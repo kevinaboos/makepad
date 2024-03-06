@@ -12,6 +12,7 @@ pub struct HtmlDoc{
     pub nodes: Vec<HtmlNode>,
 }
 
+ #[derive(Debug)]
  pub enum HtmlNode{
      OpenTag{lc:LiveId, nc:LiveId},
      CloseTag{lc:LiveId, nc:LiveId},
@@ -19,6 +20,7 @@ pub struct HtmlDoc{
      Text{start: usize, end:usize}
  }
  
+ #[derive(Debug)]
  pub struct HtmlWalker<'a>{
     decoded: &'a str,
     nodes: &'a [HtmlNode],
