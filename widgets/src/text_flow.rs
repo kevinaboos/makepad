@@ -23,7 +23,9 @@ pub enum FlowBlockType {
     #[pick] Quote = shader_enum(1),
     Sep = shader_enum(2),
     Code = shader_enum(3),
-    ListItem = shader_enum(4),
+    InlineCode = shader_enum(4),
+    Underline = shader_enum(5),
+    Strikethrough = shader_enum(6)
 }
 
 #[derive(Live, LiveHook, LiveRegister)]
@@ -33,7 +35,7 @@ pub struct DrawFlowBlock {
     #[live] block_type: FlowBlockType
 } 
 
-     
+      
 // this widget has a retained and an immediate mode api
 #[derive(Live, Widget)]
 pub struct TextFlow {
@@ -51,6 +53,8 @@ pub struct TextFlow {
     #[rust] bold_counter: usize,
     #[rust] italic_counter: usize,
     #[rust] fixed_counter: usize,
+    #[rust] underline_counter: usize,
+    #[rust] strikethrough_counter: usize,
     
     #[rust] font_size_stack: FontSizeStack,
     #[rust] area_stack: AreaStack,
@@ -63,6 +67,8 @@ pub struct TextFlow {
     #[live] sep_walk: Walk, 
     #[live] list_item_layout: Layout,
     #[live] list_item_walk: Walk,
+    #[live] inline_code_layout: Layout,
+    #[live] inline_code_walk: Walk,
     
     #[redraw] #[rust] area:Area,
     #[rust] draw_state: DrawStateWrap<DrawState>,
@@ -229,6 +235,8 @@ impl TextFlow{
         self.bold_counter = 0;
         self.italic_counter = 0;
         self.fixed_counter = 0;
+        self.underline_counter = 0;
+        self.strikethrough_counter = 0;
     }
     
     pub fn end(&mut self, cx: &mut Cx2d){
@@ -244,6 +252,26 @@ impl TextFlow{
     pub fn pop_bold(&mut self){
         if self.bold_counter>0{
             self.bold_counter -= 1;
+        }
+    } 
+    
+    pub fn push_underline(&mut self){
+        self.underline_counter += 1;
+    }
+        
+    pub fn pop_underline(&mut self){
+        if self.underline_counter>0{
+            self.underline_counter -= 1;
+        }
+    } 
+    
+    pub fn push_strikethrough(&mut self){
+        self.strikethrough_counter += 1;
+    }
+            
+    pub fn pop_strikethrough(&mut self){
+        if self.strikethrough_counter>0{
+            self.strikethrough_counter -= 1;
         }
     } 
     
@@ -301,16 +329,41 @@ impl TextFlow{
         self.draw_block.end(cx);
     }
     
-    pub fn begin_list_item(&mut self, cx:&mut Cx2d){
+    pub fn begin_inline_code(&mut self, cx:&mut Cx2d){
         // alright we are going to push a block with a layout and a walk
-        self.draw_block.block_type = FlowBlockType::ListItem;
-        self.draw_block.begin(cx, self.list_item_walk, self.list_item_layout);
+        self.draw_block.block_type = FlowBlockType::InlineCode;
+        self.draw_block.begin(cx, self.inline_code_walk, self.inline_code_layout);
+        self.area_stack.push(self.draw_block.draw_vars.area);
+    } 
+        
+    pub fn end_inline_code(&mut self, cx:&mut Cx2d){
+        self.draw_block.draw_vars.area = self.area_stack.pop();
+        self.draw_block.end(cx);
+    }
+      
+    pub fn begin_list_item(&mut self, cx:&mut Cx2d, dot:&str, pad:f64){
+        // alright we are going to push a block with a layout and a walk
+        let pad = self.draw_normal.get_font_size() * pad;
+        cx.begin_turtle(self.list_item_walk, Layout{
+            padding:Padding{
+                left: self.list_item_layout.padding.left + pad,
+                ..self.list_item_layout.padding
+            },
+            ..self.list_item_layout
+        });
+        // lets draw the 'marker' at -x 
+        // lets get the turtle position and abs draw 
+        
+        let pos = cx.turtle().pos() - dvec2(pad,0.0);
+        let fs = self.font_size_stack.value(self.font_size);
+        self.draw_normal.text_style.font_size = fs;
+        self.draw_normal.draw_abs(cx, pos, dot);
+        
         self.area_stack.push(self.draw_block.draw_vars.area);
     }
     
     pub fn end_list_item(&mut self, cx:&mut Cx2d){
-        self.draw_block.draw_vars.area = self.area_stack.pop();
-        self.draw_block.end(cx);        
+        cx.end_turtle();
     }
     
     pub fn sep(&mut self, cx:&mut Cx2d){
@@ -337,7 +390,7 @@ impl TextFlow{
             });
             return Some(entry.clone())
         }
-        None
+        None 
     }
      
     pub fn draw_text(&mut self, cx:&mut Cx2d, text:&str){
@@ -367,7 +420,23 @@ impl TextFlow{
             let fs = self.font_size_stack.value(self.font_size);
             dt.text_style.font_size = fs;
             // the turtle is at pos X so we walk it.
-            dt.draw_walk_word(cx, text);
+            if self.strikethrough_counter > 0{
+                let db = &mut self.draw_block;
+                db.block_type = FlowBlockType::Strikethrough;
+                dt.draw_walk_word_with(cx, text, |cx, rect|{
+                    db.draw_abs(cx, rect);
+                });
+            }
+            else if self.underline_counter > 0{
+                let db = &mut self.draw_block;
+                db.block_type = FlowBlockType::Underline;
+                dt.draw_walk_word_with(cx, text, |cx, rect|{
+                    db.draw_abs(cx, rect);
+                });
+            }
+            else{
+                dt.draw_walk_word(cx, text);
+            }
         }
     }
 }

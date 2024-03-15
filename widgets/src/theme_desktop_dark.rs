@@ -163,6 +163,13 @@ live_design! {
     const THEME_SPLITTER_SIZE = 5.0
     
     Html = <HtmlBase>{
+        font_size: 12,
+        flow: RightWrap,
+        width:Fill,
+        height:Fit,
+        padding: 5,
+        line_spacing: 10,
+        
         draw_normal: {text_style:<THEME_FONT_LABEL>{}}
         draw_italic: {text_style:<THEME_FONT_ITALIC>{}}
         draw_bold: {text_style:<THEME_FONT_BOLD>{}}
@@ -175,9 +182,9 @@ live_design! {
         quote_layout:{flow: RightWrap, padding:{left:15,top:10,right:10,bottom:10}},
         quote_walk:{height:Fit,width:Fill}
         
-        list_item_layout:{flow: RightWrap, padding:{left:15,top:0,right:10,bottom:0}},
+        list_item_layout:{flow: RightWrap, padding:{left:0,top:0,right:10,bottom:0}},
         list_item_walk:{height:Fit,width:Fill}
-        
+          
         sep_walk:{height:4, width: Fill},
         
         draw_block:{
@@ -225,13 +232,24 @@ live_design! {
                         sdf.fill(#7);
                         return sdf.result;
                     }
-                    FlowBlockType::ListItem => {
+                    FlowBlockType::Underline => {
                         sdf.box(
-                            4.,
-                            6.,
-                            4.,
-                            4.,
-                            1.
+                            0.,
+                            self.rect_size.y-2,
+                            self.rect_size.x,
+                            1.5,
+                            0.5
+                        );
+                        sdf.fill(#f);
+                        return sdf.result;
+                    }
+                    FlowBlockType::Strikethrough => {
+                        sdf.box(
+                            0.,
+                            self.rect_size.y*0.5,
+                            self.rect_size.x,
+                            1.5,
+                            0.5
                         );
                         sdf.fill(#f);
                         return sdf.result;
@@ -243,20 +261,30 @@ live_design! {
     }
     
     Markdown = <MarkdownBase>{
+        font_size: 12,
+        flow: RightWrap,
+        width:Fill,
+        height:Fit,
+        padding: 5,
+        line_spacing: 10,
+        
         draw_normal: {text_style:<THEME_FONT_LABEL>{}}
         draw_italic: {text_style:<THEME_FONT_ITALIC>{}}
         draw_bold: {text_style:<THEME_FONT_BOLD>{}}
         draw_bold_italic: {text_style:<THEME_FONT_BOLD_ITALIC>{}}
         draw_fixed: {text_style:<THEME_FONT_CODE>{}}
                 
-        code_layout:{flow: RightWrap, padding:{left:10,top:10,right:10,bottom:10}},
+        code_layout:{flow: RightWrap,align:{x:0.0,y:0.0}, padding:{left:10,top:10,right:10,bottom:10}},
         code_walk:{height:Fit,width:Fill}
-                
+        
+        inline_code_layout:{flow: RightWrap,  padding:{left:3,top:2,right:3,bottom:2}},
+        inline_code_walk:{height:Fit,width:Fit,margin:{top:-4}} 
+                        
         quote_layout:{flow: RightWrap, padding:{left:15,top:10,right:10,bottom:10}},
         quote_walk:{height:Fit,width:Fill}
                 
-        list_item_layout:{flow: RightWrap, padding:{left:15,top:0,right:10,bottom:0}},
-        list_item_walk:{height:Fit,width:Fill}
+        list_item_layout:{flow: RightWrap, line_spacing: 10 padding:{left:15,top:0,right:10,bottom:0}},
+        list_item_walk:{margin:{top:0},height:Fit,width:Fill}
                 
         sep_walk:{height:4, width: Fill},
                 
@@ -305,15 +333,15 @@ live_design! {
                         sdf.fill(#7);
                         return sdf.result;
                     }
-                    FlowBlockType::ListItem => {
+                    FlowBlockType::InlineCode => {
                         sdf.box(
-                            4.,
-                            6.,
-                            4.,
-                            4.,
-                            1.
+                            1.,
+                            1.,
+                            self.rect_size.x-2.,
+                            self.rect_size.y-2.,
+                            2.
                         );
-                        sdf.fill(#f);
+                        sdf.fill(#7);
                         return sdf.result;
                     }
                 }
