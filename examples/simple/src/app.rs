@@ -169,11 +169,16 @@ impl RobrixHtml{
     
 
     /*
-        * TODO: Implement the following tags:
+        * TODO: Implement the following tags and their attributes:
         *  font
+           * data-mx-bg-color, data-mx-color, color
         *  a
+           * name, target, href
+           * href value must not be relative, must have a scheme matching one of: https, http, ftp, mailto, magnet
+           * web clients should add a `rel="noopener"``attribute
         *  ul
         *  ol
+           * start
         *  sup
         *  sub
         *  div
@@ -185,9 +190,12 @@ impl RobrixHtml{
         *  td
         *  caption
         *  span
+           * data-mx-bg-color, data-mx-color, data-mx-spoiler
         *  img
+           * width, height, alt, title, src
         *  details
         *  summary.
+        *  mx-reply (custom)
         */
     
     pub fn handle_open_tag(cx: &mut Cx2d, tf: &mut TextFlow, node: &mut HtmlWalker)->Option<LiveId>{
@@ -210,8 +218,9 @@ impl RobrixHtml{
                 cx.turtle_new_line();
             }
             some_id!(code) => {
+                tf.push_size_abs_scale(0.85);
                 tf.push_fixed();
-                tf.begin_inline_code(cx);
+                // tf.begin_inline_code(cx); // doesn't work properly
             }
             some_id!(pre) => {
                 cx.turtle_new_line();
@@ -231,6 +240,7 @@ impl RobrixHtml{
             }
             some_id!(u) => tf.push_underline(),
             some_id!(del)
+            | some_id!(s)
             | some_id!(strike) => tf.push_strikethrough(),
 
             some_id!(b)
@@ -270,8 +280,9 @@ impl RobrixHtml{
             }
             some_id!(blockquote) => tf.end_quote(cx),
             some_id!(code) => {
+                tf.pop_size();
                 tf.pop_fixed();
-                tf.end_inline_code(cx);
+                // tf.end_inline_code(cx); // doesn't work properly
             }
             some_id!(pre) => {
                 tf.pop_fixed();
@@ -280,6 +291,7 @@ impl RobrixHtml{
             some_id!(li) => tf.end_list_item(cx),            
             some_id!(u) => tf.pop_underline(),
             some_id!(del)
+            | some_id!(s)
             | some_id!(strike) => tf.pop_strikethrough(),
             _ => ()
         }
