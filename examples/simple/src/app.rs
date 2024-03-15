@@ -103,6 +103,44 @@ live_design!{
                     <sep/></br>
                     "
                 }
+                <Markdown>{
+                    
+                    body:"
+                    # MD H1 
+                    ## H2 **Bold** *italic*
+                    
+                    1. aitem
+                    1. item
+                      2. item  
+                      1. test   
+                    4. item               
+                                          
+                    > block
+                    > next
+                    >> hi
+                    continuation
+                    
+                    [link](https://image)
+                    ![image](https://link)
+                    Normal
+                    Next line
+                    
+                    ---
+                    ~~single newline~~ becomes space
+                    *hello*hello world
+                    
+                        inline code
+                        more inline code
+                    Double newline
+                    `inline code` text after
+                    ```
+                    let x = 10
+                    let y = 10
+                    ```
+                    *italic* **Bold** normal _italic_ __bold__ ***Bolditalic*** normal
+                    123
+                    "
+                }
             }
         }
     }
