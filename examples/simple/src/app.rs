@@ -61,85 +61,26 @@ live_design!{
                     a = <Button> {
                         text: "Link here"
                     }
-                    // before link <a href=\"https://www.google.com/\">Google</a> after link
+                    // body: "this is <b>BOLD text</b>&nbsp;<br/><i>italic</i>  <Button>Hi</Button><br/><b><i>Bold italic</i></b>
+                    // <blockquote>\n<p>quote block single line</p>\n</blockquote>
+                    // text at the beginning <br /> <blockquote> <br /> quote block single line <br /> </blockquote> <br />
+                    // top text asldkja sldkja sldkja sldkjas dlkajs ldkajsdl laksjd laksjd laksjd laksjdlkahsldkjhaskj dhkljh lkjh lkldkjahsdlkja   lklkjadhs dl llkj h kll kdjjh  <br /> regular newline, no paragraph <p> after paragraph start </p> after paragraph end <br /> after newline <p> paragraph 1 </p> <p> paragraph 2 </p>
+                    // text at beginning <Button>My Button</Button> text after button before link <a href=\"https://www.google.com/me/\">Google2</a> after link before quote <blockquote>Quoted Text</blockquote> <h1>Header 1</h1>text after h1<h2>Header 2</h2>text after h2 <p> paragraph </p> <h3>Header 3</h3>text after h3<h4>Header 4</h4>text after h4<h5>Header 5</h5>text after h5<h6>Header 6</h6>text after h6 <br />
+                    // <li> <code> Inline code </code> </li>
+                    // this is <br/>
+                    //     <li>one asdf asdfsadflkjalsdkfjl f  alsdkfjalsdkjflakj f sd lkafjldkfjaslkdjf sdflakdjlfjlksajaf asdlkfjlasdkfjlaskdjfla sdlfkjasldkfja sdlfkj asldkfja sldkfjas ldkfjlasdk </li>
+                    //     <li>two</li>
+                    // <br/>
+                    // "
                     body: "
-                        this is <b>BOLD text</b>&nbsp;<br/><i>italic</i>  <Button>Hi</Button><br/><b><i>Bold italic</i></b>
-                        <blockquote>\n<p>quote block single line</p>\n</blockquote>
-                        text at the beginning <br /> <blockquote> <br /> quote block single line <br /> </blockquote> <br />
-                        top text asldkja sldkja sldkja sldkjas dlkajs ldkajsdl laksjd laksjd laksjd laksjdlkahsldkjhaskj dhkljh lkjh lkldkjahsdlkja   lklkjadhs dl llkj h kll kdjjh  <br /> regular newline, no paragraph <p> after paragraph start </p> after paragraph end <br /> after newline <p> paragraph 1 </p> <p> paragraph 2 </p>
-                        text at beginning <Button>My Button</Button> text after button before link <a href=\"https://www.google.com/me/\">Google2</a> after link before quote <blockquote>Quoted Text</blockquote> <h1>Header 1</h1>text after h1<h2>Header 2</h2>text after h2 <p> paragraph </p> <h3>Header 3</h3>text after h3<h4>Header 4</h4>text after h4<h5>Header 5</h5>text after h5<h6>Header 6</h6>text after h6 <br />
-                        <li> <code> Inline code </code> </li>
-                        this is <br/>
-                            <li>one asdf asdfsadflkjalsdkfjl f  alsdkfjalsdkjflakj f sd lkafjldkfjaslkdjf sdflakdjlfjlksajaf asdlkfjlasdkfjlaskdjfla sdlfkjasldkfja sdlfkj asldkfja sldkfjas ldkfjlasdk </li>
-                            <li>two</li>
-                        <br/>
-                        <code>let x = 1.0; this is a very long inline code to test wrapping </code> <pre> test block </pre> <br>
+                        first line <br />
+                        <code>let x = 1.0; this is a very long inline code to test wrapping </code> inline text after inline code
+                        <pre> test block </pre> <br>
                         <b>BOLD text</b>&nbsp;normal&nbsp;&nbsp;after nbsp <hr/>Next line normal text button: <Button>Hi</Button><br/><blockquote>blockquote<br/><blockquote> nested blockquote</blockquote> after nested</blockquote><i>  <strong>Bold italic</i></strong>
                         <br>text at beginning <pre> this is a code block </pre> text after code block
                         <br /> this <hr> is <br/><li>one</li><br/><li>two</li><br/><code>let x = 1.0;</code><b>BOLD text</b>&nbsp;italic<br/><sep/>Next line normal text button: <Button>Hi</Button><br/><block_quote>blockquote<br/><block_quote>blockquote</block_quote></block_quote><i>Bold italic</i>
                     "
 
-                }
-                
-                <Html>{
-                    
-                    Button = <Button> {
-                        text: "Helloworld"
-                    }  
-                    // body:"before link <a href=\"https://www.google.com/\">Google</a> after link"
-
-                    body:"
-                    Normal <u>underlined html</u> <s>strike</s> text hello world <br/>
-                    <li>one</li><br/>
-                    <li>two</li><br/>
-                    <code>let x = 1.0; testing another very long line of inline code to see if it wraps properly or not here i'm still going on a single line blah blah blah </code>
-                    <b>BOLD text</b>&nbsp;<i>italic</i><br/>
-                    <sep/>
-                    Next line normal text button:<Button>Hi</Button><br/>
-                    <block_quote>block<b>quote</b><br/><block_quote>blockquote</block_quote><br/>
-                    Next line <br/>
-                    <sep/>
-                    </block_quote><b><i>Bold italic</i><br/>
-                    <sep/></br>
-                    "
-                }
-                <Markdown>{
-                    
-                    body:"
-                    # MD H1 
-                    ## H2 **Bold** *italic*
-                    
-                    1. aitem
-                    1. item
-                      2. item  
-                      1. test   
-                    4. item               
-                                          
-                    > block
-                    > next
-                    >> hi
-                    continuation
-                    
-                    [link](https://image)
-                    ![image](https://link)
-                    Normal
-                    Next line
-                    
-                    ---
-                    ~~single newline~~ becomes space
-                    *hello*hello world
-                    
-                        inline code
-                        more inline code
-                    Double newline
-                    `inline code` text after
-                    ```
-                    let x = 10
-                    let y = 10
-                    ```
-                    *italic* **Bold** normal _italic_ __bold__ ***Bolditalic*** normal
-                    123
-                    "
                 }
             }
         }
