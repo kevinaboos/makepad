@@ -44,8 +44,9 @@ live_design!{
     //     }
     // }
 
-    TextOrImage = {{TextOrImage}}{
-        margin:{left:10, right:10}
+    TextOrImage = {{TextOrImage}} {
+        margin: { left: 10.0, right: 10.0, top: 10.0, bottom: 10.0 },
+        // padding: { left: 5.0, right: 5.0, top: 5.0, bottom: 5.0 },
         text_view: <View>{ 
             width: Fill,
             height: Fill,
@@ -55,8 +56,9 @@ live_design!{
                     text_style: <GO_NOTO_CURRENT_REGULAR>{
                         font_size: 12, 
                     }
-                    draw_text:{color: #00f}
+                    draw_text:{color: #f00}
                 }
+                text = "placeholder", 
             }
         }
         image_view:  <View>{ 
@@ -65,7 +67,7 @@ live_design!{
             image = <Image> {
                 width: Fill,
                 height: Fill,
-                fit: Stretch,
+                fit: Smallest,
             }
         }
     }
@@ -88,7 +90,7 @@ live_design!{
             
             draw_bg: {
                 fn pixel(self) -> vec4 {
-                    //return #000
+                    // return #f00;
                     // test
                     return mix(#7, #3, self.pos.y);
                 }
@@ -101,11 +103,12 @@ live_design!{
                     x: 0.5,
                     y: 0.5
                 },
-                simple_img = <Image> {
-                    width: 272,
-                    height: 92,
-                    source: dep("crate://self/resources/img/google_logo.png"),
-                }
+                // simple_img = <Image> {
+                //     width: 272,
+                //     height: 92,
+                //     source: dep("crate://self/resources/img/google_logo.png"),
+                // }
+
                 button1 = <Button> {
                     text: "Hello world "
                 }
@@ -121,6 +124,15 @@ live_design!{
                     text: "Counter: 0"
                 }
 
+                txt_or_img = <TextOrImage> {
+                    image_view: {
+                        image = {
+                            source: dep("crate://self/resources/img/google_logo.png"),
+                            fit: Stretch,
+                        }
+                    }
+                }
+
                 html = <Html> {
                     // font_size: 13,
                     // flow: RightWrap,
@@ -134,116 +146,16 @@ live_design!{
                     img = <HtmlImage> {
                     }
 
+                    // the below HTML fails because the parser lib seemingly doesn't find the closing tag (?):
+                    //
+                    // <img alt=\"frown\" height=\"32\" src=\"mxc://matrix.org/WXHzlcFBqMWhwmqxznTqJsll\" title=\"frown\"> Can you really use custom emoji anywhere?
+
                     body: "
-                        text up top with inline image
-                        <img src=\"experiments/html_experiment/resources/img/google_logo.png\" width=272 height=92 alt=\"Google Logo\" title=\"Google Logo\" />
-                        text after image <br />
-                        <ol>
-                            <li> list item one </li>
-                            <li> list item two </li>
-                            <li> list item three</li>
-                            <li> list item four </li>
-                        </ol>
-
-                        <ol>
-                            <li> list item one </li>
-                            <li> list item two </li>
-                            <li> list item three</li>
-                            <li> list item four </li>
-                        </ol>
-
-                        <h1> Header 1 </h1>
-                        
-                        <ol>
-                            <li> list item one </li>
-                            <li> list item two </li>
-                            <li> list item three</li>
-                            <li> list item four </li>
-                        </ol>
-                        plain text at the top <sub> subscript </sub> <sup> superscript </sup> <br />
-
-                        text before link <a href=\"https://www.google.com/\" rel=noopener target=_blank>Go to Google...</a>
-
-                        <ol>
-                            <li> list item one </li>
-                            <li> list item two </li>
-                            <li> list item three</li>
-                            <li> list item four </li>
-
-                            <li> 
-                                Level 1 list item one
-                                <ul>
-                                    <li> Level 2 list item one </li>
-                                    <li>
-                                        Level 2 list item two
-                                        <ul>
-                                            <li> Level 3 list item one </li>
-                                            <li> 
-                                                Level 3 list item two 
-                                                <ul>
-                                                    <li> Level 4 list item one </li>
-                                                    <li> Level 4 list item two </li>
-                                                </ul>
-                                            </li>
-                                        </ul>
-                                    </li>
-                                </ul>
-                            </li>
-                            <li> list item six </li>
-                            <li> list item seven 
-                                <ul>
-                                    <li> list item ul 7 </li>
-                                    <li> list item ul 7 </li>
-                                </ul>
-                                <ol>
-                                    <li> list item ol 7 </li>
-                                    <li>
-                                        list item ol 7 before
-                                        <ul>
-                                            <li> list item indent again </li>
-                                            <li> list item indent again 2 </li>
-                                        </ul>
-                                        list item old 7 after
-                                        <blockquote>Quoted Text</blockquote>
-                                    </li>
-                                    <li> list item ol 7, should be 3</li>
-                                </ol>
-                            </li>
-
-                            <li> list item one </li>
-                            <li> text <br />
-                                <ol>
-                                    <li> list item two </li>
-                                    <li> text here
-                                        <ul>
-                                            <li> list item three </li>
-                                            <li> list item four </li>
-                                            <li> sub item
-                                                <ol>
-                                                    <li> list item five </li>
-                                                    <li> list item six </li>
-                                                </ol>
-                                            </li>
-                                        </ul>                                    
-                                    </li>
-                                    <li> list item four </li>
-                                </ol>
-                            </li>
-                            <li> list item three</li>
-                            <li> list item four </li>
-                        </ol>
-
-                        <h2> Header 2 </h2>
-
-                        <ol type=1 start=16>
-                            <li> list item one </li>
-                            <li> list item two </li>
-                            <li> list item three</li>
-                            <li> list item four </li> 
-                        </ol>
-                        
+                        expecting a small image here:
+                        <img alt=\"frown\" height=\"32\" src=\"experiments/html_experiment/resources/img/WXHzlcFBqMWhwmqxznTqJsll.png\" title=\"frown\"/> Can you really use custom emoji anywhere?
+                        <br>
+                        text after matrix TextOrImage
                     "
-
                 }
             }
         }
@@ -271,6 +183,16 @@ impl MatchEvent for App {
             self.counter += 1;
             let label = self.ui.label(id!(label1));
             label.set_text_and_redraw(cx,&format!("Counter: {}", self.counter));
+
+            // testing the TextOrImage widget
+            if self.counter % 2 == 0 {
+                self.ui.text_or_image(id!(txt_or_img)).show_image(|image_ref| {
+                    image_ref.load_image_file_by_path(cx, "experiments/html_experiment/resources/img/google_logo.png")
+                        .map(|_| image_ref.size_in_pixels(cx).unwrap())
+                }).unwrap();
+            } else {
+                self.ui.text_or_image(id!(txt_or_img)).show_text(&format!("Set counter to {}", self.counter));
+            }
         }
     }
 }
@@ -288,28 +210,21 @@ impl AppMain for App {
 ////////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////
 
+
 /// A view that holds an image or text content, and can switch between the two.
 ///
 /// This is useful for displaying alternate text when an image is not (yet) available
 /// or fails to load. It can also be used to display a loading message while an image
 /// is being fetched.
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum TextOrImageStatus {
-    Text,
-    Image,
-}
-
 #[derive(Live, Widget, LiveHook)]
 pub struct TextOrImage {
-    /// The URL of the image to display.
     #[redraw] #[live] text_view: View,
     #[redraw] #[live] image_view: View,
     #[walk] walk: Walk,
     #[layout] layout: Layout,
-    #[rust(TextOrImageStatus::Text)] status: TextOrImageStatus,
-    #[rust] pixel_width: f64,
-    #[rust] pixel_height: f64,    
+    #[rust] status: TextOrImageStatus,
+    // #[rust(TextOrImageStatus::Text)] status: TextOrImageStatus,
+    #[rust] size_in_pixels: (usize, usize),
 }
 
 impl Widget for TextOrImage {
@@ -319,25 +234,102 @@ impl Widget for TextOrImage {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
-        walk.width = Size::Fixed(self.pixel_width / cx.current_dpi_factor());
-        walk.height = Size::Fixed(self.pixel_height / cx.current_dpi_factor());
+        walk.width = Size::Fixed(self.size_in_pixels.0 as f64 / cx.current_dpi_factor());
+        walk.height = Size::Fixed(self.size_in_pixels.1 as f64 / cx.current_dpi_factor());
         cx.begin_turtle(walk, self.layout);
         match self.status{
-            TextOrImageStatus::Image=>self.image_view.draw_all(cx, scope),
-            TextOrImageStatus::Text=>self.text_view.draw_all(cx, scope)
+            TextOrImageStatus::Image => self.image_view.draw_all(cx, scope),
+            TextOrImageStatus::Text  => self.text_view.draw_all(cx, scope),
         }
         cx.end_turtle();
         DrawStep::done()
     }
 }
+impl TextOrImage {
+    /// Sets the text content, which will be displayed on future draw operations.
+    ///
+    /// ## Arguments
+    /// * `text`: the text that will be displayed in this `TextOrImage`, e.g.,
+    ///   a message like "Loading..." or an error message.
+    pub fn show_text<T: AsRef<str>>(&mut self, text: T) {
+        self.text_view.label(id!(label)).set_text(text.as_ref());
+        self.status = TextOrImageStatus::Text;
+    }
+
+    /// Sets the image content, which will be displayed on future draw operations.
+    ///
+    /// ## Arguments
+    /// * `image_set_function`: this function will be called with an [ImageRef] argument,
+    ///    which refers to the image that will be displayed within this `TextOrImage`.
+    ///    This allows the caller to set the image contents in any way they want.
+    ///    * If successful, the `image_set_function` should return the size of the image
+    ///      in pixels as a tuple, `(width, height)`.
+    ///    * If `image_set_function` returns an error, no change is made to this `TextOrImage`.
+    pub fn show_image<F, E>(&mut self, image_set_function: F) -> Result<(), E>
+        where F: FnOnce(ImageRef) -> Result<(usize, usize), E>
+    {
+        let img_ref = self.image_view.image(id!(image));
+        match image_set_function(img_ref) {
+            Ok(size_in_pixels) => {
+                self.status = TextOrImageStatus::Image;
+                self.size_in_pixels = size_in_pixels;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Returns whether this `TextOrImage` is currently displaying an image or text.
+    pub fn status(&self) -> TextOrImageStatus {
+        self.status
+    }
+}
+
+impl TextOrImageRef {
+    /// See [TextOrImage::show_text()].
+    pub fn show_text<T: AsRef<str>>(&self, text: T) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.show_text(text);
+        }
+    }
+
+    /// See [TextOrImage::show_image()].
+    pub fn show_image<F, E>(&self, image_set_function: F) -> Result<(), E>
+        where F: FnOnce(ImageRef) -> Result<(usize, usize), E>
+    {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.show_image(image_set_function)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// See [TextOrImage::status()].
+    pub fn status(&self) -> TextOrImageStatus {
+        if let Some(inner) = self.borrow() {
+            inner.status()
+        } else {
+            TextOrImageStatus::Text
+        }
+    }
+}
+
+/// Whether a `TextOrImage` instance is currently displaying text or an image.
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+pub enum TextOrImageStatus {
+    #[default]
+    Text,
+    Image,
+}
+
 
 #[derive(Live, Widget)]
 pub struct HtmlImage {
-    /// The URL of the image to display.
     #[deref] toi: TextOrImage,
+    /// The URL of the image to display.
     #[rust] src: String,
     #[rust] alt: String,
-    #[rust] title: String,    
+    #[rust] title: String,
 }
 
 impl Widget for HtmlImage {
@@ -368,13 +360,13 @@ impl LiveHook for HtmlImage {
                         live_id!(alt) => self.alt = attr.into(),
                         live_id!(title) => self.title = attr.into(),
                         live_id!(width) => {
-                            if let Ok(width) = attr.parse::<f64>() {
-                                self.pixel_width = width
+                            if let Ok(width) = attr.parse::<usize>() {
+                                self.size_in_pixels.0 = width;
                             }
                         }
                         live_id!(height) => {
-                            if let Ok(height) = attr.parse::<f64>() {
-                                self.pixel_height = height
+                            if let Ok(height) = attr.parse::<usize>() {
+                                self.size_in_pixels.1 = height;
                             }
                         }
                         _ => ()
@@ -391,17 +383,19 @@ impl LiveHook for HtmlImage {
                 } else {
                     "Loading image..."
                 };
-                
                 self.toi.text_view.label(id!(label)).set_text(text);
                 
-                if !self.src.is_empty() {
+
+                if true && !self.src.is_empty() {
                     // temp: just assume a local path URL only for now
                     let mut path = std::env::current_dir().unwrap();
                     path.push(&self.src);
                     //log!("HtmlImage::after_apply(): loading image from path: {:?}", path.to_str().unwrap());
                     let image_ref = self.image_view.image(id!(image));
-                    image_ref.load_image_file_by_path(cx, path.to_str().unwrap()).unwrap();
-                    self.status = TextOrImageStatus::Image;
+                    match image_ref.load_image_file_by_path(cx, path.to_str().unwrap()) {
+                        Ok(_) => self.status = TextOrImageStatus::Image,
+                        Err(e) => log!("Error loading image: {:?}", e),
+                    }
                 }
             }
             _ => ()

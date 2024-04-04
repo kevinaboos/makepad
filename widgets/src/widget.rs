@@ -76,6 +76,9 @@ pub trait Widget: WidgetNode {
     }
     
     fn set_text(&mut self, _v: &str) {
+        if !_v.is_empty() {
+            log!("Widget::set_text() skipping _v {_v:?}");
+        }
     }
     
     fn set_text_and_redraw(&mut self, cx: &mut Cx, v: &str) {

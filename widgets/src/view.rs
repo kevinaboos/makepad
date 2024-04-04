@@ -122,10 +122,10 @@ pub struct View {
     show_bg: bool,
 
     #[layout]
-    layout: Layout,
+    pub layout: Layout,
 
     #[walk]
-    walk: Walk,
+    pub walk: Walk,
 
     //#[live] use_cache: bool,
     #[live]
@@ -161,7 +161,7 @@ pub struct View {
     view_size: Option<DVec2>,
 
     #[rust]
-    area: Area,
+    pub area: Area,
     #[rust]
     draw_list: Option<DrawList2d>,
 

@@ -310,6 +310,7 @@ impl Widget for Html {
     }
     
     fn set_text(&mut self, v:&str){
+        log!("Html::set_text() to {v:?}");
         self.body = Rc::new(v.to_string());
         let mut errors = Some(Vec::new());
         self.doc = parse_html(&*self.body, &mut errors);
@@ -318,6 +319,15 @@ impl Widget for Html {
         }
     }
 } 
+
+impl HtmlRef {
+    pub fn set_text(&self, v:&str){
+        if let Some(mut inner) = self.borrow_mut() {
+            log!("HtmlRef::set_text() to {v:?}");
+            inner.set_text(v);
+        }
+    }
+}
 
 
 fn handle_custom_widget(
@@ -353,7 +363,7 @@ fn handle_custom_widget(
 #[derive(Live, Widget)]
 struct HtmlLink {
     #[deref] link: LinkLabel,
-    #[live] href: String,
+    #[rust] href: String,
 }
 
 impl LiveHook for HtmlLink {

@@ -31,6 +31,7 @@ pub struct HtmlAttribute {
     pub value: String,
 }*/
  
+#[derive(Debug)]
 pub struct HtmlWalker<'a>{
     decoded: &'a str,
     pub nodes: &'a [HtmlNode],
@@ -248,6 +249,7 @@ impl<'a> HtmlWalker<'a>{
  }
  
  pub fn parse_html(body:&str, errors:  &mut Option<Vec<HtmlError>>)->HtmlDoc{
+    #[derive(Debug)]
      enum State{
          Text(usize, usize),
          ElementName(usize),
