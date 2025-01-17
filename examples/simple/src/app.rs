@@ -66,25 +66,7 @@ impl MatchEvent for App{
 
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        if let Event::Actions(actions) = event {
-            if self.ui.button(id!(button1)).clicked(&actions) {
-                log!("BUTTON CLICKED {}", self.counter); 
-                self.counter += 1;
-                let label = self.ui.label(id!(label1));
-                label.set_text(cx,&format!("Counter: {}", self.counter));
-            }
-        }
-
-        match event.hits(cx, self.ui.area()) {
-            Hit::FingerDown(fe) => {
-                log!("FingerDown: button {:?}", fe.device.mouse_button());
-            },
-            Hit::FingerUp(fe) => {
-                log!("FingerUp: button {:?}", fe.device.mouse_button());
-            },
-            _ => ()
-        }
-
+        self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
     }
 }
