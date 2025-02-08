@@ -1,4 +1,4 @@
-use crate::{makepad_draw::*};
+use crate::makepad_draw::*;
 use std::collections::HashMap;
 use zune_jpeg::JpegDecoder;
 use makepad_zune_png::{PngDecoder,post_process_image};
@@ -81,13 +81,13 @@ impl ImageBuffer {
         texture.set_animation(cx, self.animation);
         texture
     }
-    
+    /// This function returns a png or error if the decoding of the fields failed.
     pub fn from_png(
         data: &[u8]
     ) -> Result<Self, ImageError> {
         let mut decoder = PngDecoder::new(data);
         
-        decoder.decode_headers().unwrap();
+        decoder.decode_headers()?;
         
         if decoder.is_animated(){
             let colorspace = decoder.get_colorspace().unwrap();
@@ -160,23 +160,17 @@ impl ImageBuffer {
             return Ok(final_buffer)
         }
         else{
-            match decoder.decode() {
-                Ok(image) => {
+            let image = decoder.decode()?;
                     if let Some(data) = image.u8() {
-                        let (width,height) = decoder.get_dimensions().unwrap();
+                        let (width,height) = decoder.get_dimensions().expect("Image to have dimensions if properly decoded");
                         ImageBuffer::new(&data, width as usize, height as usize)
                     }
                     else{
                         error!("Error decoding PNG: image data empty");
                         Err(ImageError::EmptyData)
                     }
-                }
-                Err(err) => {
-                    Err(ImageError::PngDecode(err))
-                }
             }
         }
-    }
 
     pub fn from_jpg(
         data: &[u8]
@@ -225,6 +219,12 @@ pub enum ImageError {
     /// The image data was in an unsupported format.
     /// Currently, only JPEG and PNG are supported.
     UnsupportedFormat,
+}
+
+impl From<PngDecodeErrors> for ImageError {
+    fn from(value: PngDecodeErrors) -> Self {
+        Self::PngDecode(value)
+    }
 }
 
 impl std::fmt::Display for ImageError {
