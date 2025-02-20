@@ -40,6 +40,9 @@ live_design!{
                         text: "Click me 345"
                         draw_text:{color:#fff}
                     }
+                    <TextInput> {
+                        empty_message: "Enter text..."
+                    }
                 }
             }
         }

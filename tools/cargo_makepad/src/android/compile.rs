@@ -42,7 +42,7 @@ pub struct BuildResult {
 }
 
 fn manifest_xml(label:&str, class_name:&str, url:&str, sdk_version: usize)->String{
-    let label = "Robrix";
+    // let label = "Robrix";
     format!(r#"<?xml version="1.0" encoding="utf-8"?>
     <manifest xmlns:android="http://schemas.android.com/apk/res/android"
         xmlns:tools="http://schemas.android.com/tools"

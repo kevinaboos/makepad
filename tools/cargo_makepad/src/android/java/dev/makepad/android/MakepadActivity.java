@@ -61,6 +61,7 @@ import android.graphics.Color;
 import android.graphics.Insets;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.EditorInfo;
+import android.text.InputType;
 import android.widget.LinearLayout;
 
 import android.view.ViewTreeObserver;
@@ -209,8 +210,32 @@ class MakepadSurface
     // For some reason it only works if placed here and not in the parent layout.
     @Override
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+        Log.w("Makepad", "EditorInfo: " + outAttrs.toString());
+
         InputConnection connection = super.onCreateInputConnection(outAttrs);
         outAttrs.imeOptions |= EditorInfo.IME_FLAG_NO_FULLSCREEN;
+        outAttrs.inputType |= InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            | InputType.TYPE_TEXT_FLAG_AUTO_CORRECT
+            | InputType.TYPE_TEXT_FLAG_AUTO_COMPLETE;
+
+        if (connection != null) {
+            Log.w("Makepad", "dumping input connection");
+            Log.w("Makepad", connection.toString());
+            Log.w("Makepad", "getSelectedText: " + connection.getSelectedText(0));
+            Log.w("Makepad", "getSurroundingText(0): " + connection.getSurroundingText(0, 0, 0));
+            Log.w("Makepad", "getSurroundingText(10): " + connection.getSurroundingText(10, 10, 0));
+            Log.w("Makepad", "getTextBeforeCursor(10): " + connection.getTextBeforeCursor(10, 0));
+            Log.w("Makepad", "getTextAfterCursor(10): " + connection.getTextAfterCursor(10, 0));
+
+            // connection.setComposingText("", 1);
+            // connection.setComposingRegion(0, 0);
+            // connection.setSelection(0, 0);
+        } else {
+            Log.w("Makepad", "connection is null");
+        }
+
         return connection;
     }
 
