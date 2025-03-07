@@ -289,7 +289,7 @@ pub const TAP_COUNT_DISTANCE: f64 = 5.0;
 #[derive(Clone, Debug, Default, Eq, Hash, Copy, PartialEq, FromLiveId)]
 pub struct DigitId(pub LiveId);
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct CxDigitCapture {
     digit_id: DigitId,
     has_long_press_occurred: bool,
@@ -345,7 +345,24 @@ impl CxFingers {
     }*/
     
     pub (crate) fn find_digit_for_captured_area(&self, area: Area) -> Option<DigitId> {
-        if let Some(digit) = self.captures.iter().find( | d | d.area == area) {
+        if let Some(digit) = self.captures.iter().find(|d| d.area == area) {
+            log!("find_digit_for_captured_area: CxDigitCapture {{ \
+                \n        digit_id: {:?}, \
+                \n        has_long_press_occurred: {:?}, \
+                \n        area: {:?}, \
+                \n        sweep_area: {:?}, \
+                \n        switch_capture: {:?} \
+                \n        time: {:?}, \
+                \n        abs_start: {:?}, \
+                \n    }}",
+                digit.digit_id,
+                digit.has_long_press_occurred,
+                digit.area,
+                digit.sweep_area,
+                digit.switch_capture,
+                digit.time,
+                digit.abs_start,
+            );
             return Some(digit.digit_id)
         }
         None
@@ -809,24 +826,29 @@ impl<H: FnMut(&Hit) -> bool> HitOptions<H> {
 
 
 impl Event {
+    #[track_caller]
     pub fn hits(&self, cx: &mut Cx, area: Area) -> Hit {
         self.hits_with_options(cx, area, HitOptions::default())
     }
 
+    #[track_caller]
     pub fn hits_with_test<F>(&self, cx: &mut Cx, area: Area, hit_test: F) -> Hit
     where F: Fn(DVec2, &Rect, &Option<Margin>)->bool{
         self.hits_with_options_and_test(cx, area,  HitOptions::default(), hit_test)
     }
 
+    #[track_caller]
     pub fn hits_with_sweep_area(&self, cx: &mut Cx, area: Area, sweep_area: Area) -> Hit {
         self.hits_with_options(cx, area, HitOptions::default().with_sweep_area(sweep_area))
     }
     
+    #[track_caller]
     pub fn hits_with_capture_overload(&self, cx: &mut Cx, area: Area, capture_overload: bool) -> Hit {
         self.hits_with_options(cx, area, HitOptions::default().with_capture_overload(capture_overload))
     }
 
     /// See [`HitOptions::mark_as_handled_fn`].
+    #[track_caller]
     pub fn hits_with_mark_as_handled_fn<H>(&self, cx: &mut Cx, area: Area, mark_as_handled_fn: H) -> Hit
     where
         H: FnMut(&Hit) -> bool
@@ -844,6 +866,7 @@ impl Event {
     }
 
     /// See [`HitOptions::mark_as_handled_fn`] for mroe info about the `H` parameter.
+    #[track_caller]
     pub fn hits_with_options<H>(&self, cx: &mut Cx, area: Area, options: HitOptions<H>) -> Hit
     where
         H: FnMut(&Hit) -> bool,
@@ -854,6 +877,7 @@ impl Event {
     }
 
     /// See [`HitOptions::mark_as_handled_fn`] for mroe info about the `H` parameter.
+    #[track_caller]
     pub fn hits_with_options_and_test<F, H>(&self, cx: &mut Cx, area: Area, mut options: HitOptions<H>, hit_test: F) -> Hit
     where
         F: Fn(DVec2, &Rect, &Option<Margin>) -> bool,
@@ -1218,17 +1242,23 @@ impl Event {
             },
             Event::MouseDown(e) => {
                 if cx.fingers.test_sweep_lock(options.sweep_area) {
-                    // log!("Skipping MouseDown, sweep_area: {:?}", options.sweep_area);
+                    log!("called from {}, Skipping MouseDown, sweep_area: {:?}", std::panic::Location::caller(), options.sweep_area);
                     return Hit::Nothing
                 }
                 
                 let digit_id = live_id!(mouse).into();
                 
                 if !options.capture_overload && !e.handled.get().is_empty() {
+                    log!("called from {}, Skipping MouseDown, capture_overload: {}, handled area: {:?}", std::panic::Location::caller(), options.capture_overload, e.handled.get().rect(cx));
                     return Hit::Nothing
                 }
                 
                 if cx.fingers.first_mouse_button.is_some() && cx.fingers.first_mouse_button.unwrap().0 != e.button{
+                    log!("called from {}Skipping MouseDown, first_mouse_button: {:?}, event button: {:?}",
+                        std::panic::Location::caller(),
+                        cx.fingers.first_mouse_button.unwrap().0,
+                        e.button,
+                    );
                     return Hit::Nothing
                 }
                 
@@ -1240,9 +1270,18 @@ impl Event {
                 let device = DigitDevice::Mouse {
                     button: e.button,
                 };
-                
-                if cx.fingers.find_digit_for_captured_area(area).is_some() {
-                    return Hit::Nothing;
+
+                // Ensure that we don't capture a digit that is already captured,
+                // because that would break button-down handling and other animations.
+                if let Some(existing_digit_id) = cx.fingers.find_digit_for_captured_area(area) {
+                    log!("called from {}, ########## Skipping MouseDown, current {:?}, exiting: {:?}",
+                        std::panic::Location::caller(),
+                        digit_id,
+                        existing_digit_id
+                    );
+                    if existing_digit_id != digit_id {
+                        return Hit::Nothing;
+                    }
                 }
                 
                 cx.fingers.capture_digit(digit_id, area, options.sweep_area, e.time, e.abs);
@@ -1260,6 +1299,7 @@ impl Event {
                 if options.run_mark_as_handled_fn(&fde) {
                     e.handled.set(area);
                 }
+                log!("called from {}, Returning FingerDown for MouseDown at {:?}, area: {:?}", std::panic::Location::caller(), e.abs, area.rect(cx));
                 return fde;
             },
             Event::MouseUp(e) => {

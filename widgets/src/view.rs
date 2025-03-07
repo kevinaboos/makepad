@@ -146,6 +146,8 @@ pub struct View {
     block_signal_event: bool,
     #[live]
     cursor: Option<MouseCursor>,
+    /// Whether this view will also be able to handle Hit-related events
+    /// that occur within its area, even if they were already handled by a child view.
     #[live(false)]
     capture_overload: bool,
     #[live]
@@ -679,7 +681,11 @@ impl Widget for View {
         }
         
         if self.visible && self.cursor.is_some() || self.animator.live_ptr.is_some() {
-            match event.hits_with_capture_overload(cx, self.area(), self.capture_overload) {
+            let options = HitOptions::default()
+                .with_mark_as_handled_fn(|_| false) // don't mark ANY of these events as handled
+                .with_capture_overload(self.capture_overload);
+            match event.hits_with_options(cx, self.area(), options) {
+            // match event.hits_with_capture_overload(cx, self.area(), self.capture_overload) {
                 Hit::FingerDown(e) => {
                     if self.grab_key_focus {
                         cx.set_key_focus(self.area());
