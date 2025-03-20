@@ -1,23 +1,9 @@
 use {
-    std::{
-        fs::{File, remove_file},
-        io::prelude::*,
-        mem,
-        ptr,
-        ffi::{c_char, CStr},
-    },
-    self::super::gl_sys,
-    crate::{
-        makepad_live_id::*,
-        makepad_shader_compiler::generate_glsl,
-        cx::{Cx, OsType, OsType::Android},
-        texture::{Texture, TextureFormat, TexturePixel, TextureUpdated, CxTexture},
-        makepad_math::{Mat4, DVec2, Vec4},
-        pass::{PassClearColor, PassClearDepth, PassId},
-        draw_list::DrawListId,
-        draw_shader::{CxDrawShaderMapping, DrawShaderTextureInput},
-        event::{Event, TextureHandleReadyEvent}
-    },
+    self::super::gl_sys, crate::{
+        cx::{Cx, OsType::{self, Android}}, draw_list::DrawListId, draw_shader::{CxDrawShaderMapping, DrawShaderTextureInput}, event::{Event, TextureHandleReadyEvent}, log, makepad_live_id::*, makepad_math::{DVec2, Mat4, Vec4}, makepad_shader_compiler::generate_glsl, pass::{PassClearColor, PassClearDepth, PassId}, texture::{CxTexture, Texture, TextureFormat, TexturePixel, TextureUpdated}
+    }, std::{
+        ffi::{c_char, CStr}, fs::{remove_file, File}, io::prelude::*, mem, ptr
+    }
 };
 
 impl Cx {
@@ -232,6 +218,7 @@ impl Cx {
                             }
                         }
                         gl_sys::Uniform1i(shgl.textures[i].loc, i as i32);
+                        crate::warning!("Uniform1i(), slot (i): {i}, texture_id: {texture_id:?}, gl_texture: {:X?}, loc: {:#X}", cxtexture.os.gl_texture, shgl.textures[i].loc);
                     }
                     
                     gl_sys::DrawElementsInstanced(
@@ -528,6 +515,8 @@ pub struct GlShader {
 impl GlShader{
     pub fn new(vertex: &str, pixel: &str, mapping: &CxDrawShaderMapping, os_type: &OsType)->Self{
         unsafe fn read_cache(vertex: &str, pixel: &str, os_type: &OsType) -> Option<gl_sys::GLuint> {
+            return None; // KEVIN TEMP HACK
+
             if let Some(cache_dir) = os_type.get_cache_dir() {
                 let shader_hash = live_id!(shader).str_append(&vertex).str_append(&pixel);
                 let mut base_filename = format!("{}/shader_{:08x}", cache_dir, shader_hash.0);
@@ -602,6 +591,8 @@ impl GlShader{
                 gl_sys::DeleteShader(vs);
                 gl_sys::DeleteShader(fs);
             
+                //  KEVIN TEMP HACK
+                /*
                 if let Some(cache_dir) = os_type.get_cache_dir() {
                     let mut binary = Vec::new();
                     let mut binary_len = 0;
@@ -633,10 +624,12 @@ impl GlShader{
                         }
                     }
                 }
+                */
                 program
             };
 
-            Self{
+            // Kevin TEMP HACK
+            let t = Self{
                 program,
                 geometries:Self::opengl_get_attributes(program, "packed_geometry_", mapping.geometries.total_slots),
                 instances: Self::opengl_get_attributes(program, "packed_instance_", mapping.instances.total_slots),
@@ -647,7 +640,14 @@ impl GlShader{
                 user_uniforms: Self::opengl_get_uniform(program, "user_table"),
                 live_uniforms: Self::opengl_get_uniform(program, "live_table"),
                 const_table_uniform: Self::opengl_get_uniform(program, "const_table"),
+            };
+            for tex in &t.textures{
+                if tex.loc == -1 {
+                    crate::error!("TEXTURE NOT FOUND: vertex:\n{vertex}");
+                    crate::error!("TEXTURE NOT FOUND: pixel:\n{pixel}");
+                }
             }
+            t
         }
     }
 
@@ -663,8 +663,10 @@ impl GlShader{
         name0.push_str(name);
         name0.push_str("\0");
         unsafe {
+            let loc = gl_sys::GetUniformLocation(program, name0.as_ptr().cast());
+            // crate::warning!("opengl_get_uniform(): name0: {name0}, loc: {loc:#X}");
             OpenglUniform {
-                loc: gl_sys::GetUniformLocation(program, name0.as_ptr() as *const _),
+                loc,
                 //name: name.to_string(),
             }
         }
@@ -769,9 +771,9 @@ impl GlShader{
             name0.push_str(&slot.id.to_string());
             name0.push_str("\0");
             unsafe {
-                gl_texture_slots.push(OpenglUniform {
-                    loc: gl_sys::GetUniformLocation(program, name0.as_ptr() as *const _),
-                })
+                let loc = gl_sys::GetUniformLocation(program, name0.as_ptr().cast());
+                crate::warning!("opengl_get_texture_slots(): texture slot: ({:?}, {:?}), name0: {:X?}, loc: {loc:#X}", slot.id, slot.ty, name0.as_bytes());
+                gl_texture_slots.push(OpenglUniform { loc });
             }
         }
         gl_texture_slots
@@ -788,6 +790,7 @@ impl CxOsDrawShader {
     pub fn new(vertex: &str, pixel: &str, os_type: &OsType) -> Self {
         // Check if GL_OES_EGL_image_external extension is available in the current device, otherwise do not attempt to use in the shaders.
         let available_extensions = get_gl_string(gl_sys::EXTENSIONS);
+        crate::log!("Available extensions: {available_extensions}");
         let is_external_texture_supported = available_extensions.split_whitespace().any(|ext| ext == "GL_OES_EGL_image_external");
 
         let mut maybe_ext_tex_extension_import = String::new();
@@ -803,14 +806,16 @@ impl CxOsDrawShader {
         // Some Android devices running Adreno GPUs suddenly stopped compiling shaders when passing the samplerExternalOES sampler to texture2D functions. 
         // This seems like a driver bug (no confirmation from Qualcomm yet).
         // Therefore we're disabling the external texture support for Adreno until this is fixed.
-        let is_vendor_adreno = get_gl_string(gl_sys::RENDERER).contains("Adreno"); 
-        if is_external_texture_supported && !is_vendor_adreno && !is_emulator {
-            maybe_ext_tex_extension_import = "#extension GL_OES_EGL_image_external : require\n".to_string();
-            maybe_ext_tex_extension_sampler = "vec4 sample2dOES(samplerExternalOES sampler, vec2 pos){{ return texture2D(sampler, vec2(pos.x, pos.y));}}".to_string();
-        }
+
+        // KEVIN TEMP HACK REMOVED THIS
+        // let is_vendor_adreno = get_gl_string(gl_sys::RENDERER).contains("Adreno"); 
+        // if is_external_texture_supported && !is_vendor_adreno && !is_emulator {
+        //     maybe_ext_tex_extension_import = "#extension GL_OES_EGL_image_external : require\n".to_string();
+        //     maybe_ext_tex_extension_sampler = "vec4 sample2dOES(samplerExternalOES sampler, vec2 pos){{ return texture2D(sampler, vec2(pos.x, pos.y));}}".to_string();
+        // }
         
         let vertex = format!("
-            #version 100
+            #version 300 es
             {}
             precision highp float;
             precision highp int;
@@ -822,7 +827,7 @@ impl CxOsDrawShader {
             {}\0", maybe_ext_tex_extension_import, vertex);
 
         let pixel = format!("
-            #version 100
+            #version 300 es
             #extension GL_OES_standard_derivatives : enable
             {}
             precision highp float;
@@ -1010,37 +1015,38 @@ impl CxTexture {
             };
     
             match updated {
-                TextureUpdated::Partial(rect) => {
-                    if needs_realloc {
-                        gl_sys::TexImage2D(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32, height as i32,
-                            0,
-                            format,
-                            data_type,
-                            0 as *const _
-                        );
-                    }
+                // TextureUpdated::Partial(rect) => {
+                //     if needs_realloc {
+                //         gl_sys::TexImage2D(
+                //             gl_sys::TEXTURE_2D,
+                //             0,
+                //             internal_format as i32,
+                //             width as i32, height as i32,
+                //             0,
+                //             format,
+                //             data_type,
+                //             data,
+                //             // 0 as *const _
+                //         );
+                //     }
 
-                    gl_sys::PixelStorei(gl_sys::UNPACK_ALIGNMENT, bytes_per_pixel);
-                    gl_sys::PixelStorei(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                    gl_sys::PixelStorei(gl_sys::UNPACK_SKIP_PIXELS, rect.origin.x as i32);
-                    gl_sys::PixelStorei(gl_sys::UNPACK_SKIP_ROWS,rect.origin.y as i32);
-                    gl_sys::TexSubImage2D(
-                        gl_sys::TEXTURE_2D,
-                        0,
-                        rect.origin.x as i32,
-                        rect.origin.y as i32 ,
-                        rect.size.width as i32,
-                        rect.size.height as i32,
-                        format,
-                        data_type,
-                        data
-                    );
-                },
-                TextureUpdated::Full => {
+                //     gl_sys::PixelStorei(gl_sys::UNPACK_ALIGNMENT, bytes_per_pixel);
+                //     gl_sys::PixelStorei(gl_sys::UNPACK_ROW_LENGTH, width as _);
+                //     gl_sys::PixelStorei(gl_sys::UNPACK_SKIP_PIXELS, rect.origin.x as i32);
+                //     gl_sys::PixelStorei(gl_sys::UNPACK_SKIP_ROWS,rect.origin.y as i32);
+                //     gl_sys::TexSubImage2D(
+                //         gl_sys::TEXTURE_2D,
+                //         0,
+                //         rect.origin.x as i32,
+                //         rect.origin.y as i32 ,
+                //         rect.size.width as i32,
+                //         rect.size.height as i32,
+                //         format,
+                //         data_type,
+                //         data
+                //     );
+                // },
+                TextureUpdated::Partial(_) | TextureUpdated::Full => {
                     gl_sys::PixelStorei(gl_sys::UNPACK_ALIGNMENT, bytes_per_pixel);
                     gl_sys::PixelStorei(gl_sys::UNPACK_ROW_LENGTH, width as _);
                     gl_sys::PixelStorei(gl_sys::UNPACK_SKIP_PIXELS, 0);

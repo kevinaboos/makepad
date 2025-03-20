@@ -88,6 +88,8 @@ live_design!{
         }
 
         fn pixel(self) -> vec4 {
+            return mix(#f00, #0f0, mod(self.tex_coord1.x*50.0+self.tex_coord1.y*50.0,1.0));
+
             let texel_coords = self.tex_coord1.xy;
             let dxt = length(dFdx(texel_coords));
             let dyt = length(dFdy(texel_coords));

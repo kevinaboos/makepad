@@ -38,6 +38,7 @@ pub use {
 pub(crate) const ATLAS_WIDTH: usize = 4096;
 pub(crate) const ATLAS_HEIGHT: usize = 4096;
 
+
 #[derive(Debug)]
 pub struct CxFontAtlas {
     pub texture_sdf: Texture,
@@ -338,6 +339,11 @@ impl<'a> Cx2d<'a> {
                 *dst = bytes[index];
                 index += 1;
             }
+        }
+
+        // TEMP KEVIN HACK
+        for i in 0..atlas_data.len(){
+            atlas_data[i] = 0xff;
         }
 
         font_atlas.texture_sdf.put_back_vec_u8(self.cx, atlas_data, Some(RectUsize::new(
