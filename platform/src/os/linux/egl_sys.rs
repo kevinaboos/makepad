@@ -486,20 +486,6 @@ pub unsafe  fn create_egl_context(
     }
 
     #[rustfmt::skip]
-    // let cfg_attributes = vec![
-    //     EGL_SURFACE_TYPE,
-    //     EGL_WINDOW_BIT,
-    //     EGL_RED_SIZE, 8,
-    //     EGL_GREEN_SIZE, 8,
-    //     EGL_BLUE_SIZE, 8,
-    //     EGL_ALPHA_SIZE, 8,
-    //     EGL_RENDERABLE_TYPE,
-    //     EGL_OPENGL_ES2_BIT,
-    //     EGL_DEPTH_SIZE, 0,
-    //     EGL_STENCIL_SIZE, 0,
-    //     EGL_NONE
-    // ];
-    // KEVIN TEMP HACK
     let cfg_attributes = vec![
         EGL_SURFACE_TYPE,
         EGL_WINDOW_BIT,
@@ -513,17 +499,6 @@ pub unsafe  fn create_egl_context(
         EGL_STENCIL_SIZE, 0,
         EGL_NONE
     ];
-    // let cfg_attributes = vec![
-    //     EGL_SURFACE_TYPE,
-    //     EGL_PBUFFER_BIT,
-    //     EGL_RENDERABLE_TYPE,
-    //     EGL_OPENGL_BIT, 
-    //     EGL_COLOR_BUFFER_TYPE,
-    //     EGL_RGB_BUFFER,
-    //     EGL_OPENGL_ES2_BIT,
-    // ];
-
-
     let available_cfgs: Vec<EGLConfig> = vec![null_mut(); 1];
     let mut cfg_count = 0;
 
