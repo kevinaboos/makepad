@@ -498,7 +498,7 @@ pub struct CxOsDrawShader {
     pub pixel: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct GlShader {
     pub program: u32,
     pub geometries: Vec<OpenglAttribute>,
@@ -514,6 +514,7 @@ pub struct GlShader {
 
 impl GlShader{
     pub fn new(vertex: &str, pixel: &str, mapping: &CxDrawShaderMapping, os_type: &OsType)->Self{
+        crate::log!("GlShader::new(), \n\nvertex: {vertex}, \n\npixel: {pixel}");
         unsafe fn read_cache(vertex: &str, pixel: &str, os_type: &OsType) -> Option<gl_sys::GLuint> {
             return None; // KEVIN TEMP HACK
 
@@ -641,11 +642,10 @@ impl GlShader{
                 live_uniforms: Self::opengl_get_uniform(program, "live_table"),
                 const_table_uniform: Self::opengl_get_uniform(program, "const_table"),
             };
-            for tex in &t.textures{
-                if tex.loc == -1 {
-                    crate::error!("TEXTURE NOT FOUND: vertex:\n{vertex}");
-                    crate::error!("TEXTURE NOT FOUND: pixel:\n{pixel}");
-                }
+            crate::error!("GlShader: {:#?}", t);
+            for tex in &t.textures {
+                crate::error!("TEXTURE loc: {}: vertex:\n{}", tex.loc, vertex);
+                crate::error!("TEXTURE loc: {}: pixel:\n{}", tex.loc, pixel);
             }
             t
         }
@@ -815,7 +815,7 @@ impl CxOsDrawShader {
         // }
         
         let vertex = format!("
-            #version 300 es
+            #version 100
             {}
             precision highp float;
             precision highp int;
@@ -827,7 +827,7 @@ impl CxOsDrawShader {
             {}\0", maybe_ext_tex_extension_import, vertex);
 
         let pixel = format!("
-            #version 300 es
+            #version 100
             #extension GL_OES_standard_derivatives : enable
             {}
             precision highp float;
@@ -866,7 +866,7 @@ fn get_gl_string(key: gl_sys::types::GLenum) -> String {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct OpenglAttribute {
     pub loc: u32,
     pub size: i32,

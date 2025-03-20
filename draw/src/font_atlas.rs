@@ -341,10 +341,6 @@ impl<'a> Cx2d<'a> {
             }
         }
 
-        // TEMP KEVIN HACK
-        for i in 0..atlas_data.len(){
-            atlas_data[i] = 0xff;
-        }
 
         font_atlas.texture_sdf.put_back_vec_u8(self.cx, atlas_data, Some(RectUsize::new(
             PointUsize::new(atlas_x0, atlas_h - atlas_y0 - size.height),

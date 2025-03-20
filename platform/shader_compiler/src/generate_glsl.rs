@@ -972,6 +972,9 @@ impl<'a> BackendWriter for GlslBackendWriter<'a> {
     
     fn write_builtin_call_ident(&self, string: &mut String, ident: Ident, _arg_exprs: &[Expr]) {
          match ident {
+            Ident(live_id!(sample2d)) => {
+                write!(string, "texture2D").unwrap()
+            },
             _ => {
                 write!(string, "{}", ident).unwrap()
             }
