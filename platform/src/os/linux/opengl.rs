@@ -514,10 +514,16 @@ pub struct GlShader {
 
 impl GlShader{
     pub fn new(vertex: &str, pixel: &str, mapping: &CxDrawShaderMapping, os_type: &OsType)->Self{
-        crate::log!("GlShader::new(), \n\nvertex: {vertex}, \n\npixel: {pixel}");
-        unsafe fn read_cache(vertex: &str, pixel: &str, os_type: &OsType) -> Option<gl_sys::GLuint> {
-            return None; // KEVIN TEMP HACK
+        crate::log!("GlShader::new(): \n  --> vertex: {vertex}\n  --> pixel: {pixel}");
 
+        // On OpenHarmony, re-using cached shaders doesn't work properly yet.
+        #[cfg(target_env = "ohos")]
+        unsafe fn read_cache(_vertex: &str, _pixel: &str, _os_type: &OsType) -> Option<gl_sys::GLuint> {
+            None
+        }
+                
+        #[cfg(not(target_env = "ohos"))]
+        unsafe fn read_cache(vertex: &str, pixel: &str, os_type: &OsType) -> Option<gl_sys::GLuint> {
             if let Some(cache_dir) = os_type.get_cache_dir() {
                 let shader_hash = live_id!(shader).str_append(&vertex).str_append(&pixel);
                 let mut base_filename = format!("{}/shader_{:08x}", cache_dir, shader_hash.0);
@@ -534,30 +540,48 @@ impl GlShader{
                 if let Ok(mut cache_file) = File::open(&filename) {
                     let mut binary = Vec::new();
                     let mut format_bytes = [0u8; 4];
-                    if cache_file.read(&mut format_bytes).is_ok() {
-                        let binary_format = u32::from_be_bytes(format_bytes);
-                        if cache_file.read_to_end(&mut binary).is_ok() {
-                            let mut version_consistency_conflict = false;
-                            // On Android, invalidate the cached file if there have been significant system updates
-                            match os_type {
-                                OsType::Android(params) => {
-                                    let current_filename = format!("{}/shader_{:08x}_av{}_bn{}_kv{}.bin", cache_dir, shader_hash.0, params.android_version, params.build_number, params.kernel_version);
-                                    version_consistency_conflict = filename != current_filename;
-                                },
-                                _ => (),
-                            };
-            
-                            if !version_consistency_conflict {
-                                let program = gl_sys::CreateProgram();
-                                gl_sys::ProgramBinary(program, binary_format, binary.as_ptr() as *const _, binary.len() as i32);
-                                return Some(program);
-                            } else {
-                                // Version mismatch, delete the old cache file
-                                let _ = remove_file(&filename);
+                    match cache_file.read(&mut format_bytes) {
+                        Ok(_bytes_read) => {
+                            let binary_format = u32::from_be_bytes(format_bytes);
+                            match cache_file.read_to_end(&mut binary) {
+                                Ok(_full_bytes) => {
+                                    let mut version_consistency_conflict = false;
+                                    // On Android, invalidate the cached file if there have been significant system updates
+                                    match os_type {
+                                        OsType::Android(params) => {
+                                            let current_filename = format!("{}/shader_{:08x}_av{}_bn{}_kv{}.bin", cache_dir, shader_hash.0, params.android_version, params.build_number, params.kernel_version);
+                                            version_consistency_conflict = filename != current_filename;
+                                        },
+                                        _ => (),
+                                    };
+                    
+                                    if !version_consistency_conflict {
+                                        let program = gl_sys::CreateProgram();
+                                        gl_sys::ProgramBinary(program, binary_format, binary.as_ptr() as *const _, binary.len() as i32);
+                                        if let Some(error) = GlShader::opengl_has_shader_error(false, program as usize, "") {
+                                            crate::error!("ERROR::SHADER::CACHE::PROGRAM_BINARY_FAILED\n{}", error);
+                                            return None;
+                                        }
+                                        return Some(program);
+                                    } else {
+                                        // Version mismatch, delete the old cache file
+                                        let _ = remove_file(&filename);
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::warning!("Failed to read the full shader cache file {filename}, error: {e}");
+                                }
                             }
                         }
+                        Err(e) => {
+                            crate::warning!("Failed to read format bytes from shader cache file {filename}, error: {e}");
+                        }
                     }
+                } else {
+                    // crate::debug!("File was not in shader cache: {filename}");
                 }
+            } else {
+                crate::warning!("No cache directory available for shader cache");
             }
             None
         }
@@ -592,8 +616,7 @@ impl GlShader{
                 gl_sys::DeleteShader(vs);
                 gl_sys::DeleteShader(fs);
             
-                //  KEVIN TEMP HACK
-                /*
+                #[cfg(not(target_env = "ohos"))] // caching doesn't work properly on OpenHarmony
                 if let Some(cache_dir) = os_type.get_cache_dir() {
                     let mut binary = Vec::new();
                     let mut binary_len = 0;
@@ -609,7 +632,7 @@ impl GlShader{
                             let mut filename = format!("{}/shader_{:08x}", cache_dir, shader_hash.0);
 
                             match os_type {
-                                Android(params) => {
+                                OsType::Android(params) => {
                                     filename = format!("{}_av{}_bn{}_kv{}", filename, params.android_version, params.build_number, params.kernel_version);
                                 },
                                 _ => (),
@@ -618,14 +641,21 @@ impl GlShader{
                             filename = format!("{}.bin", filename);
 
                             binary.resize(return_size as usize, 0u8);
-                            if let Ok(mut cache) = File::create(filename) {
-                                let _ = cache.write_all(&binary_format.to_be_bytes());
-                                let _ = cache.write_all(&binary);
+                            match File::create(&filename) {
+                                Ok(mut cache)  => {
+                                    let _res1 = cache.write_all(&binary_format.to_be_bytes());
+                                    let _res2 = cache.write_all(&binary);
+                                    if _res1.is_err() || _res2.is_err() {
+                                        crate::error!("Failed to write shader binary to shader cache {filename}");
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::error!("Failed to write shader cache to {filename}, error: {e}");
+                                }
                             }
                         }
                     }
                 }
-                */
                 program
             };
 
@@ -811,9 +841,16 @@ impl CxOsDrawShader {
             maybe_ext_tex_extension_import = "#extension GL_OES_EGL_image_external : require\n".to_string();
             maybe_ext_tex_extension_sampler = "vec4 sample2dOES(samplerExternalOES sampler, vec2 pos){{ return texture2D(sampler, vec2(pos.x, pos.y));}}".to_string();
         }
-        
+
+        // Currently, these shaders are only compatible with version 100 through version 300.
+        // Version 310 and later have removed/deprecated some features that we currently use:
+        // * error C7616: global function texture2D is removed after version 310
+        // * error C1121: transpose: function (builtin) redefinition/overload not allowed
+        // * error C5514: 'attribute' is deprecated and removed from this profile, use 'in/out' instead
+        // * error C7614: GLSL ES doesn't allow use of reserved word attribute
+        // * error C7614: GLSL ES doesn't allow use of reserved word varying
         let vertex = format!("
-            #version 100
+            #version 300 es
             {}
             precision highp float;
             precision highp int;
@@ -825,7 +862,7 @@ impl CxOsDrawShader {
             {}\0", maybe_ext_tex_extension_import, vertex);
 
         let pixel = format!("
-            #version 100
+            #version 300 es
             #extension GL_OES_standard_derivatives : enable
             {}
             precision highp float;

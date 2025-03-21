@@ -27,10 +27,10 @@ live_design!{
                         return mix(color1, color2, radius);
                     }
                 }
-                image = <Image> {
-                    width: 400,
-                    source: dep("crate://self/resources/ducky.png")
-                }
+                // image = <Image> {
+                //     width: 400,
+                //     source: dep("crate://self/resources/ducky.png")
+                // }
                 b0= <Button> {
                     text: "Click me 123"
                     draw_text:{color:#fff}

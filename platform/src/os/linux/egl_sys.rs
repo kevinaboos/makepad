@@ -518,8 +518,11 @@ pub unsafe  fn create_egl_context(
     // TODO FIXME: these attributes were required to make the OpenHarmony emulator work.
     //             They may not be necessary on real hardware or on other platforms.
     let ctx_attributes = vec![
+        // We set version 3.0 to match that of the pixel/vertex shaders,
+        // which define `#version 300 es` at the top of their code.
         EGL_CONTEXT_CLIENT_VERSION, 3,
-        EGL_CONTEXT_MINOR_VERSION_KHR , 1,
+        EGL_CONTEXT_MINOR_VERSION_KHR , 0,
+        // The rest of this was taken from servo's OpenGL config for OpenHarmony.
         EGL_CONTEXT_OPENGL_PROFILE_MASK,
         EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
         EGL_NONE, 0, 0, 0,
