@@ -304,7 +304,7 @@ impl<'a> Cx2d<'a> {
         }
 
         let glyph_rasterizer_rc = self.glyph_rasterizer.clone();
-        let mut glyph_rasterizer_ref = glyph_rasterizer_rc.borrow_mut();
+        let mut glyph_rasterizer_ref: std::cell::RefMut<'_, GlyphRasterizer> = glyph_rasterizer_rc.borrow_mut();
         let glyph_rasterizer = &mut *glyph_rasterizer_ref;
         
         let RasterizedGlyph {

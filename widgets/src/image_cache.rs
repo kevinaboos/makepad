@@ -308,7 +308,6 @@ pub trait ImageCacheImpl {
         image_path: &str,
         id: usize,
     ) -> Result<(), ImageError> {
-        log!("LOADING FROM DISK  {}", image_path);
         if let Some(texture) = cx.get_global::<ImageCache>().map.get(image_path){
             self.set_texture(Some(texture.clone()), id);
             Ok(())
@@ -389,12 +388,8 @@ pub trait ImageCacheImpl {
                             }
                         }
                     } else if image_path.ends_with(".png") {
-                        crate::log!("Found png image {}", image_path);
                         match ImageBuffer::from_png(&*data) {
                             Ok(data) => {
-                                crate::log!("load_image_dep_by_path: loaded PNG image, {} x {}, data len: {}, animated? {}",
-                                    data.width, data.height, data.data.len(), data.animation.is_some(),
-                                );
                                 let texture = data.into_new_texture(cx);
                                 cx.get_global::<ImageCache>().map.insert(image_path.to_string(), texture.clone());
                                 self.set_texture(Some(texture), id);

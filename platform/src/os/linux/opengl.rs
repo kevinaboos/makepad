@@ -483,7 +483,7 @@ impl Cx {
         // Temporary warning for Adreno failing at compiling shaders that use samplerExternalOES.
         let gpu_renderer = get_gl_string(gl_sys::RENDERER);
         if gpu_renderer.contains("Adreno") {
-            crate::log!("WARNING: This device is using {gpu_renderer} renderer.
+            crate::warning!("WARNING: This device is using {gpu_renderer} renderer.
             OpenGL external textures (GL_OES_EGL_image_external extension) are currently not working on makepad for most Adreno GPUs.
             This is likely due to a driver bug. External texture support is being disabled, which means you won't be able to use the Video widget on this device.");
         }
@@ -514,7 +514,7 @@ pub struct GlShader {
 
 impl GlShader{
     pub fn new(vertex: &str, pixel: &str, mapping: &CxDrawShaderMapping, os_type: &OsType)->Self{
-        crate::log!("GlShader::new(): \n  --> vertex: {vertex}\n  --> pixel: {pixel}");
+        // crate::log!("GlShader::new(): \n  --> vertex: {vertex}\n  --> pixel: {pixel}");
 
         // On OpenHarmony, re-using cached shaders doesn't work properly yet.
         #[cfg(target_env = "ohos")]
@@ -819,7 +819,7 @@ impl CxOsDrawShader {
     pub fn new(vertex: &str, pixel: &str, os_type: &OsType) -> Self {
         // Check if GL_OES_EGL_image_external extension is available in the current device, otherwise do not attempt to use in the shaders.
         let available_extensions = get_gl_string(gl_sys::EXTENSIONS);
-        crate::log!("Available extensions: {available_extensions}");
+        // crate::log!("Available extensions: {available_extensions}");
         let is_external_texture_supported = available_extensions.split_whitespace().any(|ext| ext == "GL_OES_EGL_image_external");
 
         let mut maybe_ext_tex_extension_import = String::new();
