@@ -1,6 +1,6 @@
 use {
     self::super::gl_sys, crate::{
-        cx::{Cx, OsType::{self, Android}}, draw_list::DrawListId, draw_shader::{CxDrawShaderMapping, DrawShaderTextureInput}, event::{Event, TextureHandleReadyEvent}, log, makepad_live_id::*, makepad_math::{DVec2, Mat4, Vec4}, makepad_shader_compiler::generate_glsl, pass::{PassClearColor, PassClearDepth, PassId}, texture::{CxTexture, Texture, TextureFormat, TexturePixel, TextureUpdated}
+        cx::{Cx, OsType}, draw_list::DrawListId, draw_shader::{CxDrawShaderMapping, DrawShaderTextureInput}, event::{Event, TextureHandleReadyEvent}, log, makepad_live_id::*, makepad_math::{DVec2, Mat4, Vec4}, makepad_shader_compiler::generate_glsl, pass::{PassClearColor, PassClearDepth, PassId}, texture::{CxTexture, Texture, TextureFormat, TexturePixel, TextureUpdated}
     }, std::{
         ffi::{c_char, CStr}, fs::{remove_file, File}, io::prelude::*, mem, ptr
     }
@@ -799,20 +799,19 @@ impl CxOsDrawShader {
         // GL_OES_EGL_image_external is not well supported on Android emulators with macOS hosts.
         // Because there's no bullet-proof way to check the emualtor host at runtime, we're currently disabling external texture support on all emulators.
         let is_emulator = match os_type {
-            Android(params) => params.is_emulator,
+            OsType::Android(params) => params.is_emulator,
+            OsType::OpenHarmony(_) => true, // TODO FIXME: detect whether we're running on an OHOS emulator
             _ => false,
         };
 
         // Some Android devices running Adreno GPUs suddenly stopped compiling shaders when passing the samplerExternalOES sampler to texture2D functions. 
         // This seems like a driver bug (no confirmation from Qualcomm yet).
         // Therefore we're disabling the external texture support for Adreno until this is fixed.
-
-        // KEVIN TEMP HACK REMOVED THIS
-        // let is_vendor_adreno = get_gl_string(gl_sys::RENDERER).contains("Adreno"); 
-        // if is_external_texture_supported && !is_vendor_adreno && !is_emulator {
-        //     maybe_ext_tex_extension_import = "#extension GL_OES_EGL_image_external : require\n".to_string();
-        //     maybe_ext_tex_extension_sampler = "vec4 sample2dOES(samplerExternalOES sampler, vec2 pos){{ return texture2D(sampler, vec2(pos.x, pos.y));}}".to_string();
-        // }
+        let is_vendor_adreno = get_gl_string(gl_sys::RENDERER).contains("Adreno"); 
+        if is_external_texture_supported && !is_vendor_adreno && !is_emulator {
+            maybe_ext_tex_extension_import = "#extension GL_OES_EGL_image_external : require\n".to_string();
+            maybe_ext_tex_extension_sampler = "vec4 sample2dOES(samplerExternalOES sampler, vec2 pos){{ return texture2D(sampler, vec2(pos.x, pos.y));}}".to_string();
+        }
         
         let vertex = format!("
             #version 100
