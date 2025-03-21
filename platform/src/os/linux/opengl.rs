@@ -629,7 +629,6 @@ impl GlShader{
                 program
             };
 
-            // Kevin TEMP HACK
             let t = Self{
                 program,
                 geometries:Self::opengl_get_attributes(program, "packed_geometry_", mapping.geometries.total_slots),
@@ -642,11 +641,11 @@ impl GlShader{
                 live_uniforms: Self::opengl_get_uniform(program, "live_table"),
                 const_table_uniform: Self::opengl_get_uniform(program, "const_table"),
             };
-            crate::error!("GlShader: {:#?}", t);
-            for tex in &t.textures {
-                crate::error!("TEXTURE loc: {}: vertex:\n{}", tex.loc, vertex);
-                crate::error!("TEXTURE loc: {}: pixel:\n{}", tex.loc, pixel);
-            }
+            // crate::error!("GlShader: {:#?}", t);
+            // for tex in &t.textures {
+            //     crate::error!("TEXTURE loc: {}: vertex:\n{}", tex.loc, vertex);
+            //     crate::error!("TEXTURE loc: {}: pixel:\n{}", tex.loc, pixel);
+            // }
             t
         }
     }

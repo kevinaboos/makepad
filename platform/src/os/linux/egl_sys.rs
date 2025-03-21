@@ -515,6 +515,8 @@ pub unsafe  fn create_egl_context(
 
     let config = available_cfgs[0];
 
+    // TODO FIXME: these attributes were required to make the OpenHarmony emulator work.
+    //             They may not be necessary on real hardware or on other platforms.
     let ctx_attributes = vec![
         EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_CONTEXT_MINOR_VERSION_KHR , 1,
