@@ -519,6 +519,7 @@ impl Html {
             some_id!(del)
             | some_id!(s)
             | some_id!(strike) => tf.strikethrough.pop(),
+            Some(x) => return Some(x),
             _ => ()
         }
         None
@@ -528,7 +529,7 @@ impl Html {
         cx: &mut Cx2d,
         tf: &mut TextFlow,
         node: &mut HtmlWalker,
-        trim: TrimWhitespaceInText,    
+        trim: TrimWhitespaceInText,
     ) -> bool {
         if let Some(text) = node.text() {
             let text = if trim == TrimWhitespaceInText::Trim {
@@ -543,6 +544,76 @@ impl Html {
             false
         }
     }
+
+    fn parse_recursive(
+        cx: &mut Cx2d,
+        tf: &mut TextFlow,
+        node: &mut HtmlWalker,
+        auto_id: &mut u64,
+        custom_subwidget: Option<WidgetRef>,
+        doc: &HtmlDoc,
+        list_stack: &mut Vec<ListLevel>,
+        ul_markers: &Vec<String>,
+        ol_markers: &Vec<OrderedListType>,
+        ol_separator: &str,
+    ) {
+        log!("top of parse_recursive: {node:?}");
+
+        let mut trim = TrimWhitespaceInText::default();
+        match Self::handle_open_tag(cx, tf, node, list_stack, ul_markers, ol_markers, ol_separator) {
+            (Some(_tag_live_id), _tws) => {
+                log!("Handling custom tag: {_tag_live_id:?}");
+                // Here, we handle custom "subwidgets": HTML tags not handled in `handle_open_tag`.
+                let id = if let Some(id) = node.find_attr_lc(live_id!(id)) {
+                    LiveId::from_str(id)
+                } else {
+                    *auto_id += 1;
+                    LiveId(*auto_id)
+                };
+                log!("Got `find_attr_lc()` custom id: {id:?}");
+
+                let template = node.open_tag_nc().unwrap();
+                // lets grab the nodes+index from the walker
+                let mut scope_with_attrs = Scope::with_props_index(doc, node.index);
+                // log!("FOUND CUSTOM WIDGET! template: {template:?}, id: {id:?}, attrs: {attrs:?}");
+
+                if let Some(item) = tf.item_with_scope(cx, &mut scope_with_attrs, id, template) {
+                    log!("Created item from template {template:?}");
+                    Self::parse_recursive(
+                        cx,
+                        tf,
+                        node,
+                        auto_id,
+                        Some(item),
+                        doc,
+                        list_stack,
+                        ul_markers,
+                        ol_markers,
+                        ol_separator,
+                    );
+                }
+
+                node.jump_to_close();
+            }
+            (None, tws) => {
+                trim = tws;
+            }
+        }
+
+        match Self::handle_close_tag(cx, tf, node, list_stack) {
+            _ => ()
+        }
+
+        if let Some(csw) = custom_subwidget.as_ref() {
+            csw.set_text(cx, node.find_text().unwrap_or(""));
+            let mut draw_scope = Scope::with_data(tf);
+            csw.draw_all(cx, &mut draw_scope);
+        }
+        else {
+            Self::handle_text_node(cx, tf, node, trim);
+        }
+
+    }
 }
 
 impl Widget for Html {
@@ -550,31 +621,32 @@ impl Widget for Html {
         self.text_flow.handle_event(cx, event, scope);
     }
     
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
         let tf = &mut self.text_flow;
         tf.begin(cx, walk);
         // alright lets iterate the html doc and draw it
         let mut node = self.doc.new_walker();
         let mut auto_id = 0;
+
         while !node.done() {
-            let mut trim = TrimWhitespaceInText::default();
-            match Self::handle_open_tag(cx, tf, &mut node, &mut self.list_stack, &self.ul_markers, &self.ol_markers, &self.ol_separator) {
-                (Some(_), _tws) => {
-                    handle_custom_widget(cx, scope, tf, &self.doc, &mut node, &mut auto_id); 
-                }
-                (None, tws) => {
-                    trim = tws;
-                }
-            }
-            match Self::handle_close_tag(cx, tf, &mut node, &mut self.list_stack) {
-                _ => ()
-            }
-            Self::handle_text_node(cx, tf, &mut node, trim);
+            Self::parse_recursive(
+                cx,
+                tf,
+                &mut node,
+                &mut auto_id,
+                None,
+                &self.doc,
+                &mut self.list_stack,
+                &self.ul_markers,
+                &self.ol_markers,
+                &self.ol_separator,
+            );
             node.walk();
         }
+
         tf.end(cx);
         DrawStep::done()
-    }  
+    }
      
     fn text(&self) -> String {
         self.body.as_ref().to_string()
@@ -590,37 +662,6 @@ impl Widget for Html {
         self.redraw(cx);
     }
 } 
-
-
-fn handle_custom_widget(
-    cx: &mut Cx2d,
-    _scope: &mut Scope,
-    tf: &mut TextFlow,
-    doc: &HtmlDoc,
-    node: &mut HtmlWalker,
-    auto_id: &mut u64,
-) {
-    let id = if let Some(id) = node.find_attr_lc(live_id!(id)) {
-        LiveId::from_str(id)
-    } else {
-        *auto_id += 1;
-        LiveId(*auto_id)
-    };
-
-    let template = node.open_tag_nc().unwrap();
-    // lets grab the nodes+index from the walker
-    let mut scope_with_attrs = Scope::with_props_index(doc, node.index);
-    // log!("FOUND CUSTOM WIDGET! template: {template:?}, id: {id:?}, attrs: {attrs:?}");
-
-    if let Some(item) = tf.item_with_scope(cx, &mut scope_with_attrs, id, template) {
-        item.set_text(cx, node.find_text().unwrap_or(""));
-        let mut draw_scope = Scope::with_data(tf);
-        item.draw_all(cx, &mut draw_scope);
-    }
-
-    node.jump_to_close();
-}
-
 
 #[derive(Debug, Clone, DefaultNone)]
 pub enum HtmlLinkAction {

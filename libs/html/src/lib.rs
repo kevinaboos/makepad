@@ -30,7 +30,8 @@ pub struct HtmlAttribute {
     /// The value of this attribute.
     pub value: String,
 }*/
- 
+
+#[derive(Debug)]
 pub struct HtmlWalker<'a>{
     decoded: &'a str,
     pub nodes: &'a [HtmlNode],
