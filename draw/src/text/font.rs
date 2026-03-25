@@ -9,11 +9,11 @@ use {
         loader::FontData,
         rasterizer::{RasterizedGlyph, Rasterizer},
     },
+    fxhash::FxHashMap,
     rustybuzz,
     rustybuzz::ttf_parser,
     std::{
         cell::RefCell,
-        collections::HashMap,
         hash::{Hash, Hasher},
         rc::Rc,
     },
@@ -39,9 +39,13 @@ pub struct Font {
     id: FontId,
     rasterizer: Rc<RefCell<Rasterizer>>,
     face: FontFace,
-    ascender_fudge_in_ems: f32,
-    descender_fudge_in_ems: f32,
-    cached_glyph_outline_bounds_in_ems: RefCell<HashMap<GlyphId, Option<Rect<f32>>>>,
+    /// Cached font metrics computed once at construction to avoid repeated
+    /// font table parsing on every access.
+    cached_units_per_em: f32,
+    cached_ascender_in_ems: f32,
+    cached_descender_in_ems: f32,
+    cached_line_gap_in_ems: f32,
+    cached_glyph_outline_bounds_in_ems: RefCell<FxHashMap<GlyphId, Option<Rect<f32>>>>,
 }
 
 impl Font {
@@ -52,13 +56,25 @@ impl Font {
         ascender_fudge_in_ems: f32,
         descender_fudge_in_ems: f32,
     ) -> Self {
+        let (units_per_em, ascender_in_ems, descender_in_ems, line_gap_in_ems) =
+            face.with_ttf_parser_face(|f| {
+                let upem = f.units_per_em() as f32;
+                (
+                    upem,
+                    f.ascender() as f32 / upem + ascender_fudge_in_ems,
+                    f.descender() as f32 / upem + descender_fudge_in_ems,
+                    f.line_gap() as f32 / upem,
+                )
+            });
         Self {
             id,
             rasterizer,
             face,
-            ascender_fudge_in_ems,
-            descender_fudge_in_ems,
-            cached_glyph_outline_bounds_in_ems: RefCell::new(HashMap::new()),
+            cached_units_per_em: units_per_em,
+            cached_ascender_in_ems: ascender_in_ems,
+            cached_descender_in_ems: descender_in_ems,
+            cached_line_gap_in_ems: line_gap_in_ems,
+            cached_glyph_outline_bounds_in_ems: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -79,33 +95,30 @@ impl Font {
     }
 
     pub fn units_per_em(&self) -> f32 {
-        self.with_ttf_parser_face(|face| face.units_per_em() as f32)
+        self.cached_units_per_em
     }
 
     pub fn ascender_in_ems(&self) -> f32 {
-        self.with_ttf_parser_face(|face| {
-            face.ascender() as f32 / face.units_per_em() as f32 + self.ascender_fudge_in_ems
-        })
+        self.cached_ascender_in_ems
     }
 
     pub fn descender_in_ems(&self) -> f32 {
-        self.with_ttf_parser_face(|face| {
-            face.descender() as f32 / face.units_per_em() as f32 + self.descender_fudge_in_ems
-        })
+        self.cached_descender_in_ems
     }
 
     pub fn line_gap_in_ems(&self) -> f32 {
-        self.with_ttf_parser_face(|face| face.line_gap() as f32 / face.units_per_em() as f32)
+        self.cached_line_gap_in_ems
     }
 
     pub fn glyph_outline(&self, glyph_id: GlyphId) -> Option<GlyphOutline> {
+        let upem = self.cached_units_per_em;
         self.with_ttf_parser_face(|face| {
             let glyph_id = ttf_parser::GlyphId(glyph_id);
             let mut builder = glyph_outline::Builder::new();
             let bounds = face.outline_glyph(glyph_id, &mut builder)?;
             let min = Point::new(bounds.x_min as f32, bounds.y_min as f32);
             let max = Point::new(bounds.x_max as f32, bounds.y_max as f32);
-            Some(builder.finish(Rect::new(min, max - min), face.units_per_em() as f32))
+            Some(builder.finish(Rect::new(min, max - min), upem))
         })
     }
 
