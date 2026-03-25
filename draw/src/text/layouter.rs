@@ -156,7 +156,17 @@ impl Default for Settings {
 }
 
 fn default_text_atlas_size() -> Size<usize> {
-    atlas_size_override_from_env().unwrap_or_else(|| Size::new(2048, 2048))
+    atlas_size_override_from_env().unwrap_or_else(|| {
+        #[cfg(any(target_os = "android", target_os = "ios", target_arch = "wasm32"))]
+        {
+            Size::new(2048, 2048)
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))]
+        {
+            Size::new(4096, 4096)
+        }
+    })
 }
 
 fn atlas_size_override_from_env() -> Option<Size<usize>> {
