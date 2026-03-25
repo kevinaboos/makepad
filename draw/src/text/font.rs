@@ -9,11 +9,11 @@ use {
         loader::FontData,
         rasterizer::{RasterizedGlyph, Rasterizer},
     },
+    fxhash::FxHashMap,
     rustybuzz,
     rustybuzz::ttf_parser,
     std::{
         cell::RefCell,
-        collections::HashMap,
         hash::{Hash, Hasher},
         rc::Rc,
     },
@@ -43,7 +43,7 @@ pub struct Font {
     ascender_in_ems: f32,
     descender_in_ems: f32,
     line_gap_in_ems: f32,
-    cached_glyph_outlines: RefCell<HashMap<GlyphId, Option<GlyphOutline>>>,
+    cached_glyph_outlines: RefCell<FxHashMap<GlyphId, Option<GlyphOutline>>>,
 }
 
 impl Font {
@@ -72,7 +72,7 @@ impl Font {
             ascender_in_ems,
             descender_in_ems,
             line_gap_in_ems,
-            cached_glyph_outlines: RefCell::new(HashMap::new()),
+            cached_glyph_outlines: RefCell::new(FxHashMap::default()),
         }
     }
 

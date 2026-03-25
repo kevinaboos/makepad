@@ -9,7 +9,8 @@ use super::{
     sdfer,
     sdfer::Sdfer,
 };
-use std::collections::{HashMap, HashSet};
+use fxhash::FxHashMap;
+use std::collections::HashSet;
 //use std::{fs::File, io::BufWriter, path::Path, slice};
 
 #[derive(Debug)]
@@ -21,7 +22,7 @@ pub struct Rasterizer {
     outline_rasterization_mode: OutlineRasterizationMode,
     atlas: ColorAtlas,
     allocator: MultiPlaneAllocator,
-    cached_slots: HashMap<GlyphImageKey, AtlasSlot>,
+    cached_slots: FxHashMap<GlyphImageKey, AtlasSlot>,
     outline_msdf_ready: HashSet<GlyphImageKey>,
     outline_msdf_pending: HashSet<GlyphImageKey>,
     outline_msdf_failed: HashSet<GlyphImageKey>,
@@ -40,7 +41,7 @@ impl Rasterizer {
             outline_rasterization_mode: settings.outline_rasterization_mode,
             atlas: ColorAtlas::new(atlas_size),
             allocator: MultiPlaneAllocator::new(atlas_size),
-            cached_slots: HashMap::new(),
+            cached_slots: FxHashMap::default(),
             outline_msdf_ready: HashSet::new(),
             outline_msdf_pending: HashSet::new(),
             outline_msdf_failed: HashSet::new(),

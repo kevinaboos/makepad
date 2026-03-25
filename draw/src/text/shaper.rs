@@ -4,10 +4,11 @@ use {
         slice::SliceExt,
         substr::Substr,
     },
+    fxhash::FxHashMap,
     rustybuzz,
     rustybuzz::UnicodeBuffer,
     std::{
-        collections::{HashMap, VecDeque},
+        collections::VecDeque,
         hash::{Hash, Hasher},
         mem,
         rc::Rc,
@@ -53,17 +54,19 @@ pub struct Shaper {
     reusable_unicode_buffer: UnicodeBuffer,
     cache_size: usize,
     cached_params: VecDeque<ShapeParams>,
-    cached_results: HashMap<ShapeParams, Rc<ShapedText>>,
+    cached_results: FxHashMap<ShapeParams, Rc<ShapedText>>,
 }
 
 impl Shaper {
     pub fn new(settings: Settings) -> Self {
+        let mut cached_results = FxHashMap::default();
+        cached_results.reserve(settings.cache_size);
         Self {
             reusable_glyphs: Vec::new(),
             reusable_unicode_buffer: UnicodeBuffer::new(),
             cache_size: settings.cache_size,
             cached_params: VecDeque::with_capacity(settings.cache_size),
-            cached_results: HashMap::with_capacity(settings.cache_size),
+            cached_results,
         }
     }
 
