@@ -13,10 +13,11 @@ use {
         shaper::{self, ShapedText},
         substr::Substr,
     },
+    fxhash::FxHashMap,
     std::{
         borrow::Borrow,
         cell::RefCell,
-        collections::{HashMap, VecDeque},
+        collections::VecDeque,
         env,
         hash::{Hash, Hasher},
         mem,
@@ -33,16 +34,18 @@ pub struct Layouter {
     pub(crate) loader: Loader,
     cache_size: usize,
     cached_params: VecDeque<OwnedLayoutParams>,
-    cached_results: HashMap<OwnedLayoutParams, Rc<LaidoutText>>,
+    cached_results: FxHashMap<OwnedLayoutParams, Rc<LaidoutText>>,
 }
 
 impl Layouter {
     pub fn new(settings: Settings) -> Self {
+        let mut cached_results = FxHashMap::default();
+        cached_results.reserve(settings.cache_size);
         Self {
             loader: Loader::new(settings.loader),
             cache_size: settings.cache_size,
             cached_params: VecDeque::with_capacity(settings.cache_size),
-            cached_results: HashMap::with_capacity(settings.cache_size),
+            cached_results,
         }
     }
 
