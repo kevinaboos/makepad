@@ -4,12 +4,14 @@ use {
         cx_draw::CxDraw,
         draw_list_2d::ManyInstances,
         makepad_platform::*,
+        shader::draw_glyph::{DrawGlyph, GlyphShapeId},
         text::{
             color::Color,
             font::FontId,
             font_family::FontFamilyId,
             fonts::Fonts,
             geom::{Point, Rect as TextRect, Size, Transform},
+            glyph_outline::Command as OutlineCommand,
             layouter::{
                 BorrowedLayoutParams, LaidoutGlyph, LaidoutRow, LaidoutText, LayoutOptions, Style,
             },
@@ -21,7 +23,7 @@ use {
     },
     std::{
         cell::RefCell,
-        collections::hash_map::DefaultHasher,
+        collections::{hash_map::DefaultHasher, HashMap},
         hash::{Hash, Hasher},
         rc::Rc,
     },
@@ -75,24 +77,325 @@ script_mod! {
         cutoff: uniform(float)
         total_chars: instance(1000000.0)
 
+        // SDF/MSDF atlas textures
         grayscale_texture: texture_2d(float)
         color_texture: texture_2d(float)
         msdf_texture: texture_2d(float)
 
-        vertex: fn() {
-            let p = mix(self.rect_pos, self.rect_pos + self.rect_size, self.geom.pos)
-            let p_clipped = clamp(p, self.draw_clip.xy, self.draw_clip.zw)
-            let p_normalized = (p_clipped - self.rect_pos) / self.rect_size
+        // SLUG curve/band textures
+        curve_texture: texture_2d(float)
+        band_texture: texture_2d(float)
 
-            self.pos = p_normalized;
-            self.t = mix(self.t_min, self.t_max, p_normalized.xy)
+        // SLUG uniforms
+        slug_aa_pad_px: uniform(float(1.0))
+        slug_matrix_0: uniform(vec4(1.0, 0.0, 0.0, 0.0))
+        slug_matrix_1: uniform(vec4(0.0, 1.0, 0.0, 0.0))
+        slug_matrix_3: uniform(vec4(0.0, 0.0, 0.0, 1.0))
+        slug_viewport_px: uniform(vec2(1.0, 1.0))
+
+        saturate_val: fn(v: float) -> float {
+            return clamp(v, 0.0, 1.0)
+        }
+
+        slug_dilate: fn(pos: vec2, tex: vec2, jac: vec4, normal: vec2) -> vec4 {
+            let n = normalize(normal)
+            let s = dot(self.slug_matrix_3.xy, pos) + self.slug_matrix_3.w
+            let t = dot(self.slug_matrix_3.xy, n)
+            let u = (
+                s * dot(self.slug_matrix_0.xy, n)
+                    - t * (dot(self.slug_matrix_0.xy, pos) + self.slug_matrix_0.w)
+            ) * self.slug_viewport_px.x
+            let v = (
+                s * dot(self.slug_matrix_1.xy, n)
+                    - t * (dot(self.slug_matrix_1.xy, pos) + self.slug_matrix_1.w)
+            ) * self.slug_viewport_px.y
+            let s2 = s * s
+            let st = s * t
+            let uv = u * u + v * v
+            let d = normal * (
+                s2 * (st + sqrt(uv)) / max(uv - st * st, 0.0000001)
+            ) * self.slug_aa_pad_px
+            let vpos = pos + d
+            let vtex = vec2(tex.x + dot(d, jac.xy), tex.y + dot(d, jac.zw))
+            return vec4(vtex.x, vtex.y, vpos.x, vpos.y)
+        }
+
+        slug_fetch_curve: fn(texel_idx: float) -> vec4 {
+            let tex_size = self.curve_texture.size()
+            let row = floor(texel_idx / tex_size.x)
+            let col = texel_idx - row * tex_size.x
+            let uv = vec2((col + 0.5) / tex_size.x, (row + 0.5) / tex_size.y)
+            return self.curve_texture.sample(uv)
+        }
+
+        slug_fetch_band: fn(texel_idx: float) -> vec4 {
+            let tex_size = self.band_texture.size()
+            let row = floor(texel_idx / tex_size.x)
+            let col = texel_idx - row * tex_size.x
+            let uv = vec2((col + 0.5) / tex_size.x, (row + 0.5) / tex_size.y)
+            return self.band_texture.sample(uv)
+        }
+
+        slug_pick_channel: fn(v: vec4, channel: float) -> float {
+            if channel < 0.5 { return v.x }
+            if channel < 1.5 { return v.y }
+            if channel < 2.5 { return v.z }
+            return v.w
+        }
+
+        slug_root_code: fn(y1: float, y2: float, y3: float) -> u32 {
+            let i1 = asuint(y1) >> u32(31)
+            let i2 = asuint(y2) >> u32(30)
+            let i3 = asuint(y3) >> u32(29)
+            let shift = (i1 & u32(1)) | (i2 & u32(2)) | (i3 & u32(4))
+            return (u32(11892) >> shift) & u32(257)
+        }
+
+        slug_solve_horiz: fn(p12: vec4, p3: vec2) -> vec2 {
+            let a = p12.xy - p12.zw * 2.0 + p3
+            let b = p12.xy - p12.zw
+            let ra = 1.0 / a.y
+            let rb = 0.5 / b.y
+            let d = sqrt(max(b.y * b.y - a.y * p12.y, 0.0))
+            let mut t1 = (b.y - d) * ra
+            let mut t2 = (b.y + d) * ra
+            if abs(a.y) < 1.0 / 65536.0 {
+                t1 = p12.y * rb
+                t2 = t1
+            }
+            return vec2(
+                (a.x * t1 - b.x * 2.0) * t1 + p12.x,
+                (a.x * t2 - b.x * 2.0) * t2 + p12.x
+            )
+        }
+
+        slug_solve_vert: fn(p12: vec4, p3: vec2) -> vec2 {
+            let a = p12.xy - p12.zw * 2.0 + p3
+            let b = p12.xy - p12.zw
+            let ra = 1.0 / a.x
+            let rb = 0.5 / b.x
+            let d = sqrt(max(b.x * b.x - a.x * p12.x, 0.0))
+            let mut t1 = (b.x - d) * ra
+            let mut t2 = (b.x + d) * ra
+            if abs(a.x) < 1.0 / 65536.0 {
+                t1 = p12.x * rb
+                t2 = t1
+            }
+            return vec2(
+                (a.y * t1 - b.y * 2.0) * t1 + p12.y,
+                (a.y * t2 - b.y * 2.0) * t2 + p12.y
+            )
+        }
+
+        slug_scan_h_list: fn(list_offset: float, list_count: float, sample: vec2, px_size: float) -> vec2 {
+            let limit = floor(list_count + 0.5)
+            var coverage = 0.0
+            var weight = 0.0
+            var j = 0.0
+            loop {
+                if j >= limit { break }
+                let packed_idx = floor(j * 0.25)
+                let channel = j - packed_idx * 4.0
+                let idx_data = self.slug_fetch_band(list_offset + packed_idx)
+                let curve_idx = self.slug_pick_channel(idx_data, channel)
+                let p12 = self.slug_fetch_curve(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
+                let p3 = self.slug_fetch_curve(curve_idx * 2.0 + 1.0).xy - sample
+                if max(max(p12.x, p12.z), p3.x) / px_size < -0.5 { break }
+                let code = self.slug_root_code(p12.y, p12.w, p3.y)
+                if code != u32(0) {
+                    let r = self.slug_solve_horiz(p12, p3) / px_size
+                    if (code & u32(1)) != u32(0) {
+                        coverage = coverage + self.saturate_val(r.x + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.x) * 2.0))
+                    }
+                    if code > u32(1) {
+                        coverage = coverage - self.saturate_val(r.y + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.y) * 2.0))
+                    }
+                }
+                j = j + 1.0
+            }
+            return vec2(coverage, weight)
+        }
+
+        slug_scan_v_list: fn(list_offset: float, list_count: float, sample: vec2, px_size: float) -> vec2 {
+            let limit = floor(list_count + 0.5)
+            var coverage = 0.0
+            var weight = 0.0
+            var j = 0.0
+            loop {
+                if j >= limit { break }
+                let packed_idx = floor(j * 0.25)
+                let channel = j - packed_idx * 4.0
+                let idx_data = self.slug_fetch_band(list_offset + packed_idx)
+                let curve_idx = self.slug_pick_channel(idx_data, channel)
+                let p12 = self.slug_fetch_curve(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
+                let p3 = self.slug_fetch_curve(curve_idx * 2.0 + 1.0).xy - sample
+                if max(max(p12.y, p12.w), p3.y) / px_size < -0.5 { break }
+                let code = self.slug_root_code(p12.x, p12.z, p3.x)
+                if code != u32(0) {
+                    let r = self.slug_solve_vert(p12, p3) / px_size
+                    if (code & u32(1)) != u32(0) {
+                        coverage = coverage - self.saturate_val(r.x + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.x) * 2.0))
+                    }
+                    if code > u32(1) {
+                        coverage = coverage + self.saturate_val(r.y + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.y) * 2.0))
+                    }
+                }
+                j = j + 1.0
+            }
+            return vec2(coverage, weight)
+        }
+
+        slug_scan_h_all: fn(sample: vec2, px_size: float, c_offset: float, c_count: float) -> vec2 {
+            let limit = floor(c_count + 0.5)
+            var coverage = 0.0
+            var weight = 0.0
+            var i = 0.0
+            loop {
+                if i >= limit { break }
+                let curve_idx = c_offset + i
+                let p12 = self.slug_fetch_curve(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
+                let p3 = self.slug_fetch_curve(curve_idx * 2.0 + 1.0).xy - sample
+                let code = self.slug_root_code(p12.y, p12.w, p3.y)
+                if code != u32(0) {
+                    let r = self.slug_solve_horiz(p12, p3) / px_size
+                    if (code & u32(1)) != u32(0) {
+                        coverage = coverage + self.saturate_val(r.x + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.x) * 2.0))
+                    }
+                    if code > u32(1) {
+                        coverage = coverage - self.saturate_val(r.y + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.y) * 2.0))
+                    }
+                }
+                i = i + 1.0
+            }
+            return vec2(coverage, weight)
+        }
+
+        slug_scan_v_all: fn(sample: vec2, px_size: float, c_offset: float, c_count: float) -> vec2 {
+            let limit = floor(c_count + 0.5)
+            var coverage = 0.0
+            var weight = 0.0
+            var i = 0.0
+            loop {
+                if i >= limit { break }
+                let curve_idx = c_offset + i
+                let p12 = self.slug_fetch_curve(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
+                let p3 = self.slug_fetch_curve(curve_idx * 2.0 + 1.0).xy - sample
+                let code = self.slug_root_code(p12.x, p12.z, p3.x)
+                if code != u32(0) {
+                    let r = self.slug_solve_vert(p12, p3) / px_size
+                    if (code & u32(1)) != u32(0) {
+                        coverage = coverage - self.saturate_val(r.x + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.x) * 2.0))
+                    }
+                    if code > u32(1) {
+                        coverage = coverage + self.saturate_val(r.y + 0.5)
+                        weight = max(weight, self.saturate_val(1.0 - abs(r.y) * 2.0))
+                    }
+                }
+                i = i + 1.0
+            }
+            return vec2(coverage, weight)
+        }
+
+        slug_coverage: fn(xcov: float, ycov: float, xwgt: float, ywgt: float, flags: float) -> float {
+            let coverage = max(
+                abs(xcov * xwgt + ycov * ywgt) / max(xwgt + ywgt, 1.0 / 65536.0),
+                min(abs(xcov), abs(ycov))
+            )
+            if flags >= 4096.0 {
+                return 1.0 - abs(1.0 - fract(coverage * 0.5) * 2.0)
+            }
+            return self.saturate_val(coverage)
+        }
+
+        slug_alpha: fn(sample: vec2, px_x: float, px_y: float,
+                       c_offset: float, c_count: float,
+                       b_offset: float, b_count: float,
+                       flags: float) -> float {
+            var coverage_x = 0.0
+            var coverage_y = 0.0
+            var weight_x = 0.0
+            var weight_y = 0.0
+
+            if b_count > 0.5 {
+                let num_bands = max(floor(b_count + 0.5), 1.0)
+                let h_band_idx = clamp(floor(sample.y * num_bands), 0.0, num_bands - 1.0)
+                let v_band_idx = clamp(floor(sample.x * num_bands), 0.0, num_bands - 1.0)
+                let h_band_info = self.slug_fetch_band(b_offset + h_band_idx)
+                let h_band = self.slug_scan_h_list(
+                    floor(h_band_info.x + 0.5), h_band_info.y, sample, px_x
+                )
+                coverage_x = h_band.x
+                weight_x = h_band.y
+                let v_band_info = self.slug_fetch_band(b_offset + num_bands + v_band_idx)
+                let v_band = self.slug_scan_v_list(
+                    floor(v_band_info.x + 0.5), v_band_info.y, sample, px_y
+                )
+                coverage_y = v_band.x
+                weight_y = v_band.y
+            } else {
+                let x_scan = self.slug_scan_h_all(sample, px_x, c_offset, c_count)
+                coverage_x = x_scan.x
+                weight_x = x_scan.y
+                let y_scan = self.slug_scan_v_all(sample, px_y, c_offset, c_count)
+                coverage_y = y_scan.x
+                weight_y = y_scan.y
+            }
+
+            return self.slug_coverage(coverage_x, coverage_y, weight_x, weight_y, flags)
+        }
+
+        vertex: fn() {
+            if self.texture_index < 5.0 {
+                // SDF/bitmap mode vertex
+                let p = mix(self.rect_pos, self.rect_pos + self.rect_size, self.geom.pos)
+                let p_clipped = clamp(p, self.draw_clip.xy, self.draw_clip.zw)
+                let p_normalized = (p_clipped - self.rect_pos) / self.rect_size
+                self.pos = p_normalized
+                self.t = mix(self.t_min, self.t_max, p_normalized.xy)
+                self.world = self.draw_list.view_transform * vec4(
+                    p_clipped.x,
+                    p_clipped.y,
+                    self.glyph_depth + self.draw_call.zbias,
+                    1.
+                )
+                self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * (self.world))
+                return
+            }
+            // SLUG mode vertex
+            let pad_lpx = self.slug_aa_pad_px / max(self.draw_pass.dpi_factor, 0.0001)
+            let content_rect_pos = self.rect_pos + vec2(pad_lpx, pad_lpx)
+            let content_rect_size = vec2(
+                max(self.rect_size.x - 2.0 * pad_lpx, 0.0001),
+                max(self.rect_size.y - 2.0 * pad_lpx, 0.0001)
+            )
+            let p = mix(content_rect_pos, content_rect_pos + content_rect_size, self.geom.pos)
+            let jac = vec4(1.0 / content_rect_size.x, 0.0, 0.0, 1.0 / content_rect_size.y)
+            let corner = self.geom.pos * 2.0 - 1.0
+            let normal = if dot(corner, corner) > 0.000001 {
+                corner
+            } else {
+                vec2(1.0, 0.0)
+            }
+            let dilated = self.slug_dilate(p, self.geom.pos, jac, normal)
+            let p_clipped = clamp(dilated.zw, self.draw_clip.xy, self.draw_clip.zw)
+            self.pos = vec2(
+                dilated.x + (p_clipped.x - dilated.z) * jac.x,
+                dilated.y + (p_clipped.y - dilated.w) * jac.w
+            )
             self.world = self.draw_list.view_transform * vec4(
                 p_clipped.x,
                 p_clipped.y,
                 self.glyph_depth + self.draw_call.zbias,
                 1.
             )
-            self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * (self.world))
+            self.vertex_pos = self.draw_pass.camera_projection * (self.draw_pass.camera_view * self.world)
         }
 
         sdf: fn(scale, p, color) {
@@ -106,7 +409,6 @@ script_mod! {
             } else {
                 sampled.a
             };
-            // Convert sampled SDF to coverage (0..1). scale is source texels per screen pixel.
             let safe_scale = max(scale, 0.0001);
             let luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));
             var a = clamp(
@@ -114,9 +416,6 @@ script_mod! {
                 0.0,
                 1.0,
             );
-            // Polarity compensation:
-            // dark text on light backgrounds usually appears softer than the inverse,
-            // so we bias coverage slightly by text luminance.
             let bias = (0.5 - luma) * self.sdf_luma_bias;
             a = clamp(a - bias, 0.0, 1.0);
             return a
@@ -124,7 +423,6 @@ script_mod! {
 
         msdf: fn(scale, p, color) {
             let s = self.msdf_texture.sample_as_bgra(p);
-            // Use alpha as the coverage source to keep parity with SDF while RGB stores MSDF.
             let dist = s.a;
             let safe_scale = max(scale, 0.0001);
             let luma = dot(color.rgb, vec3(0.299, 0.587, 0.114));
@@ -134,7 +432,6 @@ script_mod! {
                 1.0,
             );
             let bias = (0.5 - luma) * self.sdf_luma_bias;
-            // Avoid lifting near-zero background alpha into visible gray quads on light text.
             if a > self.sdf_luma_bias * 0.5 {
                 a = clamp(a - bias, 0.0, 1.0);
             }
@@ -178,7 +475,27 @@ script_mod! {
         }
 
         pixel: fn() {
-            return self.sample_text_pixel()
+            if self.texture_index < 5.0 {
+                return self.sample_text_pixel()
+            }
+            // SLUG mode
+            let c_offset = self.t_min.x
+            let c_count = self.t_min.y
+            let b_offset = self.t_max.x
+            let b_count = self.t_max.y
+            let flags = self.atlas_plane
+
+            if c_count < 0.5 {
+                return vec4(0.0, 0.0, 0.0, 0.0)
+            }
+
+            let sample = self.pos
+            let px_x = max(abs(dFdx(sample.x)) + abs(dFdy(sample.x)), 0.00001)
+            let px_y = max(abs(dFdx(sample.y)) + abs(dFdy(sample.y)), 0.00001)
+            let alpha = self.slug_alpha(sample, px_x, px_y, c_offset, c_count, b_offset, b_count, flags)
+
+            let color = self.get_color()
+            return vec4(color.rgb * color.a * alpha, color.a * alpha)
         }
     }
 }
@@ -229,6 +546,14 @@ pub struct DrawText {
     /// Useful when drawing multiple text chunks that should be treated as one area.
     #[live]
     pub extend_area: bool,
+
+    /// Internal DrawGlyph used for SLUG shape management (path building,
+    /// curve/band data, shape caching). Rendering uses DrawText's own shader.
+    /// Wrapped in Option<Box<>> to avoid Script derive needing Default/ScriptNew on DrawGlyph.
+    #[rust]
+    slug_renderer: Option<Box<DrawGlyph>>,
+    #[rust]
+    glyph_shape_cache: HashMap<(usize, u16), GlyphShapeId>,
 
     #[deref]
     pub draw_vars: DrawVars,
@@ -283,6 +608,66 @@ impl DrawText {
     pub fn draw_abs(&mut self, cx: &mut Cx2d, pos: Vec2d, text: &str) {
         let text = self.layout(cx, 0.0, 0.0, None, false, Align::default(), text);
         self.draw_text(cx, Point::new(pos.x as f32, pos.y as f32), &text);
+    }
+
+    fn ensure_slug_renderer(&mut self) -> &mut DrawGlyph {
+        if self.slug_renderer.is_none() {
+            self.slug_renderer = Some(Box::new(DrawGlyph::new_shape_manager()));
+        }
+        self.slug_renderer.as_mut().unwrap()
+    }
+
+    /// Get or create a cached SLUG glyph shape for the given laid-out glyph.
+    /// The shape is cached by (font pointer, glyph id) so outlines are only
+    /// committed once per unique glyph.
+    fn get_or_create_glyph_shape(&mut self, glyph: &LaidoutGlyph) -> Option<GlyphShapeId> {
+        let font_key = Rc::as_ptr(&glyph.font) as usize;
+        let cache_key = (font_key, glyph.id);
+
+        if let Some(&shape_id) = self.glyph_shape_cache.get(&cache_key) {
+            return Some(shape_id);
+        }
+
+        let outline = glyph.font.glyph_outline(glyph.id)?;
+        let inv_upe = 1.0 / glyph.font.units_per_em();
+
+        let renderer = self.ensure_slug_renderer();
+        renderer.begin_shape();
+        renderer.set_color(1.0, 1.0, 1.0, 1.0);
+
+        // Add outline commands with y-flip (font coords are y-up,
+        // screen coords are y-down) and normalize to em-space.
+        for command in outline.commands() {
+            match *command {
+                OutlineCommand::MoveTo(p) => {
+                    renderer.move_to(p.x * inv_upe, -p.y * inv_upe);
+                }
+                OutlineCommand::LineTo(p) => {
+                    renderer.line_to(p.x * inv_upe, -p.y * inv_upe);
+                }
+                OutlineCommand::QuadTo(c, p) => {
+                    renderer.quad_to(
+                        c.x * inv_upe, -c.y * inv_upe,
+                        p.x * inv_upe, -p.y * inv_upe,
+                    );
+                }
+                OutlineCommand::CurveTo(c1, c2, p) => {
+                    renderer.bezier_to(
+                        c1.x * inv_upe, -c1.y * inv_upe,
+                        c2.x * inv_upe, -c2.y * inv_upe,
+                        p.x * inv_upe, -p.y * inv_upe,
+                    );
+                }
+                OutlineCommand::Close => {
+                    renderer.close();
+                }
+            }
+        }
+        renderer.fill_layer();
+
+        let shape_id = renderer.commit_shape(None)?;
+        self.glyph_shape_cache.insert(cache_key, shape_id);
+        Some(shape_id)
     }
 
     pub fn begin_many_instances(&mut self, cx: &mut Cx2d) {
@@ -633,32 +1018,53 @@ impl DrawText {
 
     fn draw_text(&mut self, cx: &mut Cx2d, origin_in_lpxs: Point<f32>, text: &LaidoutText) {
         self.update_draw_vars(cx);
+
         if let Some(mut instances) = self.many_instances.take() {
             self.glyph_depth = self.draw_depth;
+            let mut glyph_index = 0.0f32;
             for row in &text.rows {
                 self.draw_row(
                     cx,
                     origin_in_lpxs + Size::from(row.origin_in_lpxs) * self.font_scale,
                     row,
+                    &mut glyph_index,
                     &mut instances.instances,
                 );
             }
+            // Re-upload textures: new glyphs may have been committed during the
+            // draw loop, adding curve/band data that wasn't in the initial upload.
+            // The Texture handles are already in draw_vars from update_draw_vars,
+            // so updating their data here makes the GPU see the latest curves.
+            self.flush_slug_textures(cx);
             self.many_instances = Some(instances);
             return;
         }
-        let Some(mut instances) = cx.begin_many_aligned_instances(&self.draw_vars) else {
+        let Some(mut instances) =
+            cx.begin_many_aligned_instances(&self.draw_vars)
+        else {
             return;
         };
         self.glyph_depth = self.draw_depth;
+        let mut glyph_index = 0.0f32;
         for row in &text.rows {
             self.draw_row(
                 cx,
                 origin_in_lpxs + Size::from(row.origin_in_lpxs) * self.font_scale,
                 row,
+                &mut glyph_index,
                 &mut instances.instances,
             );
         }
+        self.flush_slug_textures(cx);
         self.finish_many_instances(cx, instances);
+    }
+
+    /// Re-upload SLUG curve/band textures if new shapes were committed
+    /// during the draw loop.
+    fn flush_slug_textures(&mut self, cx: &mut Cx2d) {
+        if let Some(renderer) = self.slug_renderer.as_mut() {
+            renderer.upload_textures(cx.cx.cx);
+        }
     }
 
     fn finish_many_instances(&mut self, cx: &mut Cx2d, instances: ManyInstances) {
@@ -674,6 +1080,8 @@ impl DrawText {
 
     fn update_draw_vars(&mut self, cx: &mut Cx2d) {
         self.draw_vars.append_group_id = cx.draw_call_group_content().0;
+
+        // SDF/MSDF atlas textures (slots 0-2)
         let fonts = cx.fonts.borrow();
         let rasterizer = fonts.rasterizer().borrow();
         let sdfer_settings = rasterizer.sdfer().settings();
@@ -682,6 +1090,48 @@ impl DrawText {
         self.draw_vars.texture_slots[0] = Some(fonts.grayscale_texture().clone());
         self.draw_vars.texture_slots[1] = Some(fonts.color_texture().clone());
         self.draw_vars.texture_slots[2] = Some(fonts.msdf_texture().clone());
+        drop(rasterizer);
+        drop(fonts);
+
+        // SLUG curve/band textures (slots 3-4)
+        self.ensure_slug_renderer();
+        {
+            let renderer = self.slug_renderer.as_mut().unwrap();
+            renderer.upload_textures(cx.cx.cx);
+        }
+        self.draw_vars.texture_slots[3] = self.slug_renderer.as_ref().unwrap().curve_texture.clone();
+        self.draw_vars.texture_slots[4] = self.slug_renderer.as_ref().unwrap().band_texture.clone();
+
+        // SLUG uniforms
+        let pass_id = cx.pass_stack.last().unwrap().pass_id;
+        let draw_list_id = *cx.draw_list_stack.last().unwrap();
+        let pass_uniforms = cx.passes[pass_id].pass_uniforms.clone();
+        let view_transform = cx.draw_lists[draw_list_id]
+            .draw_list_uniforms
+            .view_transform;
+        let model_view = Mat4f::mul(&pass_uniforms.camera_view, &view_transform);
+        let slug_matrix = Mat4f::mul(&pass_uniforms.camera_projection, &model_view);
+        let viewport = cx.current_pass_size();
+        let dpi_factor = cx.current_dpi_factor() as f32;
+        let viewport_px = [
+            (viewport.x as f32 * dpi_factor).max(1.0),
+            (viewport.y as f32 * dpi_factor).max(1.0),
+        ];
+
+        fn mat4_row(mat: &Mat4f, row: usize) -> [f32; 4] {
+            [mat.v[row], mat.v[row + 4], mat.v[row + 8], mat.v[row + 12]]
+        }
+
+        self.draw_vars
+            .set_uniform(cx.cx, live_id!(slug_aa_pad_px), &[1.0]);
+        self.draw_vars
+            .set_uniform(cx.cx, live_id!(slug_matrix_0), &mat4_row(&slug_matrix, 0));
+        self.draw_vars
+            .set_uniform(cx.cx, live_id!(slug_matrix_1), &mat4_row(&slug_matrix, 1));
+        self.draw_vars
+            .set_uniform(cx.cx, live_id!(slug_matrix_3), &mat4_row(&slug_matrix, 3));
+        self.draw_vars
+            .set_uniform(cx.cx, live_id!(slug_viewport_px), &viewport_px);
     }
 
     fn draw_row(
@@ -689,13 +1139,15 @@ impl DrawText {
         cx: &mut Cx2d,
         origin_in_lpxs: Point<f32>,
         row: &LaidoutRow,
+        glyph_index: &mut f32,
         out_instances: &mut Vec<f32>,
     ) {
         for glyph in &row.glyphs {
-            self.draw_glyph(
+            self.draw_glyph_slug(
                 cx,
                 origin_in_lpxs + Size::from(glyph.origin_in_lpxs) * self.font_scale,
                 glyph,
+                glyph_index,
                 out_instances,
             );
         }
@@ -738,7 +1190,78 @@ impl DrawText {
         }
     }
 
-    fn draw_glyph(
+    /// Draw a single glyph using the SLUG vector font algorithm.
+    /// Falls back to SDF rasterization for bitmap glyphs (e.g., emoji).
+    fn draw_glyph_slug(
+        &mut self,
+        cx: &mut Cx2d,
+        origin_in_lpxs: Point<f32>,
+        glyph: &LaidoutGlyph,
+        glyph_index: &mut f32,
+        output: &mut Vec<f32>,
+    ) {
+        let shape_id = match self.get_or_create_glyph_shape(glyph) {
+            Some(id) => id,
+            None => {
+                // No vector outline (bitmap glyph like emoji) — fall back to SDF path.
+                self.draw_glyph_sdf(cx, origin_in_lpxs, glyph, output);
+                return;
+            }
+        };
+
+        // Clone layer data to avoid borrow conflict with slug_renderer
+        let (layer, shape_origin, shape_size) = {
+            let renderer = self.slug_renderer.as_ref().unwrap();
+            let shape = renderer.shape(shape_id).unwrap();
+            (shape.layers[0], shape.origin, shape.size)
+        };
+
+        let font_size = glyph.font_size_in_lpxs;
+        let scale = font_size * self.font_scale;
+        let pen_x = origin_in_lpxs.x + glyph.offset_in_lpxs() * self.font_scale;
+        let pen_y = origin_in_lpxs.y;
+
+        // Apply AA padding
+        let dpi_factor = cx.current_dpi_factor() as f32;
+        let pad = (1.0 / dpi_factor).max(0.0); // aa_pad_px = 1.0
+
+        self.rect_pos = vec2(
+            pen_x + shape_origin.x * scale - pad,
+            pen_y + shape_origin.y * scale - pad + self.temp_y_shift * font_size,
+        );
+        self.rect_size = vec2(
+            shape_size.x * scale + pad * 2.0,
+            shape_size.y * scale + pad * 2.0,
+        );
+
+        // Set color: use per-glyph color if present, otherwise keep DrawText's color
+        if let Some(c) = glyph.color {
+            self.color = vec4(
+                c.r as f32 / 255.0,
+                c.g as f32 / 255.0,
+                c.b as f32 / 255.0,
+                c.a as f32 / 255.0,
+            );
+        }
+
+        // Pack SLUG data into DrawText's existing instance fields:
+        // texture_index > 5.0 signals SLUG mode to the shader
+        self.texture_index = 10.0;
+        // t_min = (curve_offset, curve_count)
+        self.t_min = vec2(layer.curve_offset as f32, layer.curve_count as f32);
+        // t_max = (band_offset, band_count)
+        self.t_max = vec2(layer.band_offset as f32, layer.band_count as f32);
+        // atlas_plane = fill_flags
+        self.atlas_plane = layer.flags as f32;
+
+        output.extend_from_slice(self.draw_vars.as_slice());
+        self.glyph_depth += 0.000001;
+        *glyph_index += 1.0;
+    }
+
+    /// Fallback: draw a glyph using SDF rasterization (for bitmap/emoji glyphs
+    /// that don't have vector outlines).
+    fn draw_glyph_sdf(
         &mut self,
         cx: &mut Cx2d,
         origin_in_lpxs: Point<f32>,

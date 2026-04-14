@@ -556,9 +556,9 @@ pub struct DrawGlyph {
     #[rust]
     band_data: Vec<f32>,
     #[rust]
-    curve_texture: Option<Texture>,
+    pub curve_texture: Option<Texture>,
     #[rust]
-    band_texture: Option<Texture>,
+    pub band_texture: Option<Texture>,
     #[rust]
     curve_dirty: bool,
     #[rust]
@@ -614,6 +614,65 @@ pub struct DrawGlyph {
 }
 
 impl DrawGlyph {
+    /// Create a DrawGlyph for shape management only (no shader).
+    /// Use this when you only need path building and shape caching,
+    /// not direct DrawGlyph rendering.
+    pub(crate) fn new_shape_manager() -> Self {
+        // Use MaybeUninit to safely construct a DrawVars without needing
+        // access to private platform constants. DrawVars is repr(C) with all
+        // zero-safe fields (Options, arrays of f32, etc.).
+        let draw_vars = {
+            let mut dv = std::mem::MaybeUninit::<DrawVars>::uninit();
+            // Safety: DrawVars is repr(C) and all its fields are valid when zeroed:
+            // - Area::Empty is the zero variant of the enum
+            // - Option<T> where T is non-zero-optimized: None is zero
+            // - [f32; N]: zero is valid
+            // - [Option<T>; N]: all None is zero
+            // - usize, u64, bool: zero is valid
+            unsafe {
+                std::ptr::write_bytes(dv.as_mut_ptr(), 0, 1);
+                dv.assume_init()
+            }
+        };
+        Self {
+            many_instances: None,
+            path: VectorPath::default(),
+            pending_layers: Vec::new(),
+            pending_color: vec4(1.0, 1.0, 1.0, 1.0),
+            pending_flags: 0,
+            curve_data: Vec::new(),
+            band_data: Vec::new(),
+            curve_texture: None,
+            band_texture: None,
+            curve_dirty: false,
+            band_dirty: false,
+            shapes: Vec::new(),
+            curve_tex_width: 0,
+            band_tex_width: 0,
+            default_num_bands: 0,
+            initialized: false,
+            draw_vars,
+            rect_pos: Vec2f::default(),
+            rect_size: Vec2f::default(),
+            draw_clip: Vec4f::default(),
+            draw_depth: 0.0,
+            depth_clip: 1.0,
+            color: vec4(1.0, 1.0, 1.0, 1.0),
+            curve_offset: 0.0,
+            curve_count: 0.0,
+            band_offset: 0.0,
+            band_count: 0.0,
+            layer_order: 0.0,
+            max_band_curves: 512.0,
+            aa_2x2: 0.0,
+            aa_4x4: 0.0,
+            axis_relief: 0.0,
+            stem_darken: 0.0,
+            stem_darken_max: 0.125,
+            fill_flags: 0.0,
+        }
+    }
+
     pub fn begin_shape(&mut self) {
         self.ensure_initialized();
         self.path.clear();
@@ -921,7 +980,7 @@ impl DrawGlyph {
         value[0]
     }
 
-    fn apply_layer(&mut self, layer: &GlyphLayerRef, order: f32) {
+    pub(crate) fn apply_layer(&mut self, layer: &GlyphLayerRef, order: f32) {
         self.color = layer.color;
         self.curve_offset = layer.curve_offset as f32;
         self.curve_count = layer.curve_count as f32;
@@ -1030,7 +1089,7 @@ impl DrawGlyph {
         (band_offset, num_bands)
     }
 
-    fn update_draw_vars(&mut self, cx: &mut Cx2d) {
+    pub(crate) fn update_draw_vars(&mut self, cx: &mut Cx2d) {
         self.ensure_initialized();
         self.upload_textures(cx.cx.cx);
         let pass_id = cx.pass_stack.last().unwrap().pass_id;
@@ -1060,7 +1119,7 @@ impl DrawGlyph {
         self.draw_vars.texture_slots[1] = self.band_texture.clone();
     }
 
-    fn upload_textures(&mut self, cx: &mut Cx) {
+    pub(crate) fn upload_textures(&mut self, cx: &mut Cx) {
         let curve_texture = self.curve_texture.get_or_insert_with(|| {
             Texture::new_with_format(
                 cx,
