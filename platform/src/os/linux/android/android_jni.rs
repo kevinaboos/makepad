@@ -1335,14 +1335,31 @@ pub(crate) unsafe fn to_java_load_asset(filepath: &str) -> Option<Vec<u8>> {
         return None;
     }
     let length = ndk_sys::AAsset_getLength64(asset);
-
-    let mut buffer = Vec::new();
-    buffer.resize(length as usize, 0u8);
-    if ndk_sys::AAsset_read(asset, buffer.as_ptr() as *mut _, length as _) > 0 {
-        ndk_sys::AAsset_close(asset);
-        return Some(buffer);
+    let length = match usize::try_from(length) {
+        Ok(length) => length,
+        Err(_) => {
+            ndk_sys::AAsset_close(asset);
+            return None;
+        }
+    };
+    let mut buffer = vec![0u8; length];
+    let mut offset = 0usize;
+    while offset < length {
+        // Large bundled assets such as fonts are not guaranteed to arrive in a
+        // single AAsset_read call, so keep draining until the full file is in memory.
+        let read = ndk_sys::AAsset_read(
+            asset,
+            buffer[offset..].as_mut_ptr() as *mut _,
+            (length - offset) as _,
+        );
+        if read <= 0 {
+            ndk_sys::AAsset_close(asset);
+            return None;
+        }
+        offset += read as usize;
     }
-    return None;
+    ndk_sys::AAsset_close(asset);
+    Some(buffer)
 }
 
 pub unsafe fn to_java_show_keyboard(visible: bool) {

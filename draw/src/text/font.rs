@@ -224,6 +224,14 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../widgets/resources/NotoColorEmoji.ttf")
     }
 
+    fn bundled_cjk_font_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../widgets/resources/LXGWWenKaiRegular.ttf")
+    }
+
+    fn bundled_regular_font_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../widgets/resources/IBMPlexSans-Text.ttf")
+    }
+
     fn load_font_data(path: PathBuf) -> FontData {
         SharedBytes::from_file_mmap_or_read(path).expect("font bytes should load")
     }
@@ -257,5 +265,50 @@ mod tests {
             .rasterize_glyph(glyph_id, dpxs_per_em)
             .expect("emoji glyph should rasterize");
         assert_eq!(rasterized.atlas_kind, AtlasKind::Color);
+
+        let atlas_pixels = font.rasterizer.borrow();
+        let atlas = atlas_pixels.color_atlas().image();
+        let rect = rasterized.atlas_image_bounds;
+        let mut opaque_pixels = 0usize;
+        let mut non_black_opaque_pixels = 0usize;
+        for y in rect.origin.y..rect.origin.y + rect.size.height {
+            for x in rect.origin.x..rect.origin.x + rect.size.width {
+                let pixel = atlas[crate::text::geom::Point::new(x, y)];
+                if pixel.a() != 0 {
+                    opaque_pixels += 1;
+                    if pixel.r() != 0 || pixel.g() != 0 || pixel.b() != 0 {
+                        non_black_opaque_pixels += 1;
+                    }
+                }
+            }
+        }
+        assert!(opaque_pixels > 0, "emoji raster should contain visible pixels");
+        assert!(
+            non_black_opaque_pixels * 4 > opaque_pixels,
+            "emoji raster should be predominantly colored, got {non_black_opaque_pixels}/{opaque_pixels} non-black opaque pixels",
+        );
+    }
+
+    #[test]
+    fn bundled_fallback_fonts_do_not_intercept_emoji_with_real_glyphs() {
+        let regular = make_font(bundled_regular_font_path());
+        let cjk = make_font(bundled_cjk_font_path());
+        let emoji = make_font(bundled_emoji_font_path());
+
+        let regular_glyph = regular.with_ttf_parser_face(|face| face.glyph_index('😀'));
+        let cjk_glyph = cjk.with_ttf_parser_face(|face| face.glyph_index('😀'));
+        let emoji_glyph = emoji.with_ttf_parser_face(|face| face.glyph_index('😀'));
+
+        assert!(emoji_glyph.is_some(), "emoji fallback font should contain 😀");
+        assert!(
+            regular_glyph.is_none() || regular_glyph == Some(rustybuzz::ttf_parser::GlyphId(0)),
+            "regular text font should not claim a real 😀 glyph: {:?}",
+            regular_glyph
+        );
+        assert!(
+            cjk_glyph.is_none() || cjk_glyph == Some(rustybuzz::ttf_parser::GlyphId(0)),
+            "cjk fallback font should not intercept 😀 with a nonzero glyph: {:?}",
+            cjk_glyph
+        );
     }
 }
