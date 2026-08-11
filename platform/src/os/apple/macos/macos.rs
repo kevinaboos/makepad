@@ -57,6 +57,10 @@ const NS_WINDOW_OCCLUSION_STATE_VISIBLE: usize = 1 << 1;
 /// long means they were lost (occlusion, display sleep) and won't come.
 const PRESENT_GATE_STUCK_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// In-flight presents at which the gate closes and the beat is skipped: the
+/// drawable pool holds three, so acquiring with fewer outstanding can't block.
+const PRESENT_GATE_IN_FLIGHT: u32 = 3;
+
 #[derive(Clone)]
 pub struct MetalWindow {
     pub window_id: WindowId,
@@ -443,7 +447,7 @@ impl Cx {
                             msg_send![metal_window.cocoa_window.window, occlusionState]
                         };
                         if occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0 {
-                            if in_flight >= 2 {
+                            if in_flight >= PRESENT_GATE_IN_FLIGHT {
                                 metal_window.gate_closed_since.get_or_insert_with(Instant::now);
                             }
                             self.repaint_pass(*draw_pass_id);
@@ -452,12 +456,11 @@ impl Cx {
                         // Present-gated pacing: with display sync on, a full
                         // drawable pool makes nextDrawable BLOCK the main
                         // thread until the compositor consumes a frame
-                        // (10-25ms phases on mirrored/scaled displays). If
-                        // two of the three pool drawables haven't reached
-                        // glass yet, skip this beat and keep the pass dirty —
-                        // the next timer beat retries with the pool drained
-                        // and event handling never stalls behind vsync.
-                        if in_flight >= 2 {
+                        // (10-25ms phases on mirrored/scaled displays). Skip
+                        // this beat and keep the pass dirty; the next timer
+                        // beat retries with the pool drained and event
+                        // handling never stalls behind vsync.
+                        if in_flight >= PRESENT_GATE_IN_FLIGHT {
                             let now = Instant::now();
                             let since =
                                 *metal_window.gate_closed_since.get_or_insert(now);
