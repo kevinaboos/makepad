@@ -47,6 +47,7 @@ use {
     std::{
         cell::RefCell,
         collections::HashMap,
+        panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
         rc::Rc,
         sync::{
             mpsc::{channel, Receiver, Sender},
@@ -436,9 +437,15 @@ impl Cx {
                     let event_flow = cx_ref.ios_event_callback(event, &mut metal_cx);
                     let executor = cx_ref.executor.take().unwrap();
                     drop(cx_ref);
-                    executor.run_until_stalled();
+                    // Put the executor back even if a spawned task panics, so
+                    // the `take` above can't hand a `None` to the next event.
+                    let stalled = catch_unwind(AssertUnwindSafe(|| executor.run_until_stalled()));
                     let mut cx_ref = cx.borrow_mut();
                     cx_ref.executor = Some(executor);
+                    drop(cx_ref);
+                    if let Err(payload) = stalled {
+                        resume_unwind(payload);
+                    }
                     event_flow
                 }
             }),
