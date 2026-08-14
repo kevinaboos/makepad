@@ -357,8 +357,47 @@ impl Drop for IosNativeCameraPreview {
     }
 }
 
+fn ios_panic_summary(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = if let Some(payload) = info.payload().downcast_ref::<&str>() {
+        (*payload).to_string()
+    } else if let Some(payload) = info.payload().downcast_ref::<String>() {
+        payload.clone()
+    } else {
+        "non-string panic payload".to_string()
+    };
+    let location = info
+        .location()
+        .map(|location| {
+            format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )
+        })
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let thread = std::thread::current();
+    let thread_name = thread.name().unwrap_or("<unnamed>");
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    format!(
+        "iOS panic hook: thread={thread_name} location={location} payload={payload}\n{backtrace}"
+    )
+}
+
+/// The default hook writes to stderr, which goes nowhere on a device, so route
+/// panics through `error!` (NSLog) while the panicking frame is still on the stack.
+fn install_ios_panic_hook() {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::error!("{}", ios_panic_summary(info));
+        previous_hook(info);
+    }));
+}
+
 impl Cx {
     pub fn event_loop(cx: Rc<RefCell<Cx>>) {
+        install_ios_panic_hook();
+
         let data_path = IosApp::get_ios_directory_paths();
 
         // Get device info
