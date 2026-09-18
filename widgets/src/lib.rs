@@ -518,6 +518,11 @@ pub fn theme_mod(vm: &mut ScriptVm) {
 }
 
 pub fn widgets_mod(vm: &mut ScriptVm) {
+    let host_io_only = vm.cx().script_data.std.host_io_only();
+    widgets_mod_with_host_io(vm, host_io_only);
+}
+
+pub(crate) fn widgets_mod_with_host_io(vm: &mut ScriptVm, host_io_only: bool) {
     // make the prelude for our own widgets
     script_eval!(vm, {
         mod.prelude.widgets_internal = {
@@ -538,7 +543,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::link_label::script_mod(vm);
     crate::button::script_mod(vm);
     #[cfg(feature = "cef")]
-    crate::browser::script_mod(vm);
+    if !host_io_only { crate::browser::script_mod(vm); }
     crate::check_box::script_mod(vm);
     crate::radio_button::script_mod(vm);
     crate::image::script_mod(vm);
@@ -562,8 +567,8 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::nav_control::script_mod(vm);
     crate::tweaker::script_mod(vm);
     crate::gauss_view::script_mod(vm);
-    crate::screen_cap::script_mod(vm);
-    crate::window::script_mod(vm);
+    if !host_io_only { crate::screen_cap::script_mod(vm); }
+    if !host_io_only { crate::window::script_mod(vm); }
 
     crate::popup_menu::script_mod(vm);
     crate::drop_down::script_mod(vm);
@@ -628,7 +633,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     #[cfg(feature = "maps")]
     crate::map::style::script_mod(vm);
     #[cfg(feature = "maps")]
-    crate::map::view::script_mod(vm);
+    if !host_io_only { crate::map::view::script_mod(vm); }
     crate::math_view::script_mod(vm);
 
     // Safe area inset values (in Makepad layout points). Populated from the platform's
