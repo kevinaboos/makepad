@@ -4499,7 +4499,7 @@ fn classify_prop(prop: &str, value: &str) -> SectionKind {
     match first {
         "width" | "height" | "abs_pos" | "margin" | "padding" | "spacing" | "line_spacing"
         | "align" | "flow" | "clip_x" | "clip_y" | "scroll" | "wrap_spacing" | "layout"
-        | "metrics" => return SectionKind::Layout,
+        | "metrics" | "baseline" => return SectionKind::Layout,
         "text" | "empty_text" | "label" | "title" | "suffix" => return SectionKind::Text,
         "visible" | "enabled" | "grab_key_focus" | "cursor" | "trigger_on_press"
         | "enable_long_press" | "reset_hover_on_click" | "block_signal_event"
