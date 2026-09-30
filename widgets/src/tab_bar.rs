@@ -1,5 +1,6 @@
 use crate::{
     animator::Animate,
+    event::TouchState,
     makepad_derive_widget::*,
     makepad_draw::*,
     scroll_bars::ScrollBars,
@@ -346,6 +347,7 @@ impl Widget for TabBar {
             let Some(mut tab) = tab.borrow_mut::<Tab>() else {
                 continue;
             };
+            let tab_area = tab.area();
             tab.handle_event_with(cx, event, &mut |cx, action| match action {
                 TabAction::WasPressed => {
                     cx.widget_action(uid, TabBarAction::TabWasPressed(*tab_id));
@@ -385,6 +387,14 @@ impl Widget for TabBar {
                     }
                 }
                 TabAction::TouchUp { abs: _, time: _ } => {
+                    if matches!(event, Event::TouchUpdate(update)
+                        if update.touches.iter().any(|touch| touch.state == TouchState::Cancel
+                            && cx.fingers.touch_capture_area(touch.uid) == Some(tab_area)))
+                    {
+                        // A canceled drag keeps its current offset and releases its samples.
+                        self.finger_scroll = FingerScrollState::Idle;
+                        return;
+                    }
                     if let FingerScrollState::Dragging { samples } = &self.finger_scroll {
                         // Calculate flick velocity from recent samples.
                         let mut last: Option<&FingerScrollSample> = None;

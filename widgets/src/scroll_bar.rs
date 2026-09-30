@@ -1,5 +1,5 @@
 use crate::animator::*;
-use crate::event::ScrollPhase;
+use crate::event::{ScrollPhase, TouchState};
 use crate::makepad_derive_widget::*;
 use crate::makepad_draw::*;
 use crate::scroll_motion::{
@@ -997,6 +997,18 @@ impl ScrollBar {
                 }
                 _ => (),
             },
+            Hit::FingerUp(fe) if matches!((event, &fe.device),
+                (Event::TouchUpdate(update), DigitDevice::Touch { uid })
+                    if update.touches.iter().any(|touch| touch.uid == *uid && touch.state == TouchState::Cancel)) =>
+            {
+                // Cancellation releases the held stretch without starting a flick.
+                self.scroll_state = ScrollState::Stopped;
+                self.caught_fling = None;
+                if self.overscroll != 0.0 {
+                    self.overscroll = 0.0;
+                    dispatch_action(cx, self.make_scroll_action());
+                }
+            }
             Hit::FingerUp(fe) if fe.is_primary_hit() => match &mut self.scroll_state {
                 ScrollState::Drag { samples } => {
                     // The press's release settles the fate of any fling it caught:
