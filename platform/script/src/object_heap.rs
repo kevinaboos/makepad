@@ -1047,8 +1047,8 @@ impl ScriptHeap {
             }
         }
 
-        // Field doesn't exist directly - get from prototype chain. A miss isn't reported
-        // since callers fall back to proto_field_from_type_check.
+        // Field doesn't exist directly - get from prototype chain. Both callers drop a miss and
+        // fall back to proto_field_from_type_check for id fields, so a miss never reaches `trap`.
         let value = self.value(obj, field, NoTrap);
 
         // If it's an object from prototype, create a new instance
