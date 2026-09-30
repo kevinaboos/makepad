@@ -85,25 +85,14 @@ pub fn format_value_brief(heap: &ScriptHeap, value: ScriptValue) -> String {
     }
 
     // Handle inline strings
-    if let Some(s) = value.as_inline_string(|s| s.to_string()) {
-        let truncated = if s.len() > 12 {
-            format!("{}...", &s[..12])
-        } else {
-            s
-        };
-        return format!("\"{}\"", truncated);
+    if let Some(s) = value.as_inline_string(format_string_brief) {
+        return s;
     }
 
     // Handle heap strings
     if let Some(s) = value.as_string() {
         if let Some(str_data) = &heap.strings[s] {
-            let s = &str_data.string.0;
-            let truncated = if s.len() > 12 {
-                format!("{}...", &s[..12])
-            } else {
-                s.to_string()
-            };
-            return format!("\"{}\"", truncated);
+            return format_string_brief(&str_data.string.0);
         }
         return "\"\"".to_string();
     }
@@ -147,6 +136,14 @@ pub fn format_value_brief(heap: &ScriptHeap, value: ScriptValue) -> String {
 
     // Fallback
     format!("{:?}", value.value_type())
+}
+
+/// Quotes `s`, cutting it after 12 chars.
+fn format_string_brief(s: &str) -> String {
+    match s.char_indices().nth(12) {
+        Some((end, _)) => format!("\"{}...\"", &s[..end]),
+        None => format!("\"{}\"", s),
+    }
 }
 
 /// Format the type of a ScriptValue as a human-readable string for error messages.
@@ -678,5 +675,20 @@ pub fn suggest_pod_field(heap: &ScriptHeap, pod_ty: ScriptPodType, field: LiveId
             suggest_from_iter(&key_str, components.into_iter())
         }
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_value_brief_cuts_strings_at_a_char_boundary() {
+        let mut heap = ScriptHeap::empty();
+        let ascii = heap.new_string_from_str("abcdefghijklmnop");
+        assert_eq!(format_value_brief(&heap, ascii), "\"abcdefghijkl...\"");
+        // Byte 12 falls inside the 'ñ'.
+        let multibyte = heap.new_string_from_str("abcdefghijkñopq");
+        assert_eq!(format_value_brief(&heap, multibyte), "\"abcdefghijkñ...\"");
     }
 }
