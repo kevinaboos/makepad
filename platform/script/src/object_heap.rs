@@ -1047,8 +1047,9 @@ impl ScriptHeap {
             }
         }
 
-        // Field doesn't exist directly - get from prototype chain
-        let value = self.value(obj, field, trap);
+        // Field doesn't exist directly - get from prototype chain. A miss isn't reported
+        // since callers fall back to proto_field_from_type_check.
+        let value = self.value(obj, field, NoTrap);
 
         // If it's an object from prototype, create a new instance
         if let Some(value_obj) = value.as_object() {
