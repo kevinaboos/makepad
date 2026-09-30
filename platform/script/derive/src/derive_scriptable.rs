@@ -12,6 +12,37 @@ pub fn derive_script_impl(input: TokenStream) -> TokenStream {
     }
 }
 
+/// The default a `#[live(expr)]` field declares for itself, if it does.
+fn declared_default(field: &StructField) -> Option<TokenStream> {
+    field
+        .attrs
+        .iter()
+        .find(|a| a.name == "live")
+        .and_then(|a| a.args.clone())
+        .filter(|args| !args.is_empty())
+}
+
+/// Adds the expression for a field's declared default (`args`), converted to its type.
+fn add_declared_default(tb: &mut TokenBuilder, field: &StructField, args: TokenStream) {
+    // for primitive numeric fields, cast instead of .into() -
+    // unsuffixed literals like #[live(1.0)] on an f32 field
+    // otherwise hit the deprecated f64->f32 inference fallback
+    let ty = field.ty.to_string().replace(' ', "");
+    if matches!(
+        ty.as_str(),
+        "f32" | "f64"
+            | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+    ) {
+        tb.add("(")
+            .stream(Some(args))
+            .add(") as ")
+            .stream(Some(field.ty.clone()));
+    } else {
+        tb.add("(").stream(Some(args)).add(").into()");
+    }
+}
+
 fn derive_script_impl_inner(
     parser: &mut TokenParser,
     tb: &mut TokenBuilder,
@@ -162,7 +193,16 @@ fn derive_script_impl_inner(
                     .stream(Some(field.ty.clone()))
                     .add(" as ScriptNew>::script_reload_default(vm);");
                 tb.add("    if !default_value.is_nil(){");
-                tb.add("        __field_value = Some(default_value);");
+                // A field with a default of its own (`#[live(expr)]`) goes back to that, the same
+                // as a newly made one, instead of to its type's default. E.g. a Label's
+                // `#[live(Flow::right_wrap())] flow` would otherwise stop wrapping after a reload.
+                if let Some(args) = declared_default(field) {
+                    tb.add("        self.").ident(&field.name).add(" = ");
+                    add_declared_default(tb, field, args);
+                    tb.add(";");
+                } else {
+                    tb.add("        __field_value = Some(default_value);");
+                }
                 tb.add("    }");
                 tb.add("}");
                 tb.add("if let Some(v) = __field_value {");
@@ -355,23 +395,7 @@ fn derive_script_impl_inner(
                         tb.add("Default::default()");
                     }
                 } else {
-                    // for primitive numeric fields, cast instead of .into() -
-                    // unsuffixed literals like #[live(1.0)] on an f32 field
-                    // otherwise hit the deprecated f64->f32 inference fallback
-                    let ty = field.ty.to_string().replace(' ', "");
-                    if matches!(
-                        ty.as_str(),
-                        "f32" | "f64"
-                            | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-                            | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-                    ) {
-                        tb.add("(")
-                            .stream(attr.args.clone())
-                            .add(") as ")
-                            .stream(Some(field.ty.clone()));
-                    } else {
-                        tb.add("(").stream(attr.args.clone()).add(").into()");
-                    }
+                    add_declared_default(tb, field, attr.args.clone().unwrap());
                 }
             } else {
                 tb.add("Default::default()");
