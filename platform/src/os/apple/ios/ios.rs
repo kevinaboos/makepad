@@ -996,7 +996,11 @@ impl Cx {
 
                 // Synthesize internal drag-and-drop events from touch gestures.
                 if self.os.internal_drag_items.is_some() {
-                    if let Some(touch) = e
+                    if e.touches.iter().any(|touch| touch.state == crate::event::TouchState::Cancel) {
+                        self.os.internal_drag_items = None;
+                        self.call_event_handler(&Event::DragEnd);
+                        self.drag_drop.cycle_drag();
+                    } else if let Some(touch) = e
                         .touches
                         .iter()
                         .find(|t| t.state == crate::event::TouchState::Stop)

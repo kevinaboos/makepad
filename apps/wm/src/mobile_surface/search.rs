@@ -73,7 +73,7 @@ impl PhoneSurface {
                 (
                     t.abs,
                     t.state == makepad_platform::event::TouchState::Start,
-                    t.state == makepad_platform::event::TouchState::Stop,
+                    matches!(t.state, makepad_platform::event::TouchState::Stop | makepad_platform::event::TouchState::Cancel),
                 )
             }),
             _ => None,

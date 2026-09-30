@@ -3212,7 +3212,7 @@ fn touch_abs(event: &TouchUpdateEvent, uid: u64) -> Option<Vec2d> {
     event
         .touches
         .iter()
-        .find(|touch| touch.uid == uid && touch.state != TouchState::Stop)
+        .find(|touch| touch.uid == uid && !matches!(touch.state, TouchState::Stop | TouchState::Cancel))
         .map(|touch| touch.abs)
 }
 
@@ -3220,7 +3220,7 @@ fn first_active_touch(event: &TouchUpdateEvent) -> Option<TouchSample> {
     event
         .touches
         .iter()
-        .filter(|touch| touch.state != TouchState::Stop)
+        .filter(|touch| !matches!(touch.state, TouchState::Stop | TouchState::Cancel))
         .min_by_key(|touch| touch.uid)
         .map(|touch| TouchSample {
             uid: touch.uid,
@@ -3234,7 +3234,7 @@ fn first_two_active_touches(event: &TouchUpdateEvent) -> Option<TouchPair> {
     for touch in event
         .touches
         .iter()
-        .filter(|touch| touch.state != TouchState::Stop)
+        .filter(|touch| !matches!(touch.state, TouchState::Stop | TouchState::Cancel))
     {
         let sample = TouchSample {
             uid: touch.uid,

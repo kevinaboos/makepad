@@ -519,6 +519,7 @@ impl Widget for CalendarMonthCanvas {
                     match t.state {
                         TouchState::Start if r.contains(t.abs) => self.swipe_origin = Some(t.abs),
                         TouchState::Stop => finish = Some(t.abs),
+                        TouchState::Cancel => self.swipe_origin = None,
                         _ => {}
                     }
                 }

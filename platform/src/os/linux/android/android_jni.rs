@@ -887,7 +887,9 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnTouch(
 
         touches.push(TouchPoint {
             state: {
-                if action_index == touch_index {
+                if action_masked == 3 {
+                    TouchState::Cancel
+                } else if action_index == touch_index {
                     match action_masked {
                         0 | 5 => TouchState::Start,
                         1 | 6 => TouchState::Stop,

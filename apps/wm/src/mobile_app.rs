@@ -634,6 +634,16 @@ impl App {
                 TouchState::Start => PhonePointerPhase::Down,
                 TouchState::Move => PhonePointerPhase::Move,
                 TouchState::Stop => PhonePointerPhase::Up,
+                TouchState::Cancel => {
+                    let phone = &mut self.state_mut().phone;
+                    phone.touch = None;
+                    let screen = phone.gesture.take().map_or(phone.screen, |gesture| gesture.screen);
+                    phone.edit.drag = None;
+                    phone.cards.set(phone.cards.page.round());
+                    phone.navigate(screen);
+                    self.animate_phone(cx);
+                    return owned.is_some() || !self.state_mut().phone.accepts_app_input();
+                }
                 TouchState::Stable => return owned.is_some() || !self.state_mut().phone.accepts_app_input(),
             };
             let handled = self.phone_pointer_at(cx, phase, point.abs, point.time, true, 0.0);

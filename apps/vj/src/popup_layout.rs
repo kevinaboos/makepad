@@ -29,6 +29,7 @@ pub fn handle_event(event: &Event, area: Area, chip: Rect, layout: ChoiceLayout)
                         return choose(touch.abs);
                     }
                     TouchState::Stop => return choose(touch.abs),
+                    TouchState::Cancel => return ChoiceEvent::Dismiss,
                     TouchState::Move => return ChoiceEvent::Hover(layout.pick(touch.abs)),
                     TouchState::Stable => {}
                 }

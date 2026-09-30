@@ -710,12 +710,13 @@ impl IosApp {
             modifiers: KeyModifiers::default(),
             touches,
         }));
-        // remove the stopped touches
+        // Keep unchanged fingers in later updates without replaying their previous phase.
         with_ios_app(|app| {
-            app.touches.retain(|v| {
-                if let TouchState::Stop = v.state {
+            app.touches.retain_mut(|touch| {
+                if matches!(touch.state, TouchState::Stop | TouchState::Cancel) {
                     false
                 } else {
+                    touch.state = TouchState::Stable;
                     true
                 }
             })

@@ -15,6 +15,7 @@ use {
     std::{
         cell::{Cell, RefCell},
         ops::Deref,
+        rc::{Rc, Weak},
     },
 };
 
@@ -158,6 +159,8 @@ pub struct LongPressEvent {
 pub enum TouchState {
     Start,
     Stop,
+    /// The platform interrupted this touch; release capture without activating its target.
+    Cancel,
     Move,
     Stable,
 }
@@ -334,6 +337,18 @@ pub struct CxDigitHover {
     area: Area,
 }
 
+/// Keeps a scoped sweep lock alive until its widget closes or is dropped.
+#[must_use]
+pub struct SweepLock {
+    owner: Rc<Cell<bool>>,
+}
+
+impl SweepLock {
+    pub fn is_active(&self) -> bool {
+        self.owner.get()
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct CxFingers {
     pub first_mouse_button: Option<(MouseButton, WindowId)>,
@@ -342,6 +357,8 @@ pub struct CxFingers {
     hovers: Vec<CxDigitHover>,
     xr_poke_locks: Vec<DigitId>,
     sweep_lock: Option<Area>,
+    sweep_lock_owner: Option<Weak<Cell<bool>>>,
+    sweep_lock_validation_event: Option<u64>,
     /// * If `Some`, scrolling is currently blocked *except* within the contained area.
     /// * If `None`, scrolling is not blocked anywhere.
     block_scrolling_except_within: Option<Area>,
@@ -390,6 +407,7 @@ impl CxFingers {
         }
         if self.sweep_lock == Some(old_area) {
             self.sweep_lock = Some(new_area);
+            self.sweep_lock_validation_event = None;
         }
     }
 
@@ -592,7 +610,7 @@ impl CxFingers {
         for touch in touches {
             let digit_id = live_id_num!(touch, touch.uid).into();
             match touch.state {
-                TouchState::Stop => {
+                TouchState::Stop | TouchState::Cancel => {
                     self.release_digit(digit_id);
                     self.remove_hover(digit_id);
                 }
@@ -662,6 +680,7 @@ impl CxFingers {
     }
 
     pub(crate) fn test_sweep_lock(&mut self, sweep_area: Area) -> bool {
+        self.clear_expired_sweep_lock();
         if let Some(lock) = self.sweep_lock {
             if lock != sweep_area {
                 return true;
@@ -671,14 +690,43 @@ impl CxFingers {
     }
 
     pub fn sweep_lock(&mut self, area: Area) {
+        self.clear_expired_sweep_lock();
         if self.sweep_lock.is_none() {
             self.sweep_lock = Some(area);
+            self.sweep_lock_owner = None;
+            self.sweep_lock_validation_event = None;
+        }
+    }
+
+    pub fn acquire_sweep_lock(&mut self, area: Area) -> Option<SweepLock> {
+        self.clear_expired_sweep_lock();
+        if self.sweep_lock.is_some() {
+            return None;
+        }
+        let owner = Rc::new(Cell::new(true));
+        self.sweep_lock = Some(area);
+        self.sweep_lock_owner = Some(Rc::downgrade(&owner));
+        self.sweep_lock_validation_event = None;
+        Some(SweepLock { owner })
+    }
+
+    fn clear_sweep_lock(&mut self) {
+        if let Some(owner) = self.sweep_lock_owner.take().and_then(|owner| owner.upgrade()) {
+            owner.set(false);
+        }
+        self.sweep_lock = None;
+        self.sweep_lock_validation_event = None;
+    }
+
+    fn clear_expired_sweep_lock(&mut self) {
+        if self.sweep_lock_owner.as_ref().is_some_and(|owner| owner.strong_count() == 0) {
+            self.clear_sweep_lock();
         }
     }
 
     pub fn sweep_unlock(&mut self, area: Area) {
         if self.sweep_lock == Some(area) {
-            self.sweep_lock = None;
+            self.clear_sweep_lock();
         }
     }
 
@@ -840,6 +888,7 @@ pub struct FingerUpEvent {
     pub rect: Rect,
     /// Whether this finger-up event (`abs`) occurred within the hits area.
     pub is_over: bool,
+    /// A synthetic release caused by leaving a sweep area or canceling a touch.
     pub is_sweep: bool,
 }
 impl Deref for FingerUpEvent {
@@ -849,9 +898,9 @@ impl Deref for FingerUpEvent {
     }
 }
 impl FingerUpEvent {
-    /// Returns `true` if this FingerUp event was a regular tap/click (not a long press).
+    /// Returns `true` for a regular tap/click, excluding long presses and synthetic releases.
     pub fn was_tap(&self) -> bool {
-        if self.has_long_press_occurred {
+        if self.has_long_press_occurred || self.is_sweep {
             return false;
         }
         self.time - self.capture_time < TAP_COUNT_TIME
@@ -980,6 +1029,34 @@ impl HitOptions {
     }
 }
 
+impl Cx {
+    pub(crate) fn validate_scoped_sweep_lock_after_draw(&mut self) {
+        self.fingers.sweep_lock_validation_event = None;
+        self.validate_scoped_sweep_lock();
+    }
+
+    fn validate_scoped_sweep_lock(&mut self) {
+        self.fingers.clear_expired_sweep_lock();
+        let event_id = self.event_id();
+        if self.fingers.sweep_lock_owner.is_none()
+            || self.fingers.sweep_lock_validation_event == Some(event_id)
+        {
+            return;
+        }
+        self.fingers.sweep_lock_validation_event = Some(event_id);
+        let attached = self.fingers.sweep_lock.is_some_and(|area| {
+            area.is_valid(self)
+                && area.draw_list_id()
+                    .and_then(|list| self.draw_lists[list].draw_pass_id)
+                    .is_some_and(|pass| !self.pass_attachment_is_stale(pass)
+                        && area.is_attached(self, &self.attached_draw_lists(pass)))
+        });
+        if !attached {
+            self.fingers.clear_sweep_lock();
+        }
+    }
+}
+
 impl Event {
     pub fn unhandle(&self, cx: &mut Cx, area: &Area) {
         match self {
@@ -1064,6 +1141,10 @@ impl Event {
     where
         F: Fn(Vec2d, &Rect, &Option<Inset>) -> bool,
     {
+        // Draw lists attach when they end, so validate only between draws.
+        if !matches!(self, Event::Draw(_)) {
+            cx.validate_scoped_sweep_lock();
+        }
         if !area.is_valid(cx) {
             return Hit::Nothing;
         }
@@ -1237,10 +1318,12 @@ impl Event {
                                 rect,
                             });
                         }
-                        TouchState::Stop => {
+                        TouchState::Stop | TouchState::Cancel => {
                             let tap_count = cx.fingers.tap_count();
                             let rect = area.clipped_rect(&cx);
-                            if let Some(capture) = cx.fingers.find_area_capture(area) {
+                            if let Some(capture) = cx.fingers.find_area_capture(area)
+                                .filter(|capture| capture.digit_id == digit_id)
+                            {
                                 // See the note in TouchState::Start above: hit-test on the
                                 // touch centroid only, without inflating by `t.radius`.
                                 let rect_check = rect.contains(t.abs);
@@ -1251,7 +1334,8 @@ impl Event {
                                     < TAP_COUNT_TIME)
                                     && ((t.abs - capture.abs_start).length() < TAP_COUNT_DISTANCE);
 
-                                let is_over = rect_check || layout_shift_fallback;
+                                let canceled = t.state == TouchState::Cancel;
+                                let is_over = !canceled && (rect_check || layout_shift_fallback);
 
                                 return Hit::FingerUp(FingerUpEvent {
                                     abs_start: capture.abs_start,
@@ -1266,7 +1350,7 @@ impl Event {
                                     modifiers: e.modifiers,
                                     time: e.time,
                                     is_over,
-                                    is_sweep: false,
+                                    is_sweep: canceled,
                                 });
                             }
                         }
@@ -1336,7 +1420,9 @@ impl Event {
                                         });
                                     }
                                 }
-                            } else if let Some(capture) = cx.fingers.find_area_capture(area) {
+                            } else if let Some(capture) = cx.fingers.find_area_capture(area)
+                                .filter(|capture| capture.digit_id == digit_id)
+                            {
                                 let is_over = hit_test(t.abs, &rect, &options.margin_for(&device));
                                 return Hit::FingerMove(FingerMoveEvent {
                                     window_id: e.window_id,

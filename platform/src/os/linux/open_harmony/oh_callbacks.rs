@@ -125,7 +125,7 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
             OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_DOWN => TouchState::Start,
             OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_UP => TouchState::Stop,
             OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_MOVE => TouchState::Move,
-            OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_CANCEL => TouchState::Move,
+            OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_CANCEL => TouchState::Cancel,
             _ => {
                 crate::error!(
                     "Failed to dispatch call for touch Event {:?}",

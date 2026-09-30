@@ -275,6 +275,12 @@ impl ReorderList {
                 self.cancel_drag(cx);
                 return true;
             }
+            if matches!(event, Event::TouchUpdate(e)
+                if e.touches.iter().any(|touch| touch.state == makepad_draw::event::TouchState::Cancel))
+            {
+                self.cancel_drag(cx);
+                return true;
+            }
             // A live drag is modal for the list: a wheel scroll would slide
             // the rows away under the pointer.
             if drag.active && matches!(event, Event::Scroll(_)) {

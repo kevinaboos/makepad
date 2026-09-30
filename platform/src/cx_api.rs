@@ -1584,6 +1584,11 @@ impl Cx {
         self.fingers.sweep_lock(value);
     }
 
+    /// Locks pointer sweeps while the returned guard lives, or returns `None` if already locked.
+    pub fn acquire_sweep_lock(&mut self, value: Area) -> Option<crate::event::SweepLock> {
+        self.fingers.acquire_sweep_lock(value)
+    }
+
     /// Hand the finger currently captured by `from` over to `to` (with sweep area
     /// `to_sweep`), so a drag begun on one widget can continue on another — e.g. a
     /// long-pressed drawer app handing its touch to the home pager for placement.

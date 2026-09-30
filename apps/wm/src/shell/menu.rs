@@ -1430,6 +1430,11 @@ impl ShellMenu {
                                 }
                             }
                         }
+                        TouchState::Cancel => {
+                            if self.touch_press.is_some_and(|(uid, _, _)| uid == point.uid) {
+                                self.touch_press = None;
+                            }
+                        }
                         TouchState::Stop => {
                             if let Some((uid, start, _)) = self.touch_press {
                                 if uid != point.uid { continue; }
