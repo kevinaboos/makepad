@@ -15,6 +15,40 @@ script_mod! {
 
     mod.widgets.CheckBoxBase = #(CheckBox::register_widget(vm))
 
+    mod.widgets.DrawCheckLabel = mod.draw.DrawText{
+        /** keyboard-focus mix 0..1 step 0.01 */
+        focus: instance(0.0)
+        /** pointer-hover mix 0..1 step 0.01 */
+        hover: instance(0.0)
+        /** pressed mix 0..1 step 0.01 */
+        down: instance(0.0)
+        /** checked mix 0..1 step 0.01 */
+        active: instance(0.0)
+        /** disabled mix 0..1 step 0.01 */
+        disabled: instance(0.0)
+
+        ink_centered: true
+
+        color: theme.color_label_outer
+        color_hover: uniform(theme.color_label_outer_hover)
+        color_down: uniform(theme.color_label_outer_down)
+        color_focus: uniform(theme.color_label_outer_focus)
+        color_active: uniform(theme.color_label_outer_active)
+        color_disabled: uniform(theme.color_label_outer_disabled)
+
+        get_color: fn() {
+            return self.color
+                .mix(self.color_focus, self.focus)
+                .mix(self.color_active, self.active)
+                .mix(self.color_hover, self.hover)
+                .mix(self.color_down, self.down)
+                .mix(self.color_disabled, self.disabled)
+        }
+        text_style: theme.font_regular{
+            font_size: theme.font_size_p
+        }
+    }
+
     /** The flat checkbox: an inset mark box with a stroked check, plus its label. */
     mod.widgets.CheckBoxFlat = set_type_default() do mod.widgets.CheckBoxBase{
         width: Fit
@@ -131,39 +165,7 @@ script_mod! {
         }
 
         /** The checkbox label ink, state-mixed with the mark box. */
-        draw_text +: {
-            /** keyboard-focus mix 0..1 step 0.01 */
-            focus: instance(0.0)
-            /** pointer-hover mix 0..1 step 0.01 */
-            hover: instance(0.0)
-            /** pressed mix 0..1 step 0.01 */
-            down: instance(0.0)
-            /** checked mix 0..1 step 0.01 */
-            active: instance(0.0)
-            /** disabled mix 0..1 step 0.01 */
-            disabled: instance(0.0)
-
-            ink_centered: true
-
-            color: theme.color_label_outer
-            color_hover: uniform(theme.color_label_outer_hover)
-            color_down: uniform(theme.color_label_outer_down)
-            color_focus: uniform(theme.color_label_outer_focus)
-            color_active: uniform(theme.color_label_outer_active)
-            color_disabled: uniform(theme.color_label_outer_disabled)
-
-            get_color: fn() {
-                return self.color
-                    .mix(self.color_focus, self.focus)
-                    .mix(self.color_active, self.active)
-                    .mix(self.color_hover, self.hover)
-                    .mix(self.color_down, self.down)
-                    .mix(self.color_disabled, self.disabled)
-            }
-            text_style: theme.font_regular{
-                font_size: theme.font_size_p
-            }
-        }
+        draw_text: mod.widgets.DrawCheckLabel{}
 
         icon_walk: Walk{width: 14.0, height: Fit}
 
