@@ -342,6 +342,8 @@ impl Cx {
                 if self.need_redrawing() {
                     self.call_draw_event(time_now);
                     self.hlsl_compile_shaders(d3d11_cx);
+                } else {
+                    self.adopt_compiled_shaders(d3d11_cx);
                 }
 
                 self.stdin_handle_repaint(d3d11_cx, stdin_windows, time);

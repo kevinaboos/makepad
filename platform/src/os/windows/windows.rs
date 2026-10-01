@@ -385,6 +385,10 @@ impl Cx {
                     self.handle_media_signals();
                     self.handle_script_signals();
                 }
+                // Finished shader builds raise the internal signal, so we adopt them here.
+                if internal_signal {
+                    self.adopt_compiled_shaders(d3d11_cx);
+                }
                 if ui_signal {
                     self.call_event_handler(&Event::Signal);
                 }
@@ -582,6 +586,8 @@ impl Cx {
         if self.need_redrawing() {
             self.call_draw_event(time_now);
             self.hlsl_compile_shaders(&d3d11_cx);
+        } else {
+            self.adopt_compiled_shaders(&d3d11_cx);
         }
         // ok here we send out to all our childprocesses
 
