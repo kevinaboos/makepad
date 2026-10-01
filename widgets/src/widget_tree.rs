@@ -1638,6 +1638,7 @@ impl WidgetTree {
         // its whole subtree from every downward search (and the removal pass
         // below then deleted it), which silently killed name lookups inside
         // dynamically hosted subtrees. Keep the live ones linked.
+        let mut unlinked = Vec::new();
         for old_uid in old_children.iter().copied() {
             if new_children.iter().any(|entry| *entry == old_uid) {
                 continue;
@@ -1647,14 +1648,14 @@ impl WidgetTree {
             });
             if keep {
                 new_children.push(old_uid);
+            } else {
+                unlinked.push(old_uid);
             }
         }
 
         // Compare against old_children (the original list before std::mem::take),
         // NOT node.children which is empty after the take.
         let parent_children_changed = old_children != new_children;
-        if parent_children_changed {
-        }
 
         if let Some(node) = inner.graph.get_mut(&uid) {
             node.children = new_children;
@@ -1675,25 +1676,39 @@ impl WidgetTree {
             Self::invalidate_path_cache_from_child_change(inner, uid);
         }
 
-        if mark_structure_dirty {
-            for removed_uid in old_children {
-                let still_child = inner.graph.get(&uid).map_or(false, |node| {
-                    node.children.iter().any(|child| *child == removed_uid)
-                });
-                if still_child {
-                    continue;
-                }
-
-                let should_remove = inner
-                    .graph
-                    .get(&removed_uid)
-                    .map_or(false, |node| node.parent == Some(uid));
-                if should_remove {
-                    Self::remove_subtree(inner, removed_uid);
-                }
+        // A dead child can't ever come back (like a list row that scrolled away),
+        // and nothing else would drop it, so do it now. Not if something inside it
+        // is still held elsewhere, though: lookups anchored there still need it.
+        // A live one (like a pooled row) may get reinserted, so only a full sync drops those.
+        for removed_uid in unlinked {
+            let should_remove = inner
+                .graph
+                .get(&removed_uid)
+                .map_or(false, |node| node.parent == Some(uid))
+                && (mark_structure_dirty || Self::subtree_is_dead(inner, removed_uid));
+            if should_remove {
+                Self::remove_subtree(inner, removed_uid);
             }
         }
 
+        true
+    }
+
+    /// Whether nothing at or below `uid` is alive anymore, following the same
+    /// parent links `remove_subtree` does.
+    fn subtree_is_dead(inner: &WidgetTreeInner, uid: WidgetUid) -> bool {
+        let mut stack = vec![uid];
+        while let Some(uid) = stack.pop() {
+            let Some(node) = inner.graph.get(&uid) else {
+                continue;
+            };
+            if node.widget.upgrade().is_some() {
+                return false;
+            }
+            stack.extend(node.children.iter().copied().filter(|child_uid| {
+                inner.graph.get(child_uid).is_some_and(|child| child.parent == Some(uid))
+            }));
+        }
         true
     }
 
@@ -4465,6 +4480,87 @@ mod tests {
             churned.cache_misses, warm.cache_misses,
             "the root-level hit and MISS must both survive the churn"
         );
+    }
+
+    /// Rows a list drops leave the graph (subtrees and cached lookups too) instead of
+    /// piling up all session. A pooled row is still alive, so it stays.
+    #[test]
+    fn rows_dropped_by_a_list_leave_the_graph() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let list_uid = WidgetUid::new();
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        let root = make_widget(root_uid, vec![(name("list"), list.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        let make_row = || {
+            make_widget(WidgetUid::new(), vec![(name("label"), make_widget(WidgetUid::new(), vec![]))])
+        };
+        let pooled = make_row();
+
+        // Scroll: every round inserts fresh rows the way PortalList does and
+        // drops the previous ones. The pooled row is only shown in the first round.
+        for round in 0..50u64 {
+            let mut fresh: Vec<(LiveId, WidgetRef)> =
+                (0..4).map(|i| (LiveId(round * 4 + i + 1), make_row())).collect();
+            if round == 0 {
+                fresh.push((LiveId(1000), pooled.clone()));
+            }
+            for (id, row) in &fresh {
+                tree.insert_child(list_uid, *id, row.clone());
+            }
+            let first_row = fresh[0].1.widget_uid();
+            *rows.borrow_mut() = fresh;
+            tree.mark_dirty(list_uid);
+            // A lookup anchored at a row caches its answer under that row.
+            assert!(!tree.find_within(first_row, &[name("label")]).is_empty());
+        }
+
+        let inner = tree.inner.borrow();
+        assert!(inner.graph.contains_key(&pooled.widget_uid()), "a pooled row stays known");
+        assert_eq!(
+            inner.graph.len(),
+            2 + 4 * 2 + 2,
+            "only the root, the list, the live rows and the pooled row (each with its label) are left"
+        );
+        assert!(
+            inner.path_cache.keys().all(|uid| {
+                inner.graph.get(uid).is_some_and(|node| node.widget.upgrade().is_some())
+            }),
+            "no cached lookups rooted at dropped rows"
+        );
+    }
+
+    /// A dropped row stays put while something inside it is still held elsewhere,
+    /// since lookups can still be anchored there.
+    #[test]
+    fn a_dropped_row_stays_while_something_in_it_is_held() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let list_uid = WidgetUid::new();
+        let rows = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let list = make_dynamic_widget_skip(list_uid, rows.clone());
+        let root = make_widget(root_uid, vec![(name("list"), list.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        let label_uid = WidgetUid::new();
+        let label = make_widget(label_uid, vec![]);
+        let content = make_widget(WidgetUid::new(), vec![(name("label"), label)]);
+        let row = make_widget(WidgetUid::new(), vec![(name("content"), content.clone())]);
+        tree.insert_child(list_uid, LiveId(1), row.clone());
+        *rows.borrow_mut() = vec![(LiveId(1), row.clone())];
+        tree.mark_dirty(list_uid);
+        assert_eq!(tree.find_within(row.widget_uid(), &[name("label")]).widget_uid(), label_uid);
+
+        // The list drops the row, but the app still holds its content.
+        drop(row);
+        rows.borrow_mut().clear();
+        tree.mark_dirty(list_uid);
+        assert_eq!(tree.find_within(content.widget_uid(), &[name("label")]).widget_uid(), label_uid);
+        assert_eq!(tree.widget(content.widget_uid()).widget_uid(), content.widget_uid());
     }
 
     /// The barrier stops ABOVE the list, never at it: a lookup rooted at
