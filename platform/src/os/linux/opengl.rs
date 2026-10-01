@@ -405,37 +405,14 @@ impl Cx {
             self.publications.set_envelope(allowance / 4);
             crate::log!("retained-upload budgets: adapter_bytes={} process_allowance={} allocation_limit={} source={}", reported, self.memory_budget(), allowance / 4, if reported != 0 { "GL_NVX_gpu_memory_info" } else { "process_allowance_fallback" });
         }
-        self.draw_lists.1.allocations.collect_for_frame(
-            self.repaint_id,
-            self.textures
-                .1
-                .serials
-                .completed
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
-        self.draw_lists.1.allocations.collect_backlog(
-            self.repaint_id,
-            self.textures
-                .1
-                .serials
-                .completed
-                .load(std::sync::atomic::Ordering::Acquire),
-            8,
-        );
-        let pool = self.task_pool();
-        let gl = self.os.gl();
-        if self
-            .draw_lists
-            .retire_free_items(&pool, self.repaint_id, |os| {
-                if let Some(vao) = os.vao.take() {
-                    vao.free(gl);
-                }
-                os.inst_vb.free_resources(gl);
-                std::mem::take(&mut os.inst_vb)
-            })
-        {
+        if self.service_gl_instance_retirements() {
             crate::trace!("gl.repaint", "retirements pending: {}", self.draw_lists.instance_retirement_terms());
-            self.demo_time_repaint = true;
+            // Without the lifetime fence there's no `maintain_instance_retirements`, so
+            // these builds keep asking for a repaint while retirement work is pending.
+            #[cfg(any(linux_direct, target_env = "ohos", all(use_vulkan, not(target_os = "linux"))))]
+            {
+                self.demo_time_repaint = true;
+            }
         }
         self.render_view_inner(pass, list, zbias, step);
         let serial = self.textures.1.serials.submit();
@@ -452,6 +429,28 @@ impl Cx {
             all(use_vulkan, not(target_os = "linux"))
         )))]
         self.poll_texture_lifetimes_for(false);
+    }
+
+    /// Collects what the GPU is done with and hands freed draw items to the
+    /// workers, once per `repaint_id`. Returns whether work is still pending.
+    fn service_gl_instance_retirements(&mut self) -> bool {
+        let completed = self
+            .textures
+            .1
+            .serials
+            .completed
+            .load(std::sync::atomic::Ordering::Acquire);
+        self.draw_lists.1.allocations.collect_for_frame(self.repaint_id, completed);
+        self.draw_lists.1.allocations.collect_backlog(self.repaint_id, completed, 8);
+        let pool = self.task_pool();
+        let gl = self.os.gl();
+        self.draw_lists.retire_free_items(&pool, self.repaint_id, |os| {
+            if let Some(vao) = os.vao.take() {
+                vao.free(gl);
+            }
+            os.inst_vb.free_resources(gl);
+            std::mem::take(&mut os.inst_vb)
+        })
     }
 
     fn retained_adapter_bytes(&self) -> u64 {
@@ -4596,28 +4595,73 @@ impl Cx {
         self.poll_texture_lifetimes_for(true);
     }
 
-    /// `waiting` is false on the paint path, which polls once per frame and
-    /// only arms a fence (and pays for the flush behind it) while something it
-    /// can see is waiting on the completion serial.
-    fn poll_texture_lifetimes_for(&mut self, waiting: bool) {
-        // Vulkan retires its resources on its own frame path.
+    /// Does a render's retirement work on a beat where nothing rendered, so it
+    /// finishes at rest without repainting the window.
+    pub(crate) fn maintain_instance_retirements(&mut self) {
         #[cfg(target_os = "linux")]
         if self.os.vulkan_active() {
             return;
+        }
+        if !self.draw_lists.has_pending_instance_retirements()
+            && self.publications.accounting().pending_retirement == 0
+            && self.textures.1.retired.is_empty()
+        {
+            return;
+        }
+        // An EGL without surfaceless contexts fails this bind, so we let the poll's
+        // own check decide whether our context is current.
+        #[cfg(target_os = "linux")]
+        if let Some(opengl_cx) = self.os.opengl_cx.as_ref() {
+            opengl_cx.make_current();
+        }
+        #[cfg(target_os = "android")]
+        if !self.os.has_drawable_surface()
+            || !self.os.display.as_ref().is_some_and(|display| display.try_make_current())
+        {
+            return;
+        }
+        if !self.poll_texture_lifetimes_for(true) {
+            // We couldn't poll, so a repaint does this work instead.
+            self.demo_time_repaint = true;
+            return;
+        }
+        // Each retirement step runs once per repaint_id, so this beat needs its own.
+        self.repaint_id += 1;
+        self.service_gl_instance_retirements();
+        // No swap follows, so flush the step's deletes ourselves.
+        unsafe {
+            (self.os.gl().glFlush)();
+        }
+        crate::trace!(
+            "gl.repaint",
+            "retirement beat: [{}] records={}",
+            self.draw_lists.instance_retirement_terms(),
+            self.draw_lists.1.allocations.record_count()
+        );
+    }
+
+    /// `waiting` is false on the paint path, which polls once per frame and
+    /// only arms a fence (and pays for the flush behind it) while something it
+    /// can see is waiting on the completion serial.
+    fn poll_texture_lifetimes_for(&mut self, waiting: bool) -> bool {
+        // Vulkan retires its resources on its own frame path.
+        #[cfg(target_os = "linux")]
+        if self.os.vulkan_active() {
+            return false;
         }
         // The adapter draws attached blocks here (no per-publication
         // backing): dropped blocks release from this poll, contract §3.3.
         self.publications.retire_without_backing();
         #[cfg(target_os = "linux")]
         let Some(display) = self.os.opengl_cx.as_ref() else {
-            return;
+            return false;
         };
         #[cfg(target_os = "android")]
         let Some(display) = self.os.display.as_ref() else {
-            return;
+            return false;
         };
         let Some(get_proc) = display.libegl.eglGetProcAddress else {
-            return;
+            return false;
         };
         // An explicit poll may have no swap coming to flush our fence, and glFlush
         // alone isn't guaranteed to, so the check itself flushes it.
@@ -4636,7 +4680,7 @@ impl Cx {
                 let delete = get_proc(c"glDeleteSync".as_ptr());
                 let current = get_proc(c"eglGetCurrentContext".as_ptr());
                 if create.is_null() || poll.is_null() || delete.is_null() || current.is_null() {
-                    return;
+                    return false;
                 }
                 state.gl.functions = Some(TextureFenceFunctions {
                     create: std::mem::transmute::<
@@ -4662,7 +4706,7 @@ impl Cx {
         unsafe {
             if (functions.current)() != display.egl_context {
                 crate::trace!("gl.repaint", "lifetime poll: context not current");
-                return;
+                return false;
             }
             crate::trace!(
                 "gl.repaint",
@@ -4707,5 +4751,6 @@ impl Cx {
                 false
             });
         }
+        true
     }
 }
