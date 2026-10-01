@@ -237,6 +237,15 @@ impl HeightTree {
         }
     }
 
+    /// Forget the height measured at index i, so it's estimated with the default again.
+    fn forget(&mut self, i: usize) {
+        if i >= self.size || !self.measured[i] {
+            return;
+        }
+        self.update(i, self.default_height);
+        self.measured[i] = false;
+    }
+
     /// Get the sum of the heights of the items in `start..end`
     fn range_sum(&self, start: usize, end: usize) -> f64 {
         if start >= end || start >= self.size {
@@ -1838,6 +1847,18 @@ impl PortalList {
         self.skip_to = Some(id);
     }
 
+    /// Forgets the measured heights of the items in `range`, so they're estimated again until
+    /// they get drawn, e.g., once they're no longer skipped over (see [`Self::skip_to()`]).
+    pub fn forget_item_heights(&mut self, range: Range<usize>) {
+        if let Some(tree) = self.height_tree.as_mut() {
+            let start = range.start.max(self.range_start) - self.range_start;
+            let end = range.end.min(self.range_end).saturating_sub(self.range_start);
+            for index in start..end {
+                tree.forget(index);
+            }
+        }
+    }
+
     /// Sets the first visible item and scroll offset.
     pub fn set_first_id_and_scroll(&mut self, first_id: usize, first_scroll: f64) {
         self.first_id = first_id;
@@ -3426,6 +3447,13 @@ impl Widget for PortalList {
 }
 
 impl PortalListRef {
+    /// See [`PortalList::forget_item_heights()`].
+    pub fn forget_item_heights(&self, range: Range<usize>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.forget_item_heights(range);
+        }
+    }
+
     /// Sets the first item to be shown and its scroll offset.
     pub fn set_first_id_and_scroll(&self, id: usize, s: f64) {
         if let Some(mut inner) = self.borrow_mut() {
@@ -3798,6 +3826,11 @@ mod height_tree_tests {
         assert_eq!(tree.range_sum(2, 5), 40.0);
         assert_eq!(tree.range_sum(5, 5), 0.0);
         assert_eq!(tree.range_sum(8, 20), 40.0);
+        // Forgetting a measured height goes back to the default, and follows it from then on.
+        tree.forget(3);
+        assert_eq!(tree.range_sum(2, 5), 60.0);
+        tree.update_default_height(30.0);
+        assert_eq!(tree.range_sum(3, 4), 30.0);
     }
 
     /// Growing the tree must keep every height measured before the growth.
