@@ -1723,19 +1723,28 @@ impl WidgetTree {
     }
 
     /// Notes a new parentless placeholder at `uid`. Once there are twice as many as the last
-    /// sweep kept (so it's O(1) per placeholder), it first drops the ones with nothing alive under
-    /// them anymore: their widgets are gone, so nothing can look them up again. (One whose widget
-    /// is still around but has no children just gets made again by its next lookup.)
+    /// sweep kept (so it's O(1) per placeholder), it first drops the ones that don't list or own
+    /// anything alive anymore, since their widgets are gone. (One whose widget is still around
+    /// but has no children just gets made again by its next lookup.)
     fn note_placeholder_root(inner: &mut WidgetTreeInner, uid: WidgetUid) {
         let sweep_at = (2 * inner.placeholder_roots_kept).max(MIN_PLACEHOLDER_ROOTS_TO_SWEEP);
         if inner.placeholder_roots.len() >= sweep_at {
             let mut roots = std::mem::take(&mut inner.placeholder_roots);
+            let mut seen = HashSet::new();
             roots.retain(|&root| {
-                // Gone or adopted since then, so it's not one anymore.
-                if !inner.graph.get(&root).is_some_and(|node| node.placeholder && node.parent.is_none()) {
+                // Listed twice, or gone or adopted since then, so it's not one to keep track of.
+                if !seen.insert(root) {
                     return false;
                 }
-                if root == inner.root_uid || !Self::subtree_is_dead(inner, root) {
+                let Some(node) = inner.graph.get(&root).filter(|node| node.placeholder && node.parent.is_none()) else {
+                    return false;
+                };
+                // It lists what its widget reported last time, so anything alive in there (even one
+                // it only borrows, like a FoldHeader's header) means that widget likely is too.
+                let lists_live_child = node.children.iter().any(|child_uid| {
+                    inner.graph.get(child_uid).is_some_and(|child| child.widget.upgrade().is_some())
+                });
+                if root == inner.root_uid || lists_live_child || !Self::subtree_is_dead(inner, root) {
                     return true;
                 }
                 Self::remove_subtree(inner, root);
@@ -4626,6 +4635,48 @@ mod tests {
         let placeholders = inner.graph.values().filter(|node| node.placeholder).count();
         assert!(placeholders <= MIN_PLACEHOLDER_ROOTS_TO_SWEEP, "{placeholders} placeholders left");
         assert!(inner.graph.contains_key(&held.widget_uid()));
+    }
+
+    /// A FoldHeader's header (whose fold reports its children as the fold's own) keeps its
+    /// placeholder while the fold's around, and loses it once the fold's gone.
+    #[test]
+    fn placeholders_for_flattened_refs_stay_while_their_widget_does() {
+        let tree = WidgetTree::default();
+        let root_children = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let root = make_dynamic_widget(WidgetUid::new(), root_children.clone());
+        let mut headers = Vec::new();
+        for i in 0..2 * MIN_PLACEHOLDER_ROOTS_TO_SWEEP {
+            let button = make_widget(WidgetUid::new(), vec![]);
+            headers.push(make_widget(WidgetUid::new(), vec![(name("fold_button"), button.clone())]));
+            let fold = make_widget(WidgetUid::new(), vec![(name("fold_button"), button)]);
+            root_children.borrow_mut().push((LiveId(i as u64 + 1), fold));
+        }
+        tree.observe_node(root.widget_uid(), name("root"), root.clone(), None);
+        tree.refresh_from_borrowed(root.widget_uid(), |visit| root.children(visit));
+        assert!(!tree.find_within(root.widget_uid(), &[name("fold_button")]).is_empty());
+
+        // What FoldHeader::handle_event does on every Actions event.
+        let look_up_buttons = |headers: &[WidgetRef]| {
+            for header in headers {
+                tree.refresh_from_borrowed(header.widget_uid(), |visit| header.children(visit));
+                assert!(!tree.find_within(header.widget_uid(), &[name("fold_button")]).is_empty());
+            }
+        };
+        look_up_buttons(&headers);
+        let misses = tree.stats().cache_misses;
+        look_up_buttons(&headers);
+        assert_eq!(tree.stats().cache_misses, misses, "warm lookups shouldn't miss");
+
+        let header_uids: Vec<_> = headers.iter().map(|header| header.widget_uid()).collect();
+        drop(headers);
+        root_children.borrow_mut().clear();
+        tree.refresh_from_borrowed(root.widget_uid(), |visit| root.children(visit));
+        for _ in 0..2 * MIN_PLACEHOLDER_ROOTS_TO_SWEEP {
+            let avatar = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.refresh_from_borrowed(avatar.widget_uid(), |visit| avatar.children(visit));
+        }
+        let inner = tree.inner.borrow();
+        assert!(header_uids.iter().all(|uid| !inner.graph.contains_key(uid)));
     }
 
     /// The tree's root stays put, even if it's a placeholder whose widget is gone.
