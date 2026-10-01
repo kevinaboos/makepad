@@ -2066,9 +2066,8 @@ impl PortalList {
         let item_top = self.item_top_from_height_tree(target_id);
         if viewport_size > 0.0 {
             if let Some(item_top) = item_top {
-                // Targeting the last item means "go to the bottom", and a tall
-                // last item can have its top on screen with most of it below.
-                let settled = if target_id + 1 >= self.range_end {
+                // Going to the end is done once we're there, wherever a tall last item's top is.
+                let settled = if to_end {
                     self.at_end
                 } else {
                     item_top >= 0.0 && item_top < viewport_size
@@ -2076,13 +2075,15 @@ impl PortalList {
                 if settled {
                     // A smooth scroll that's still on its way somewhere else is over too,
                     // or it'd carry the list right past this target.
-                    if matches!(self.scroll_state, ScrollState::ScrollingTo { target_id: id, .. } if id != target_id) {
+                    if matches!(self.scroll_state, ScrollState::ScrollingTo { target_id: id, to_end: was_to_end, .. }
+                        if id != target_id || was_to_end != to_end)
+                    {
                         self.scroll_state = ScrollState::Stopped;
                         self.was_scrolling = false;
                     }
                     // Already at the end, so follow it from now on. Do it right away: whoever's
                     // appending hasn't drawn the new items yet, and that draw won't be at the end.
-                    if target_id + 1 >= self.range_end && self.auto_tail {
+                    if self.at_end && self.auto_tail {
                         self.tail_range = true;
                     }
                     cx.widget_action(self.widget_uid(), PortalListAction::SmoothScrollReached);
@@ -2145,8 +2146,8 @@ impl PortalList {
     }
 
     /// Trigger a scrolling animation to the end of the list: that end lines up with the end of
-    /// the viewport (even if the last item's taller than the viewport), and the list follows
-    /// its end again from then on.
+    /// the viewport (even if the last item's taller than the viewport), and with `auto_tail`,
+    /// the list follows its end again from then on.
     pub fn smooth_scroll_to_end(
         &mut self,
         cx: &mut Cx,
