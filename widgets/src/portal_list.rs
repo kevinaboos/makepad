@@ -41,9 +41,29 @@ const SMOOTH_SCROLL_MAXIMUM_WINDOW: usize = 20;
 /// How many frames a `smooth_scroll_to_end` animation takes, whatever the
 /// distance, so a long list doesn't crawl at a fixed pixels-per-frame rate.
 const SMOOTH_SCROLL_TO_END_FRAMES: f64 = 24.0;
+/// How close a smooth scroll has to get its target to count as there,
+/// so float drift can't keep it creeping along forever.
+const SMOOTH_SCROLL_TOLERANCE: f64 = 0.1;
 /// How far past the end of the viewport an item can end and still count as fitting,
 /// to absorb float drift from adding up item sizes.
 const END_TOLERANCE: f64 = 1.0;
+
+/// How far one frame of a smooth scroll moves the list (positive moves the content down) to
+/// bring the target's `top` to `goal`, both measured from the viewport's top: at most `speed`,
+/// and never past `goal`. `None` once it's there, or once the start or end of the list is in
+/// the way.
+fn smooth_scroll_step(
+    top: f64,
+    goal: f64,
+    speed: f64,
+    at_start: bool,
+    at_end: bool,
+) -> Option<f64> {
+    let remaining = goal - top;
+    let blocked = if remaining > 0.0 { at_start } else { at_end };
+    (remaining.abs() > SMOOTH_SCROLL_TOLERANCE && !blocked)
+        .then(|| remaining.max(-speed).min(speed))
+}
 
 enum ScrollState {
     Stopped,
@@ -92,6 +112,9 @@ enum ScrollState {
         /// Pixel offset from the top of the viewport where the target item's
         /// top edge should end up once scrolling completes.
         top_offset: f64,
+        /// Whether the target is the last item, which means going to the end of the list instead,
+        /// wherever that is by the time it gets there.
+        to_end: bool,
     },
     Tailing {
         next_frame: NextFrame,
@@ -1931,10 +1954,13 @@ impl PortalList {
     /// occurs and [`PortalListAction::SmoothScrollReached`] is emitted immediately.
     ///
     /// Otherwise, the list animates until the target item's top edge is positioned at
-    /// `top_offset` pixels below the viewport's top edge. A value of `0.0` places the
-    /// item flush with the viewport top; `20.0` leaves a 20 px margin. Negative values
-    /// are clamped to `0.0`. Animating to any item but the last one also stops the list
-    /// from following its end (see `set_tail_range()`).
+    /// `top_offset` pixels below the viewport's top edge, or as close as the start or end
+    /// of the list lets it get. A value of `0.0` places the item flush with the viewport
+    /// top; `20.0` leaves a 20 px margin. Negative values are clamped to `0.0`. The last
+    /// item is different: animating to it goes all the way to the end of the list (even
+    /// if that item's taller than the viewport), and has the list follow its end again.
+    /// Animating to any other item stops the list from following its end (see
+    /// `set_tail_range()`).
     pub fn smooth_scroll_to(
         &mut self,
         cx: &mut Cx,
@@ -2025,6 +2051,7 @@ impl PortalList {
             delta: speed.abs() * scroll_direction,
             next_frame: cx.new_next_frame(),
             top_offset,
+            to_end: target_id + 1 >= self.range_end,
         };
     }
 
@@ -2041,9 +2068,11 @@ impl PortalList {
         // `range_end` is exclusive, so the last item is one before it.
         let target_id = self.range_end.saturating_sub(1);
         // `speed` is a per-frame pixel delta. Scale it to the distance so the
-        // animation takes the same time from anywhere in the list.
-        let speed = match self.item_top_from_height_tree(target_id) {
-            Some(item_top) => (item_top.abs() / SMOOTH_SCROLL_TO_END_FRAMES).max(speed),
+        // animation takes the same time from anywhere in the list. That's the distance
+        // to the end of the list, which is past the last item's top if it's a tall one.
+        let viewport_size = self.area.rect(cx).size.index(self.vec_index);
+        let speed = match self.item_top_from_height_tree(self.range_end) {
+            Some(bottom) => ((bottom - viewport_size).abs() / SMOOTH_SCROLL_TO_END_FRAMES).max(speed),
             None => speed,
         };
         // Pass an unbounded window so `smooth_scroll_to` doesn't teleport the anchor
@@ -2666,69 +2695,57 @@ impl Widget for PortalList {
                 delta,
                 next_frame,
                 top_offset,
+                to_end,
             } => {
                 if next_frame.is_event(event).is_some() {
                     // Copy values out of the borrow so we can call &self methods.
                     let target_id = *target_id;
                     let delta_val = *delta;
                     let top_offset = *top_offset;
-                    let scrolling_down = delta_val < 0.0;
+                    let to_end = *to_end;
 
-                    // Check if the target item has reached (or passed) the
-                    // desired position using the height tree for accuracy.
-                    let vi = self.vec_index;
-                    let viewport_size = self.area.rect(cx).size.index(vi);
-                    let item_top = self.item_top_from_height_tree(target_id);
-                    let mut target_reached = false;
-
-                    if let Some(item_top) = item_top {
-                        // Clamp: the item must at least reach the viewport (top >= 0).
-                        let effective_target = top_offset.max(0.0);
-                        if scrolling_down {
-                            target_reached = item_top <= effective_target;
-                        } else {
-                            target_reached = item_top >= effective_target;
+                    // Going to the end lines up the bottom of the list with the bottom of the viewport.
+                    let (edge_id, goal) = if to_end {
+                        (self.range_end, self.area.rect(cx).size.index(self.vec_index))
+                    } else {
+                        (target_id, top_offset.max(0.0))
+                    };
+                    let step = match self.item_top_from_height_tree(edge_id) {
+                        // Head for the goal from whichever side of it the target is on, since
+                        // estimated heights can leave it short or past once they're drawn.
+                        Some(edge_top) => smooth_scroll_step(
+                            edge_top,
+                            goal,
+                            delta_val.abs(),
+                            self.first_id == self.range_start && self.first_scroll >= 0.0,
+                            self.at_end,
+                        ),
+                        // With no heights to go by, scrolling down stops once it hits the end.
+                        None if delta_val < 0.0 && self.at_end && target_id > self.first_id => None,
+                        None => {
+                            // If first_id has scrolled past target_id, snap it back so the
+                            // item gets drawn.
+                            let distance_to_target = target_id as isize - self.first_id as isize;
+                            if distance_to_target.signum() == delta_val.signum() as isize {
+                                self.first_id = target_id;
+                            }
+                            Some(delta_val)
                         }
+                    };
 
-                        // For boundary conditions (e.g., near list start/end), the
-                        // effective_target may not be reachable. Consider it reached
-                        // if the item's top is visible and we're at a list boundary.
-                        if !target_reached
-                            && item_top >= 0.0
-                            && item_top < viewport_size
-                            && (self.first_id == self.range_start || self.at_end)
-                        {
-                            target_reached = true;
-                        }
-                    }
-
-                    // Fallback: if we're scrolling down and the list has hit
-                    // the end, the target is as visible as it can get.
-                    if scrolling_down && self.at_end && target_id > self.first_id {
-                        target_reached = true;
-                    }
-
-                    if !target_reached {
-                        // Overshoot protection: if first_id has scrolled past
-                        // target_id, snap it back so the item gets drawn.
-                        let distance_to_target = target_id as isize - self.first_id as isize;
-                        let overshot = distance_to_target.signum() == delta_val.signum() as isize;
-                        if overshot {
-                            self.first_id = target_id;
-                        }
-
+                    if let Some(step) = step {
                         if let ScrollState::ScrollingTo { next_frame, .. } = &mut self.scroll_state
                         {
                             *next_frame = cx.new_next_frame();
                         }
-                        self.delta_top_scroll(cx, delta_val, true, false, 0.0, false, false);
+                        self.delta_top_scroll(cx, step, true, false, 0.0, false, false);
                         self.area.redraw(cx);
                     } else {
                         self.was_scrolling = false;
                         self.scroll_state = ScrollState::Stopped;
-                        // Landing on the last item means we're following the end again,
+                        // Going to the end means we're following it again,
                         // so let the next draw pick tailing back up.
-                        if target_id + 1 >= self.range_end {
+                        if to_end {
                             self.detect_tail_in_draw = true;
                         }
                         cx.widget_action(uid, PortalListAction::SmoothScrollReached);
@@ -3862,5 +3879,71 @@ mod height_tree_tests {
         tree.update(2, 100.0);
         tree.resize(4);
         assert_matches(&tree, &[30.0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod smooth_scroll_tests {
+    use super::{smooth_scroll_step, SMOOTH_SCROLL_TOLERANCE};
+
+    /// Every top a target passes through on its way to `goal`, moving the way the list moves it.
+    fn tops(mut top: f64, goal: f64, speed: f64) -> Vec<f64> {
+        let mut tops = vec![top];
+        while let Some(step) = smooth_scroll_step(top, goal, speed, false, false) {
+            assert!(step.abs() <= speed);
+            top += step;
+            tops.push(top);
+            assert!(tops.len() < 1000, "never got from {} to {goal}", tops[0]);
+        }
+        tops
+    }
+
+    #[test]
+    fn a_smooth_scroll_lands_right_on_its_goal() {
+        // Jumping down the list brings the target up from below; jumping up brings it down.
+        for (start, goal, speed) in [
+            (1234.5, 10.0, 50.0),
+            (60.25, 10.0, 50.0),
+            (-987.3, 10.0, 50.0),
+            (-3.0, 0.0, 90.0),
+            (77.7, 33.3, 13.0),
+        ] {
+            let tops = tops(start, goal, speed);
+            let last = *tops.last().unwrap();
+            assert!((last - goal).abs() < 1e-9, "{start} -> {goal} stopped at {last}");
+            // It never goes past the goal, so it never has to come back.
+            assert!(
+                tops.iter().all(|&top| (top - goal) * (start - goal) >= -1e-9),
+                "{start} -> {goal} went past it: {tops:?}"
+            );
+            assert_eq!(tops.len() - 1, ((start - goal).abs() / speed).ceil() as usize);
+        }
+    }
+
+    #[test]
+    fn a_target_already_there_needs_no_scrolling() {
+        assert_eq!(smooth_scroll_step(10.0, 10.0, 50.0, false, false), None);
+        let close = 10.0 - SMOOTH_SCROLL_TOLERANCE / 2.0;
+        assert_eq!(smooth_scroll_step(close, 10.0, 50.0, false, false), None);
+        // Float drift from adding up heights can't keep it creeping toward the goal.
+        assert_eq!(smooth_scroll_step(9.999999999999986, 10.0, 50.0, false, false), None);
+    }
+
+    #[test]
+    fn a_target_past_its_goal_comes_back() {
+        // E.g., the items scrolled over turned out shorter or taller than estimated.
+        assert_eq!(smooth_scroll_step(-20.0, 10.0, 50.0, false, false), Some(30.0));
+        assert_eq!(smooth_scroll_step(45.5, 10.0, 50.0, false, false), Some(-35.5));
+    }
+
+    #[test]
+    fn the_ends_of_the_list_stop_it_short() {
+        // At the end, a target near the bottom of the list can't come up any further...
+        assert_eq!(smooth_scroll_step(300.0, 10.0, 50.0, false, true), None);
+        // ...but the list can still move away from the end.
+        assert_eq!(smooth_scroll_step(-300.0, 10.0, 50.0, false, true), Some(50.0));
+        // Same at the start, for a target near the top of the list.
+        assert_eq!(smooth_scroll_step(4.0, 10.0, 50.0, true, false), None);
+        assert_eq!(smooth_scroll_step(300.0, 10.0, 50.0, true, false), Some(-50.0));
     }
 }
