@@ -1993,6 +1993,13 @@ impl PortalList {
         self.first_id
     }
 
+    /// How long the viewport is along the list, inside its padding,
+    /// which is what `end()` lines up the items against.
+    fn viewport_size(&self, cx: &Cx) -> f64 {
+        let vi = self.vec_index;
+        (self.area.rect(cx).size.index(vi) - self.layout.padding.size().index(vi)).max(0.0)
+    }
+
     /// Computes the top position of `target_id` relative to the viewport top
     /// using `first_id`, `first_scroll`, and the height tree.
     ///
@@ -2055,8 +2062,7 @@ impl PortalList {
         // Compute the target's top position relative to viewport using first_id,
         // first_scroll, and the height_tree — this avoids relying on widget rects
         // which may be clipped for partially-visible items.
-        let vi = self.vec_index;
-        let viewport_size = self.area.rect(cx).size.index(vi);
+        let viewport_size = self.viewport_size(cx);
         let item_top = self.item_top_from_height_tree(target_id);
         if viewport_size > 0.0 {
             if let Some(item_top) = item_top {
@@ -2068,6 +2074,12 @@ impl PortalList {
                     item_top >= 0.0 && item_top < viewport_size
                 };
                 if settled {
+                    // A smooth scroll that's still on its way somewhere else is over too,
+                    // or it'd carry the list right past this target.
+                    if matches!(self.scroll_state, ScrollState::ScrollingTo { target_id: id, .. } if id != target_id) {
+                        self.scroll_state = ScrollState::Stopped;
+                        self.was_scrolling = false;
+                    }
                     // Already at the end, so follow it from now on. Do it right away: whoever's
                     // appending hasn't drawn the new items yet, and that draw won't be at the end.
                     if target_id + 1 >= self.range_end && self.auto_tail {
@@ -2149,7 +2161,7 @@ impl PortalList {
         // `speed` is a per-frame pixel delta. Scale it to the distance so the
         // animation takes the same time from anywhere in the list. That's the distance
         // to the end of the list, which is past the last item's top if it's a tall one.
-        let viewport_size = self.area.rect(cx).size.index(self.vec_index);
+        let viewport_size = self.viewport_size(cx);
         let speed = match self.item_top_from_height_tree(self.range_end) {
             Some(bottom) => ((bottom - viewport_size).abs() / SMOOTH_SCROLL_TO_END_FRAMES).max(speed),
             None => speed,
@@ -2786,11 +2798,13 @@ impl Widget for PortalList {
 
                     // Going to the end lines up the bottom of the list with the bottom of the viewport.
                     let (edge_id, goal) = if to_end {
-                        (self.range_end, self.area.rect(cx).size.index(self.vec_index))
+                        (self.range_end, self.viewport_size(cx))
                     } else {
                         (target_id, top_offset.max(0.0))
                     };
                     let step = match self.item_top_from_height_tree(edge_id) {
+                        // An empty list is as far as it can go (and has nothing to measure).
+                        _ if self.range_start >= self.range_end => None,
                         // Head for the goal from whichever side of it the target is on, since
                         // estimated heights can leave it short or past once they're drawn.
                         Some(edge_top) => smooth_scroll_step(
