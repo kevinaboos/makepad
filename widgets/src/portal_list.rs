@@ -1918,7 +1918,7 @@ impl PortalList {
         }
     }
 
-    /// Tells the list which items to skip (e.g. ones folded away behind a collapsed header),
+    /// Tells the list which items to skip (e.g. the ones in a collapsed group, besides its summary),
     /// as runs of item ids, in order and not overlapping. The list skips right over them while
     /// drawing (so it doesn't keep them around or send them events), and counts them as taking up
     /// no space for scrolling. Items that aren't skipped anymore get estimated again until they're drawn.
