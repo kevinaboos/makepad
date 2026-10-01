@@ -140,7 +140,10 @@ enum ListDrawState {
     Up {
         index: usize,
         pos: f64,
-        hit_bottom: bool,
+        /// Where the bottom of what's in the range ended up, if drawing down ran out of things to draw
+        /// (usually at the end of the list) before the bottom of the viewport. `end()` then moves it all
+        /// down to line that up with the bottom of the viewport.
+        list_bottom: Option<f64>,
         viewport: Rect,
     },
     DownAgain {
@@ -1335,10 +1338,17 @@ impl PortalList {
                     if !did_draw || pos + rect.size.index(vi) > viewport.size.index(vi) + END_TOLERANCE {
                         if self.first_id > self.range_start && !is_down_again {
                             let above = self.prev_drawn_before(self.first_id);
+                            // Same as where `end()` puts it, which only counts what's in the range.
+                            let ran_out = !did_draw || index >= self.range_end;
+                            let list_bottom = (ran_out && self.first_id < self.range_end).then(|| {
+                                self.draw_align_list.iter()
+                                    .filter(|item| item.index < self.range_end)
+                                    .fold(self.first_scroll, |pos, item| pos + item.size.index(vi))
+                            });
                             self.draw_state.set(ListDrawState::Up {
                                 index: above,
                                 pos: self.first_scroll,
-                                hit_bottom: index >= self.range_end,
+                                list_bottom,
                                 viewport,
                             });
                             match vi {
@@ -1424,7 +1434,7 @@ impl PortalList {
                 ListDrawState::Up {
                     index,
                     pos,
-                    hit_bottom,
+                    list_bottom,
                     viewport,
                 } => {
                     let did_draw = cx.turtle_has_align_items();
@@ -1490,14 +1500,15 @@ impl PortalList {
                         return None;
                     }
 
-                    if !did_draw
-                        || pos
-                            < if hit_bottom {
-                                -viewport.size.index(vi)
-                            } else {
-                                0.0
-                            }
-                    {
+                    // If drawing down ran out before the bottom of the viewport, `end()` moves everything down
+                    // to line that bottom up with the viewport's. That's more than a viewport's worth if it's
+                    // above the top (e.g., the last item just got a lot shorter), so draw enough up here to
+                    // still fill the viewport after that.
+                    let stop_above = match list_bottom {
+                        Some(bottom) => bottom.min(0.0) - viewport.size.index(vi),
+                        None => 0.0,
+                    };
+                    if !did_draw || pos < stop_above {
                         self.draw_state.set(ListDrawState::End { viewport });
                         return None;
                     }
@@ -1505,7 +1516,7 @@ impl PortalList {
                     let next = self.prev_drawn_before(index);
                     self.draw_state.set(ListDrawState::Up {
                         index: next,
-                        hit_bottom,
+                        list_bottom,
                         pos: pos - rect.size.index(vi),
                         viewport,
                     });
