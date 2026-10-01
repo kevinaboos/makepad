@@ -23,6 +23,8 @@ unsafe impl Send for WidgetTree {}
 unsafe impl Sync for WidgetTree {}
 
 const NONE: u32 = u32::MAX;
+/// Placeholder roots don't get swept until there are at least this many, so a few cost nothing.
+const MIN_PLACEHOLDER_ROOTS_TO_SWEEP: usize = 64;
 
 /// Cheap always-on counters for the path lookup hot path. Three integer
 /// adds; no hashing, no allocation. They exist because "does this lookup
@@ -166,6 +168,12 @@ struct WidgetTreeInner {
     // Only set when tree topology changes (nodes added/removed, parent changes).
     // Property-only changes (name, widget ref, skip_search) are patched in-place.
     structure_dirty: bool,
+    /// Parentless placeholders, made when a lookup is anchored at (or a child gets inserted
+    /// under) a widget that nothing reports as a child, like one made from a template. Nothing
+    /// else ever revisits these, so `note_placeholder_root()` sweeps out the dead ones now and then.
+    placeholder_roots: Vec<WidgetUid>,
+    /// How many of those the last sweep kept, which spaces out the next one.
+    placeholder_roots_kept: usize,
 }
 
 struct WidgetTreeNode {
@@ -541,6 +549,7 @@ impl WidgetTree {
         let mut inner = self.inner.borrow_mut();
 
         if !inner.graph.contains_key(&parent_uid) {
+            Self::note_placeholder_root(&mut inner, parent_uid);
             inner.graph.insert(
                 parent_uid,
                 GraphNode {
@@ -938,6 +947,7 @@ impl WidgetTree {
 
         let mut inner = self.inner.borrow_mut();
         if !inner.graph.contains_key(&uid) {
+            Self::note_placeholder_root(&mut inner, uid);
             inner.graph.insert(
                 uid,
                 GraphNode {
@@ -1710,6 +1720,31 @@ impl WidgetTree {
             }));
         }
         true
+    }
+
+    /// Notes a new parentless placeholder at `uid`. Once there are twice as many as the last
+    /// sweep kept (so it's O(1) per placeholder), it first drops the ones with nothing alive under
+    /// them anymore: their widgets are gone, so nothing can look them up again. (One whose widget
+    /// is still around but has no children just gets made again by its next lookup.)
+    fn note_placeholder_root(inner: &mut WidgetTreeInner, uid: WidgetUid) {
+        let sweep_at = (2 * inner.placeholder_roots_kept).max(MIN_PLACEHOLDER_ROOTS_TO_SWEEP);
+        if inner.placeholder_roots.len() >= sweep_at {
+            let mut roots = std::mem::take(&mut inner.placeholder_roots);
+            roots.retain(|&root| {
+                // Gone or adopted since then, so it's not one anymore.
+                if !inner.graph.get(&root).is_some_and(|node| node.placeholder && node.parent.is_none()) {
+                    return false;
+                }
+                if root == inner.root_uid || !Self::subtree_is_dead(inner, root) {
+                    return true;
+                }
+                Self::remove_subtree(inner, root);
+                false
+            });
+            inner.placeholder_roots_kept = roots.len();
+            inner.placeholder_roots = roots;
+        }
+        inner.placeholder_roots.push(uid);
     }
 
     fn remove_subtree(inner: &mut WidgetTreeInner, uid: WidgetUid) {
@@ -4561,6 +4596,53 @@ mod tests {
         tree.mark_dirty(list_uid);
         assert_eq!(tree.find_within(content.widget_uid(), &[name("label")]).widget_uid(), label_uid);
         assert_eq!(tree.widget(content.widget_uid()).widget_uid(), content.widget_uid());
+    }
+
+    /// Widgets nothing reports as a child (like ones made from a template) get a placeholder
+    /// when a lookup is anchored at them, which gets swept out once they're gone.
+    #[test]
+    fn placeholders_for_dropped_widgets_get_swept() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let root = make_widget(root_uid, vec![]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.sync_dirty();
+
+        // One that's still around keeps its placeholder (and working lookups) the whole time.
+        let label_uid = WidgetUid::new();
+        let held = make_widget(WidgetUid::new(), vec![(name("label"), make_widget(label_uid, vec![]))]);
+        tree.refresh_from_borrowed(held.widget_uid(), |visit| held.children(visit));
+        for round in 0..500 {
+            let avatar = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.refresh_from_borrowed(avatar.widget_uid(), |visit| avatar.children(visit));
+            assert!(!tree.find_within(avatar.widget_uid(), &[name("image")]).is_empty());
+            if round % 50 == 0 {
+                assert!(tree.inner.borrow().graph.contains_key(&held.widget_uid()), "round {round}");
+                tree.refresh_from_borrowed(held.widget_uid(), |visit| held.children(visit));
+                assert_eq!(tree.find_within(held.widget_uid(), &[name("label")]).widget_uid(), label_uid);
+            }
+        }
+        let inner = tree.inner.borrow();
+        let placeholders = inner.graph.values().filter(|node| node.placeholder).count();
+        assert!(placeholders <= MIN_PLACEHOLDER_ROOTS_TO_SWEEP, "{placeholders} placeholders left");
+        assert!(inner.graph.contains_key(&held.widget_uid()));
+    }
+
+    /// The tree's root stays put, even if it's a placeholder whose widget is gone.
+    #[test]
+    fn the_root_never_gets_swept() {
+        let tree = WidgetTree::default();
+        let first = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+        let first_uid = first.widget_uid();
+        tree.refresh_from_borrowed(first_uid, |visit| first.children(visit));
+        drop(first);
+        for _ in 0..200 {
+            let avatar = make_widget(WidgetUid::new(), vec![(name("image"), make_widget(WidgetUid::new(), vec![]))]);
+            tree.refresh_from_borrowed(avatar.widget_uid(), |visit| avatar.children(visit));
+        }
+        let inner = tree.inner.borrow();
+        assert_eq!(inner.root_uid, first_uid);
+        assert!(inner.graph.contains_key(&first_uid));
     }
 
     /// The barrier stops ABOVE the list, never at it: a lookup rooted at
