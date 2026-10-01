@@ -436,19 +436,19 @@ impl HeightTree {
     }
 }
 
-/// The items that are folded away (see [`PortalList::set_folded_ranges()`]):
+/// The items to skip (see [`PortalList::set_skipped_ranges()`]):
 /// runs of item ids, in order and not overlapping.
 #[derive(Default)]
-struct FoldedRuns(Vec<Range<usize>>);
+struct SkippedRuns(Vec<Range<usize>>);
 
-impl FoldedRuns {
-    /// The run that the item `id` is folded into, if any.
+impl SkippedRuns {
+    /// The run that the item `id` is in, if any.
     fn run_at(&self, id: usize) -> Option<&Range<usize>> {
         let i = self.0.partition_point(|run| run.end <= id);
         self.0.get(i).filter(|run| run.start <= id)
     }
 
-    /// The first item after `id` that isn't folded away.
+    /// The first item after `id` that isn't skipped.
     fn next_after(&self, id: usize) -> usize {
         let mut next = id + 1;
         // Runs can touch, so keep going until it's past all of them.
@@ -458,7 +458,7 @@ impl FoldedRuns {
         next
     }
 
-    /// The last item before `id` that isn't folded away, or the very first item if they all are.
+    /// The last item before `id` that isn't skipped, or the very first item if they all are.
     fn prev_before(&self, id: usize) -> usize {
         let mut prev = id.saturating_sub(1);
         while let Some(run) = self.run_at(prev) {
@@ -469,12 +469,12 @@ impl FoldedRuns {
     }
 
     /// Switches to the given runs, and updates `tree` (whose first item is `first`) to match:
-    /// items that just got folded away take up no space, and ones that came back get estimated
+    /// items that just got skipped take up no space, and ones that came back get estimated
     /// again until they're drawn, since whatever they measured before is long gone.
     fn set(&mut self, runs: &[Range<usize>], first: usize, tree: Option<&mut HeightTree>) {
         debug_assert!(
             runs.windows(2).all(|pair| pair[0].end <= pair[1].start),
-            "folded ranges must be in order, with no overlaps: {runs:?}"
+            "skipped ranges must be in order, with no overlaps: {runs:?}"
         );
         if let Some(tree) = tree {
             for run in ranges_minus(&self.0, runs) {
@@ -493,7 +493,7 @@ impl FoldedRuns {
     }
 
     /// Resizes `tree` (whose first item is `first`) to `size` items. Whatever that (re)builds
-    /// starts out at the default height, so the folded items in there get zeroed again.
+    /// starts out at the default height, so the skipped items in there get zeroed again.
     fn resize_tree(&self, tree: &mut HeightTree, first: usize, size: usize) {
         // Growing keeps what's there, but shrinking starts the tree over.
         let rebuilt_from = if size >= tree.size { tree.size } else { 0 };
@@ -682,10 +682,10 @@ pub struct PortalList {
     draw_state: DrawStateWrap<ListDrawState>,
     #[rust]
     draw_align_list: Vec<AlignItem>,
-    /// The items that are folded away, see [`Self::set_folded_ranges()`].
+    /// The items to skip, see [`Self::set_skipped_ranges()`].
     #[rust]
-    folded: FoldedRuns,
-    /// The furthest item (before `range_end`) the last draw left on screen. With folded items
+    skipped: SkippedRuns,
+    /// The furthest item (before `range_end`) the last draw left on screen. With items
     /// skipped over, the drawn ids aren't contiguous, so `first_id + visible_items` doesn't reach it.
     #[rust]
     last_visible_id: Option<usize>,
@@ -1687,11 +1687,11 @@ impl PortalList {
         if range_changed {
             self.range_end = range_end;
 
-            // Initialize or resize the height tree, where folded items take up no space.
+            // Initialize or resize the height tree, where skipped items take up no space.
             let size = range_end.saturating_sub(range_start);
             let average = self.height_cache.average();
             let tree = self.height_tree.get_or_insert_with(|| HeightTree::new(0, average));
-            self.folded.resize_tree(tree, range_start, size);
+            self.skipped.resize_tree(tree, range_start, size);
 
             if self.tail_range {
                 self.first_id = self.range_end.max(1) - 1;
@@ -1918,33 +1918,33 @@ impl PortalList {
         }
     }
 
-    /// Tells the list which items are folded away, e.g. behind a collapsed header, as runs of
-    /// item ids, in order and not overlapping. The list skips right over them while drawing (so it
-    /// doesn't keep them around or send them events), and counts them as taking up no space for
-    /// scrolling. Items that aren't folded away anymore get estimated again until they're drawn.
+    /// Tells the list which items to skip (e.g. ones folded away behind a collapsed header),
+    /// as runs of item ids, in order and not overlapping. The list skips right over them while
+    /// drawing (so it doesn't keep them around or send them events), and counts them as taking up
+    /// no space for scrolling. Items that aren't skipped anymore get estimated again until they're drawn.
     ///
     /// A draw still starts at `first_id`, and never skips past the first or last item in the range
-    /// (drawing those is how the list knows it reached an end), even if they're folded away,
+    /// (drawing those is how the list knows it reached an end), even if they're in a skipped run,
     /// so draw those at zero size.
     ///
     /// Call this before drawing any items, e.g. right after [`Self::set_item_range()`].
     /// It's cheap when nothing changed, so it's fine to call it on every draw.
-    pub fn set_folded_ranges(&mut self, ranges: &[Range<usize>]) {
-        if ranges != self.folded.0.as_slice() {
-            self.folded.set(ranges, self.range_start, self.height_tree.as_mut());
+    pub fn set_skipped_ranges(&mut self, ranges: &[Range<usize>]) {
+        if ranges != self.skipped.0.as_slice() {
+            self.skipped.set(ranges, self.range_start, self.height_tree.as_mut());
         }
     }
 
-    /// The item to draw after `index` on the way down: the next one that isn't folded away (see
-    /// [`Self::set_folded_ranges()`]), but no further than the last item in the range.
+    /// The item to draw after `index` on the way down: the next one that isn't skipped (see
+    /// [`Self::set_skipped_ranges()`]), but no further than the last item in the range.
     fn next_drawn_after(&self, index: usize) -> usize {
-        self.folded.next_after(index).min(self.range_end.saturating_sub(1)).max(index + 1)
+        self.skipped.next_after(index).min(self.range_end.saturating_sub(1)).max(index + 1)
     }
 
     /// Like [`Self::next_drawn_after()`], on the way up from `index`,
     /// but no further than the first item in the range.
     fn prev_drawn_before(&self, index: usize) -> usize {
-        self.folded.prev_before(index).max(self.range_start)
+        self.skipped.prev_before(index).max(self.range_start)
     }
 
     /// Sets the first visible item and scroll offset.
@@ -2728,7 +2728,7 @@ impl Widget for PortalList {
         if pass_through_to_children {
             // Iterate in visual order (by item_id) for deterministic event handling.
             // Walk the live ids themselves rather than everything between the smallest and
-            // largest one, which can be far apart with a long folded run between them.
+            // largest one, which can be far apart with a long skipped run between them.
             let mut item_ids = std::mem::take(&mut self.event_item_ids);
             item_ids.clear();
             item_ids.extend(self.items.keys().copied());
@@ -3557,10 +3557,10 @@ impl Widget for PortalList {
 }
 
 impl PortalListRef {
-    /// See [`PortalList::set_folded_ranges()`].
-    pub fn set_folded_ranges(&self, ranges: &[Range<usize>]) {
+    /// See [`PortalList::set_skipped_ranges()`].
+    pub fn set_skipped_ranges(&self, ranges: &[Range<usize>]) {
         if let Some(mut inner) = self.borrow_mut() {
-            inner.set_folded_ranges(ranges);
+            inner.set_skipped_ranges(ranges);
         }
     }
 
@@ -3915,7 +3915,7 @@ impl PortalListSet {
 
 #[cfg(test)]
 mod height_tree_tests {
-    use super::{ranges_minus, FoldedRuns, HeightTree};
+    use super::{ranges_minus, SkippedRuns, HeightTree};
 
     /// Checks every prefix sum against a plain vector of the same heights.
     fn assert_matches(tree: &HeightTree, heights: &[f64]) {
@@ -3940,47 +3940,47 @@ mod height_tree_tests {
     }
 
     #[test]
-    fn drawing_jumps_over_whole_folded_runs() {
+    fn drawing_jumps_over_whole_skipped_runs() {
         // Runs can touch, and empty ones don't count.
-        let runs = FoldedRuns(vec![2..4, 4..6, 8..8, 9..12]);
+        let runs = SkippedRuns(vec![2..4, 4..6, 8..8, 9..12]);
         assert_eq!([0, 1, 6, 7, 8, 12].map(|id| runs.next_after(id)), [1, 6, 7, 8, 12, 13]);
         assert_eq!([1, 2, 6, 9, 12, 13].map(|id| runs.prev_before(id)), [0, 1, 1, 8, 8, 12]);
-        // With nothing before it that isn't folded, going up stops at the very first item.
-        let runs = FoldedRuns(vec![0..3, 5..6]);
+        // With nothing before it that isn't skipped, going up stops at the very first item.
+        let runs = SkippedRuns(vec![0..3, 5..6]);
         assert_eq!([3, 6].map(|id| runs.prev_before(id)), [0, 4]);
     }
 
     #[test]
-    fn folded_items_take_up_no_space() {
+    fn skipped_items_take_up_no_space() {
         let mut tree = HeightTree::new(8, 20.0);
         tree.update(2, 50.0);
         tree.update(5, 40.0);
-        let mut runs = FoldedRuns::default();
+        let mut runs = SkippedRuns::default();
         runs.set(&[1..3, 5..7], 0, Some(&mut tree));
         assert_matches(&tree, &[20.0, 0.0, 0.0, 20.0, 20.0, 0.0, 0.0, 20.0]);
-        // Unfolding one goes back to the default, even if it measured something before...
+        // One that's not skipped anymore goes back to the default, even if it measured something before...
         runs.set(&[1..2, 4..7], 0, Some(&mut tree));
         assert_matches(&tree, &[20.0, 0.0, 20.0, 20.0, 0.0, 0.0, 0.0, 20.0]);
-        // ...and then follows the default, unlike folded ones.
+        // ...and then follows the default, unlike skipped ones.
         tree.update_default_height(30.0);
         assert_matches(&tree, &[30.0, 0.0, 30.0, 30.0, 0.0, 0.0, 0.0, 30.0]);
         // The tree's first item can be a later one in the list.
         let mut tree = HeightTree::new(4, 20.0);
-        FoldedRuns::default().set(&[1..3, 5..9], 2, Some(&mut tree));
+        SkippedRuns::default().set(&[1..3, 5..9], 2, Some(&mut tree));
         assert_matches(&tree, &[0.0, 20.0, 20.0, 0.0]);
     }
 
     #[test]
-    fn folded_items_stay_folded_as_the_tree_grows_or_shrinks() {
-        // Runs can come before the tree has their items, which get folded once it does.
-        let mut runs = FoldedRuns::default();
+    fn skipped_items_stay_skipped_as_the_tree_grows_or_shrinks() {
+        // Runs can come before the tree has their items, which get skipped once it does.
+        let mut runs = SkippedRuns::default();
         runs.set(&[1..2, 3..6], 0, None);
         let mut tree = HeightTree::new(0, 20.0);
         runs.resize_tree(&mut tree, 0, 4);
         assert_matches(&tree, &[20.0, 0.0, 20.0, 0.0]);
         runs.resize_tree(&mut tree, 0, 8);
         assert_matches(&tree, &[20.0, 0.0, 20.0, 0.0, 0.0, 0.0, 20.0, 20.0]);
-        // Shrinking starts the tree over, but what's folded stays folded...
+        // Shrinking starts the tree over, but what's skipped stays skipped...
         tree.update(2, 50.0);
         runs.resize_tree(&mut tree, 0, 5);
         assert_matches(&tree, &[20.0, 0.0, 20.0, 0.0, 0.0]);
