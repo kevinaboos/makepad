@@ -17,7 +17,7 @@ use {
         widget_async::CxSplashVmExt,
         widget_tree::CxWidgetExt,
     },
-    std::collections::HashMap,
+    std::{collections::HashMap, ops::Range},
 };
 
 script_mod! {
@@ -549,6 +549,12 @@ pub struct PortalList {
     /// (or before) the one just drawn; see [`Self::skip_to()`].
     #[rust]
     skip_to: Option<usize>,
+    /// The runs of items skipped over during this draw, which take up no space.
+    #[rust]
+    skipped_ranges: Vec<Range<usize>>,
+    /// The skipped runs last recorded as zero-height in `height_tree`.
+    #[rust]
+    zeroed_ranges: Vec<Range<usize>>,
     #[rust]
     detect_tail_in_draw: bool,
 
@@ -897,6 +903,20 @@ impl PortalList {
                     }
                 }
 
+                // Items the app skipped over take up no space. They aren't part of the running
+                // average (that's for items that actually got drawn), and only need marking
+                // again once something else gets skipped.
+                if self.skipped_ranges != self.zeroed_ranges {
+                    if let Some(ref mut tree) = self.height_tree {
+                        for range in &self.skipped_ranges {
+                            for index in range.start.max(self.range_start)..range.end.min(self.range_end) {
+                                tree.update(index - self.range_start, 0.0);
+                            }
+                        }
+                    }
+                    self.zeroed_ranges.clone_from(&self.skipped_ranges);
+                }
+
                 // Update unmeasured items with new average if it changed significantly
                 if let Some(ref mut tree) = self.height_tree {
                     let new_avg = self.height_cache.average();
@@ -1125,6 +1145,7 @@ impl PortalList {
             match draw_state {
                 ListDrawState::Begin => {
                     self.skip_to = None;
+                    self.skipped_ranges.clear();
                     let viewport = cx.turtle().inner_rect();
                     self.draw_state.set(ListDrawState::Down {
                         index: self.first_id,
@@ -1228,6 +1249,9 @@ impl PortalList {
                         }
                     }
                     let next = skip_to.filter(|&id| id > index).unwrap_or(index + 1);
+                    if next > index + 1 {
+                        self.skipped_ranges.push(index + 1..next);
+                    }
                     if is_down_again {
                         self.draw_state.set(ListDrawState::DownAgain {
                             index: next,
@@ -1359,6 +1383,9 @@ impl PortalList {
                     let next = skip_to
                         .filter(|&id| id < index)
                         .map_or(index - 1, |id| id.max(self.range_start));
+                    if next + 1 < index {
+                        self.skipped_ranges.push(next + 1..index);
+                    }
                     self.draw_state.set(ListDrawState::Up {
                         index: next,
                         hit_bottom,
@@ -1771,8 +1798,11 @@ impl PortalList {
     ///
     /// Call this right after drawing an item to jump over a run of items that would all take up
     /// no space anyway, e.g. ones folded away behind a collapsed header, so they never get drawn,
-    /// kept around, or sent events. It's ignored unless `id` is further along in the direction
-    /// the list is currently being drawn in.
+    /// kept around, or sent events (and count as zero-height for scrolling). It's ignored unless
+    /// `id` is further along in the direction the list is currently being drawn in.
+    ///
+    /// Don't skip over the last item in the range: whether that got drawn is how the list
+    /// knows it's at the end.
     pub fn skip_to(&mut self, id: usize) {
         self.skip_to = Some(id);
     }
