@@ -417,12 +417,10 @@ impl Cx {
         self.render_view_inner(pass, list, zbias, step);
         let serial = self.textures.1.serials.submit();
         self.readback_pass_submitted(pass, serial);
-        // Complete the previous frame's fence and arm one for this frame. Without
-        // this poll on the paint path the completion serial never advanced, so
-        // released instance allocations (one per upload) were never collected:
-        // the retirement queue grew without bound and its "still pending" answer
-        // kept the window repainting at rest. (The direct and OpenHarmony
-        // renderers do not track texture lifetimes.)
+        // Complete the previous frame's fence and arm one for this frame. Painting
+        // leaves no quiet beat for `maintain_instance_retirements`, so without this
+        // poll released instance allocations would pile up for as long as we paint.
+        // (The direct and OpenHarmony renderers do not track texture lifetimes.)
         #[cfg(not(any(
             linux_direct,
             target_env = "ohos",
@@ -4642,7 +4640,8 @@ impl Cx {
 
     /// `waiting` is false on the paint path, which polls once per frame and
     /// only arms a fence (and pays for the flush behind it) while something it
-    /// can see is waiting on the completion serial.
+    /// can see is waiting on the completion serial. Returns false if it couldn't
+    /// poll, like when our context isn't current.
     fn poll_texture_lifetimes_for(&mut self, waiting: bool) -> bool {
         // Vulkan retires its resources on its own frame path.
         #[cfg(target_os = "linux")]
