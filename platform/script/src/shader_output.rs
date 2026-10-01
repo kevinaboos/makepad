@@ -329,6 +329,7 @@ pub struct ShaderFn {
     pub args: Vec<ScriptPodType>,
     pub fnobj: ScriptObject,
     pub out: String,
+    pub callees: Vec<usize>,
     pub ret: ScriptPodType,
 }
 
