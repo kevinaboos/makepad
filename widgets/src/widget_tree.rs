@@ -168,11 +168,11 @@ struct WidgetTreeInner {
     // Only set when tree topology changes (nodes added/removed, parent changes).
     // Property-only changes (name, widget ref, skip_search) are patched in-place.
     structure_dirty: bool,
-    /// Parentless placeholders, made when a lookup is anchored at (or a child gets inserted
-    /// under) a widget that nothing reports as a child, like one made from a template. Nothing
-    /// else ever revisits these, so `note_placeholder_root()` sweeps out the dead ones now and then.
+    /// Parentless placeholders, made when a lookup starts at a widget nothing reports as a child
+    /// (like one made from a template) or a child gets inserted under one. Nothing else notices
+    /// when their widgets die, so `note_placeholder_root()` sweeps out the dead ones now and then.
     placeholder_roots: Vec<WidgetUid>,
-    /// How many of those the last sweep kept, which spaces out the next one.
+    /// How many placeholder roots the last sweep kept. The next sweep waits for twice as many.
     placeholder_roots_kept: usize,
 }
 
@@ -199,8 +199,9 @@ struct GraphNode {
     /// hosts like Dock-style containers own these children outside the
     /// widget's child vec. Cleared the moment the parent reports it.
     manual: bool,
-    /// Live children a refresh unlinked but kept (like pooled rows), so they can still go
-    /// once they die or their parent does.
+    /// Children kept in the graph after this widget stopped reporting them, since something
+    /// in them was still alive (like a pooled row). They still get removed once nothing in
+    /// them is alive, or along with this node.
     detached: Vec<WidgetUid>,
 }
 
@@ -1653,8 +1654,8 @@ impl WidgetTree {
             }
         }
 
-        // Ones it unlinked earlier while they were alive: drop them once they're dead, and
-        // forget the ones it lists again (or that moved elsewhere).
+        // Recheck the `detached` children: remove the ones with nothing alive left in them, and
+        // stop tracking any that got reported again, moved to another parent, or are already gone.
         let detached = inner.graph.get_mut(&uid).map(|node| std::mem::take(&mut node.detached)).unwrap_or_default();
         let mut still_detached = Vec::new();
         for old_uid in detached {
@@ -1713,11 +1714,9 @@ impl WidgetTree {
             Self::invalidate_path_cache_from_child_change(inner, uid);
         }
 
-        // A dead child can't ever come back (like a list row that scrolled away),
-        // and nothing else would drop it, so do it now. Not if something inside it
-        // is still held elsewhere, though: lookups anchored there still need it.
-        // A live one (like a pooled row) may come back, so unless this is a full sync,
-        // it stays until it dies (see `detached`).
+        // Remove the children this widget stopped reporting (like dropped list rows), since nothing
+        // else would. Outside a full sync, keep any with something alive in them (see `detached`):
+        // a pooled row may come back, and lookups may still start at content held elsewhere.
         for removed_uid in unlinked {
             let should_remove = inner
                 .graph
@@ -1737,8 +1736,7 @@ impl WidgetTree {
         true
     }
 
-    /// Whether nothing at or below `uid` is alive anymore, following the same
-    /// parent links `remove_subtree` does.
+    /// Whether everything `remove_subtree(uid)` would remove is already dead.
     fn subtree_is_dead(inner: &WidgetTreeInner, uid: WidgetUid) -> bool {
         let mut stack = vec![uid];
         while let Some(uid) = stack.pop() {
@@ -1755,25 +1753,25 @@ impl WidgetTree {
         true
     }
 
-    /// Notes a new parentless placeholder at `uid`. Once there are twice as many as the last
-    /// sweep kept (so it's O(1) per placeholder), it first drops the ones that don't list or own
-    /// anything alive anymore, since their widgets are gone. (One whose widget is still around
-    /// but has no children just gets made again by its next lookup.)
+    /// Tracks a new parentless placeholder at `uid`. Once there are twice as many as the last sweep
+    /// kept (amortized O(1) per placeholder), it sweeps out the ones with nothing alive in them.
+    /// A live but childless widget loses its placeholder too, but its next lookup makes a new one.
     fn note_placeholder_root(inner: &mut WidgetTreeInner, uid: WidgetUid) {
         let sweep_at = (2 * inner.placeholder_roots_kept).max(MIN_PLACEHOLDER_ROOTS_TO_SWEEP);
         if inner.placeholder_roots.len() >= sweep_at {
             let mut roots = std::mem::take(&mut inner.placeholder_roots);
             let mut seen = HashSet::new();
             roots.retain(|&root| {
-                // Listed twice, or gone or adopted since then, so it's not one to keep track of.
+                // Stop tracking duplicates and anything that's gone or not a parentless placeholder.
                 if !seen.insert(root) {
                     return false;
                 }
                 let Some(node) = inner.graph.get(&root).filter(|node| node.placeholder && node.parent.is_none()) else {
                     return false;
                 };
-                // It lists what its widget reported last time, so anything alive in there (even one
-                // it only borrows, like a FoldHeader's header) means that widget likely is too.
+                // A placeholder has no ref to its widget, but if any child it lists is still alive,
+                // that widget likely is too. This includes children parented elsewhere, like the
+                // fold_button that a FoldHeader's header lists.
                 let lists_live_child = node.children.iter().any(|child_uid| {
                     inner.graph.get(child_uid).is_some_and(|child| child.widget.upgrade().is_some())
                 });
@@ -4670,8 +4668,8 @@ mod tests {
         assert!(inner.graph.contains_key(&held.widget_uid()));
     }
 
-    /// A FoldHeader's header (whose fold reports its children as the fold's own) keeps its
-    /// placeholder while the fold's around, and loses it once the fold's gone.
+    /// A FoldHeader reports its header's children as its own, so a lookup starting at the header
+    /// makes a placeholder for it. That placeholder survives sweeps until the FoldHeader is gone.
     #[test]
     fn placeholders_for_flattened_refs_stay_while_their_widget_does() {
         let tree = WidgetTree::default();
@@ -4755,7 +4753,8 @@ mod tests {
         assert_eq!(dead, 0, "{dead} dead nodes left behind");
     }
 
-    /// Same for a child that a widget nothing reports swapped out while something else held it.
+    /// Same when a widget that nothing reports as a child swaps out a child that's still alive:
+    /// once everything's dead, the old child goes when that widget's placeholder gets swept.
     #[test]
     fn a_swapped_out_child_goes_once_it_dies() {
         let tree = WidgetTree::default();
@@ -4775,7 +4774,7 @@ mod tests {
         let old_uid = old_child.widget_uid();
         assert!(tree.inner.borrow().graph.contains_key(&old_uid));
 
-        // Then it's all gone, and enough placeholders come and go to get swept.
+        // Then drop it all, and make enough throwaway placeholders to trigger a sweep.
         drop((old_child, new_child, swapper));
         kids.borrow_mut().clear();
         for _ in 0..2 * MIN_PLACEHOLDER_ROOTS_TO_SWEEP {

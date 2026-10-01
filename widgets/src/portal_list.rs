@@ -41,17 +41,16 @@ const SMOOTH_SCROLL_MAXIMUM_WINDOW: usize = 20;
 /// How many frames a `smooth_scroll_to_end` animation takes, whatever the
 /// distance, so a long list doesn't crawl at a fixed pixels-per-frame rate.
 const SMOOTH_SCROLL_TO_END_FRAMES: f64 = 24.0;
-/// How close a smooth scroll has to get its target to count as there,
-/// so float drift can't keep it creeping along forever.
+/// How close (in pixels) the target has to get to its goal for a smooth scroll to finish,
+/// so float drift can't keep the scroll creeping along forever.
 const SMOOTH_SCROLL_TOLERANCE: f64 = 0.1;
 /// How far past the end of the viewport an item can end and still count as fitting,
 /// to absorb float drift from adding up item sizes.
 const END_TOLERANCE: f64 = 1.0;
 
-/// How far one frame of a smooth scroll moves the list (positive moves the content down) to
-/// bring the target's `top` to `goal`, both measured from the viewport's top: at most `speed`,
-/// and never past `goal`. `None` once it's there, or once the start or end of the list is in
-/// the way.
+/// How far one frame of a smooth scroll moves the list (positive moves the content down): up to
+/// `speed`, to bring the target's `top` to `goal` without passing it. Both are measured from the
+/// viewport's top. `None` once the target is at `goal`, or if the list can't scroll any further that way.
 fn smooth_scroll_step(
     top: f64,
     goal: f64,
@@ -112,8 +111,9 @@ enum ScrollState {
         /// Pixel offset from the top of the viewport where the target item's
         /// top edge should end up once scrolling completes.
         top_offset: f64,
-        /// Whether this is going to the end of the list (see `smooth_scroll_to_end()`), wherever
-        /// that is by the time it gets there, instead of to the top of `target_id`.
+        /// Whether this is a scroll to the end of the list (see `smooth_scroll_to_end()`) instead of
+        /// to the top of `target_id`. If the end moves during the scroll (e.g., new items get added),
+        /// the scroll keeps going to the new end.
         to_end: bool,
     },
     Tailing {
@@ -140,9 +140,9 @@ enum ListDrawState {
     Up {
         index: usize,
         pos: f64,
-        /// Where the bottom of what's in the range ended up, if drawing down ran out of things to draw
-        /// (usually at the end of the list) before the bottom of the viewport. `end()` then moves it all
-        /// down to line that up with the bottom of the viewport.
+        /// If drawing down ran out of items (usually at the end of the list) before the bottom of
+        /// the viewport, this is where the last drawn item in the range ends. `end()` then moves
+        /// everything down so that item ends at the bottom of the viewport.
         list_bottom: Option<f64>,
         viewport: Rect,
     },
@@ -468,9 +468,9 @@ impl SkippedRuns {
         prev
     }
 
-    /// Switches to the given runs, and updates `tree` (whose first item is `first`) to match:
-    /// items that just got skipped take up no space, and ones that came back get estimated
-    /// again until they're drawn, since whatever they measured before is long gone.
+    /// Switches to the given runs and updates `tree` (whose first item is `first`) to match: newly
+    /// skipped items take up no space, and items that aren't skipped anymore get an estimated height
+    /// again until they're drawn, since their old measured height wasn't kept.
     fn set(&mut self, runs: &[Range<usize>], first: usize, tree: Option<&mut HeightTree>) {
         debug_assert!(
             runs.windows(2).all(|pair| pair[0].end <= pair[1].start),
@@ -492,8 +492,8 @@ impl SkippedRuns {
         self.0.extend_from_slice(runs);
     }
 
-    /// Resizes `tree` (whose first item is `first`) to `size` items. Whatever that (re)builds
-    /// starts out at the default height, so the skipped items in there get zeroed again.
+    /// Resizes `tree` (whose first item is `first`) to `size` items. Any entries the resize adds or
+    /// rebuilds start at the default height, so this sets the skipped ones among them back to zero.
     fn resize_tree(&self, tree: &mut HeightTree, first: usize, size: usize) {
         // Growing keeps what's there, but shrinking starts the tree over.
         let rebuilt_from = if size >= tree.size { tree.size } else { 0 };
@@ -517,7 +517,8 @@ fn ranges_minus(ranges: &[Range<usize>], minus: &[Range<usize>]) -> Vec<Range<us
     let mut left = Vec::new();
     let mut first = 0;
     for range in ranges {
-        // Whatever ends before this range can't overlap the ones after it either.
+        // A `minus` range that ends before this range can't overlap any later range either,
+        // so skip past it for good.
         while minus.get(first).is_some_and(|m| m.end <= range.start) {
             first += 1;
         }
@@ -685,8 +686,8 @@ pub struct PortalList {
     /// The items to skip, see [`Self::set_skipped_ranges()`].
     #[rust]
     skipped: SkippedRuns,
-    /// The furthest item (before `range_end`) the last draw left on screen. With items
-    /// skipped over, the drawn ids aren't contiguous, so `first_id + visible_items` doesn't reach it.
+    /// The largest item id in the range that was on screen in the last draw. Skipped items
+    /// leave gaps in the drawn ids, so `first_id + visible_items` can't be used to find it.
     #[rust]
     last_visible_id: Option<usize>,
     /// Scratch list of the live item ids, for sending events to them in order.
@@ -1338,7 +1339,7 @@ impl PortalList {
                     if !did_draw || pos + rect.size.index(vi) > viewport.size.index(vi) + END_TOLERANCE {
                         if self.first_id > self.range_start && !is_down_again {
                             let above = self.prev_drawn_before(self.first_id);
-                            // Same as where `end()` puts it, which only counts what's in the range.
+                            // Find the list's bottom like `end()` does, only counting items in the range.
                             let ran_out = !did_draw || index >= self.range_end;
                             let list_bottom = (ran_out && self.first_id < self.range_end).then(|| {
                                 self.draw_align_list.iter()
@@ -1500,10 +1501,9 @@ impl PortalList {
                         return None;
                     }
 
-                    // If drawing down ran out before the bottom of the viewport, `end()` moves everything down
-                    // to line that bottom up with the viewport's. That's more than a viewport's worth if it's
-                    // above the top (e.g., the last item just got a lot shorter), so draw enough up here to
-                    // still fill the viewport after that.
+                    // If drawing down ran out of items, `end()` moves everything down so the last item ends at
+                    // the viewport's bottom. That move can be more than a viewport's height (e.g., the last item
+                    // just got a lot shorter), so draw enough items above to still fill the viewport afterward.
                     let stop_above = match list_bottom {
                         Some(bottom) => bottom.min(0.0) - viewport.size.index(vi),
                         None => 0.0,
@@ -1918,14 +1918,14 @@ impl PortalList {
         }
     }
 
-    /// Tells the list which items to skip (e.g. the ones in a collapsed group, besides its summary),
+    /// Tells the list which items to skip (e.g. the ones in a collapsed group, besides its summary item),
     /// as runs of item ids, in order and not overlapping. The list skips right over them while
     /// drawing (so it doesn't keep them around or send them events), and counts them as taking up
     /// no space for scrolling. Items that aren't skipped anymore get estimated again until they're drawn.
     ///
-    /// A draw still starts at `first_id`, and never skips past the first or last item in the range
-    /// (drawing those is how the list knows it reached an end), even if they're in a skipped run,
-    /// so draw those at zero size.
+    /// The list still asks for a skipped item in a few cases: a draw always starts at `first_id`, and
+    /// the list never skips the first or last item in the range, since drawing those is how it knows
+    /// it reached an end. Draw any skipped item it asks for at zero size.
     ///
     /// Call this before drawing any items, e.g. right after [`Self::set_item_range()`].
     /// It's cheap when nothing changed, so it's fine to call it on every draw.
@@ -1993,8 +1993,8 @@ impl PortalList {
         self.first_id
     }
 
-    /// How long the viewport is along the list, inside its padding,
-    /// which is what `end()` lines up the items against.
+    /// How long the viewport is along the list, inside its padding. `end()` uses this same size
+    /// when it moves the bottom of the list to the bottom of the viewport.
     fn viewport_size(&self, cx: &Cx) -> f64 {
         let vi = self.vec_index;
         (self.area.rect(cx).size.index(vi) - self.layout.padding.size().index(vi)).max(0.0)
@@ -2028,8 +2028,9 @@ impl PortalList {
     /// Otherwise, the list animates until the target item's top edge is positioned at
     /// `top_offset` pixels below the viewport's top edge, or as close as the start or end
     /// of the list lets it get. A value of `0.0` places the item flush with the viewport
-    /// top; `20.0` leaves a 20 px margin. Negative values are clamped to `0.0`. This stops
-    /// the list from following its end (see `set_tail_range()`) until it ends up there anyway.
+    /// top; `20.0` leaves a 20 px margin. Negative values are clamped to `0.0`.
+    /// This also stops the list from following its end (see `set_tail_range()`). If `auto_tail`
+    /// is on, the list follows its end again once it's scrolled back to the end.
     pub fn smooth_scroll_to(
         &mut self,
         cx: &mut Cx,
@@ -2066,14 +2067,15 @@ impl PortalList {
         let item_top = self.item_top_from_height_tree(target_id);
         if viewport_size > 0.0 {
             if let Some(item_top) = item_top {
-                // Going to the end is done once we're there, wherever a tall last item's top is.
+                // A scroll to the end is already done if the list is at its end,
+                // even if the last item is tall and its top is above the viewport.
                 let settled = if to_end {
                     self.at_end
                 } else {
                     item_top >= 0.0 && item_top < viewport_size
                 };
                 if settled {
-                    // A smooth scroll that's still on its way somewhere else is over too,
+                    // Stop any earlier smooth scroll that's still heading somewhere else,
                     // or it'd carry the list right past this target.
                     if matches!(self.scroll_state, ScrollState::ScrollingTo { target_id: id, to_end: was_to_end, .. }
                         if id != target_id || was_to_end != to_end)
@@ -2081,8 +2083,8 @@ impl PortalList {
                         self.scroll_state = ScrollState::Stopped;
                         self.was_scrolling = false;
                     }
-                    // Already at the end, so follow it from now on. Do it right away: whoever's
-                    // appending hasn't drawn the new items yet, and that draw won't be at the end.
+                    // The list is already at its end, so follow its end from now on. Don't wait for the
+                    // next draw to check: if new items were just added, that draw won't be at the end.
                     if self.at_end && self.auto_tail {
                         self.tail_range = true;
                     }
@@ -2129,8 +2131,8 @@ impl PortalList {
         // leftover fling, bounce, or OS momentum stream can't fight or resume
         // after it finishes.
         self.stop_all_scroll_motion();
-        // Scrolling anywhere but the end also stops following it (or getting back to it on the
-        // next draw), otherwise each draw would pull the list right back down there.
+        // Scrolling to anywhere but the end also stops the list from following its end,
+        // otherwise each draw would pull the list right back down to the end.
         if !to_end {
             self.tail_range = false;
             self.tail_adjustment_needed = 0.0;
@@ -2145,9 +2147,9 @@ impl PortalList {
         };
     }
 
-    /// Trigger a scrolling animation to the end of the list: that end lines up with the end of
-    /// the viewport (even if the last item's taller than the viewport), and with `auto_tail`,
-    /// the list follows its end again from then on.
+    /// Trigger a scrolling animation to the end of the list, which puts the bottom of the last item
+    /// at the bottom of the viewport (even if that item is taller than the viewport). With `auto_tail`,
+    /// the list follows its end from then on.
     pub fn smooth_scroll_to_end(
         &mut self,
         cx: &mut Cx,
@@ -2160,16 +2162,15 @@ impl PortalList {
         // `range_end` is exclusive, so the last item is one before it.
         let target_id = self.range_end.saturating_sub(1);
         // `speed` is a per-frame pixel delta. Scale it to the distance so the
-        // animation takes the same time from anywhere in the list. That's the distance
-        // to the end of the list, which is past the last item's top if it's a tall one.
+        // animation takes the same time from anywhere in the list. Measure from the bottom
+        // of the list to the bottom of the viewport, since that's where this scroll stops.
         let viewport_size = self.viewport_size(cx);
         let speed = match self.item_top_from_height_tree(self.range_end) {
             Some(bottom) => ((bottom - viewport_size).abs() / SMOOTH_SCROLL_TO_END_FRAMES).max(speed),
             None => speed,
         };
-        // Pass an unbounded window so it doesn't teleport the anchor to the last few
-        // items first; that jump is most of the travel, and it's why this only looked
-        // smooth when you were already near the bottom.
+        // By default, scroll the whole way instead of jumping to within a few items of the end first,
+        // since that jump would be most of the distance and the scroll wouldn't look smooth.
         self.start_smooth_scroll(
             cx,
             target_id,
@@ -2804,10 +2805,10 @@ impl Widget for PortalList {
                         (target_id, top_offset.max(0.0))
                     };
                     let step = match self.item_top_from_height_tree(edge_id) {
-                        // An empty list is as far as it can go (and has nothing to measure).
+                        // An empty list has nowhere to scroll, so stop instead of stepping forever.
                         _ if self.range_start >= self.range_end => None,
-                        // Head for the goal from whichever side of it the target is on, since
-                        // estimated heights can leave it short or past once they're drawn.
+                        // Each frame, head for the goal from whichever side the target is on,
+                        // since items can turn out taller or shorter than estimated once drawn.
                         Some(edge_top) => smooth_scroll_step(
                             edge_top,
                             goal,
@@ -2838,8 +2839,9 @@ impl Widget for PortalList {
                     } else {
                         self.was_scrolling = false;
                         self.scroll_state = ScrollState::Stopped;
-                        // Ending up at the end, even on the way to an earlier item, means we're
-                        // following it again. Or we will be, if the next draw says we got there.
+                        // If the list ended up at its end, even on its way to an earlier item,
+                        // follow the end again. If it was headed for the end or the last item,
+                        // the next draw starts following the end if it finds the list there.
                         if self.at_end && self.auto_tail {
                             self.tail_range = true;
                         } else if to_end || target_id + 1 >= self.range_end {
@@ -3935,7 +3937,7 @@ mod height_tree_tests {
         tree.update(1, 50.0);
         tree.forget(1);
         assert_matches(&tree, &[20.0; 4]);
-        // ...and follows it from then on.
+        // ...and from then on, item 1 changes along with the default height.
         tree.update_default_height(30.0);
         assert_matches(&tree, &[30.0; 4]);
     }
@@ -3946,7 +3948,7 @@ mod height_tree_tests {
         let runs = SkippedRuns(vec![2..4, 4..6, 8..8, 9..12]);
         assert_eq!([0, 1, 6, 7, 8, 12].map(|id| runs.next_after(id)), [1, 6, 7, 8, 12, 13]);
         assert_eq!([1, 2, 6, 9, 12, 13].map(|id| runs.prev_before(id)), [0, 1, 1, 8, 8, 12]);
-        // With nothing before it that isn't skipped, going up stops at the very first item.
+        // If every item above is skipped, going up stops at the very first item.
         let runs = SkippedRuns(vec![0..3, 5..6]);
         assert_eq!([3, 6].map(|id| runs.prev_before(id)), [0, 4]);
     }
@@ -3959,10 +3961,10 @@ mod height_tree_tests {
         let mut runs = SkippedRuns::default();
         runs.set(&[1..3, 5..7], 0, Some(&mut tree));
         assert_matches(&tree, &[20.0, 0.0, 0.0, 20.0, 20.0, 0.0, 0.0, 20.0]);
-        // One that's not skipped anymore goes back to the default, even if it measured something before...
+        // When item 2 stops being skipped, it goes back to the default height, not its old 50...
         runs.set(&[1..2, 4..7], 0, Some(&mut tree));
         assert_matches(&tree, &[20.0, 0.0, 20.0, 20.0, 0.0, 0.0, 0.0, 20.0]);
-        // ...and then follows the default, unlike skipped ones.
+        // ...and then changes along with the default height, while skipped items stay at zero.
         tree.update_default_height(30.0);
         assert_matches(&tree, &[30.0, 0.0, 30.0, 30.0, 0.0, 0.0, 0.0, 30.0]);
         // The tree's first item can be a later one in the list.
@@ -3973,7 +3975,8 @@ mod height_tree_tests {
 
     #[test]
     fn skipped_items_stay_skipped_as_the_tree_grows_or_shrinks() {
-        // Runs can come before the tree has their items, which get skipped once it does.
+        // Runs can be set before the tree has their items.
+        // Those items take up no space once the tree grows to include them.
         let mut runs = SkippedRuns::default();
         runs.set(&[1..2, 3..6], 0, None);
         let mut tree = HeightTree::new(0, 20.0);
@@ -3985,7 +3988,7 @@ mod height_tree_tests {
         tree.update(2, 50.0);
         runs.resize_tree(&mut tree, 0, 5);
         assert_matches(&tree, &[20.0, 0.0, 20.0, 0.0, 0.0]);
-        // ...and still comes back like anything else.
+        // ...and those items still go back to the default height when they stop being skipped.
         runs.set(&[0..1, 4..5], 0, Some(&mut tree));
         assert_matches(&tree, &[0.0, 20.0, 20.0, 20.0, 0.0]);
     }
@@ -4034,7 +4037,7 @@ mod height_tree_tests {
 mod smooth_scroll_tests {
     use super::{smooth_scroll_step, SMOOTH_SCROLL_TOLERANCE};
 
-    /// Every top a target passes through on its way to `goal`, moving the way the list moves it.
+    /// The target's top at the start and after each frame of a smooth scroll from `top` to `goal`.
     fn tops(mut top: f64, goal: f64, speed: f64) -> Vec<f64> {
         let mut tops = vec![top];
         while let Some(step) = smooth_scroll_step(top, goal, speed, false, false) {
@@ -4048,7 +4051,7 @@ mod smooth_scroll_tests {
 
     #[test]
     fn a_smooth_scroll_lands_right_on_its_goal() {
-        // Jumping down the list brings the target up from below; jumping up brings it down.
+        // Targets start below their goal (scrolling down the list) or above it (scrolling up).
         for (start, goal, speed) in [
             (1234.5, 10.0, 50.0),
             (60.25, 10.0, 50.0),
@@ -4073,7 +4076,7 @@ mod smooth_scroll_tests {
         assert_eq!(smooth_scroll_step(10.0, 10.0, 50.0, false, false), None);
         let close = 10.0 - SMOOTH_SCROLL_TOLERANCE / 2.0;
         assert_eq!(smooth_scroll_step(close, 10.0, 50.0, false, false), None);
-        // Float drift from adding up heights can't keep it creeping toward the goal.
+        // A top that's only off by float drift (from adding up heights) counts as there too.
         assert_eq!(smooth_scroll_step(9.999999999999986, 10.0, 50.0, false, false), None);
     }
 
