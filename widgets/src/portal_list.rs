@@ -545,6 +545,10 @@ pub struct PortalList {
     draw_state: DrawStateWrap<ListDrawState>,
     #[rust]
     draw_align_list: Vec<AlignItem>,
+    /// Where the next [`Self::next_visible_item()`] call goes, if not just to the item after
+    /// (or before) the one just drawn; see [`Self::skip_to()`].
+    #[rust]
+    skip_to: Option<usize>,
     #[rust]
     detect_tail_in_draw: bool,
 
@@ -1120,6 +1124,7 @@ impl PortalList {
         if let Some(draw_state) = self.draw_state.get() {
             match draw_state {
                 ListDrawState::Begin => {
+                    self.skip_to = None;
                     let viewport = cx.turtle().inner_rect();
                     self.draw_state.set(ListDrawState::Down {
                         index: self.first_id,
@@ -1171,6 +1176,7 @@ impl PortalList {
                     viewport,
                 } => {
                     let is_down_again = draw_state.is_down_again();
+                    let skip_to = self.skip_to.take();
                     let did_draw = cx.turtle_has_align_items();
                     let align_range = cx.get_turtle_align_range();
                     let rect = cx.end_turtle();
@@ -1221,15 +1227,16 @@ impl PortalList {
                             return None;
                         }
                     }
+                    let next = skip_to.filter(|&id| id > index).unwrap_or(index + 1);
                     if is_down_again {
                         self.draw_state.set(ListDrawState::DownAgain {
-                            index: index + 1,
+                            index: next,
                             pos: pos + rect.size.index(vi),
                             viewport,
                         });
                     } else {
                         self.draw_state.set(ListDrawState::Down {
-                            index: index + 1,
+                            index: next,
                             pos: pos + rect.size.index(vi),
                             viewport,
                         });
@@ -1266,7 +1273,7 @@ impl PortalList {
                             );
                         }
                     }
-                    return Some(index + 1);
+                    return Some(next);
                 }
                 ListDrawState::Up {
                     index,
@@ -1274,6 +1281,7 @@ impl PortalList {
                     hit_bottom,
                     viewport,
                 } => {
+                    let skip_to = self.skip_to.take();
                     let did_draw = cx.turtle_has_align_items();
                     let align_range = cx.get_turtle_align_range();
                     let rect = cx.end_turtle();
@@ -1348,8 +1356,11 @@ impl PortalList {
                         return None;
                     }
 
+                    let next = skip_to
+                        .filter(|&id| id < index)
+                        .map_or(index - 1, |id| id.max(self.range_start));
                     self.draw_state.set(ListDrawState::Up {
-                        index: index - 1,
+                        index: next,
                         hit_bottom,
                         pos: pos - rect.size.index(vi),
                         viewport,
@@ -1379,7 +1390,7 @@ impl PortalList {
                         ),
                     }
 
-                    return Some(index - 1);
+                    return Some(next);
                 }
                 _ => (),
             }
@@ -1753,6 +1764,17 @@ impl PortalList {
             self.vec_index = if let Flow::Down = flow { Vec2Index::Y } else { Vec2Index::X };
             self.redraw(cx);
         }
+    }
+
+    /// Makes the next [`Self::next_visible_item()`] call return `id`, instead of the item right
+    /// after the one just drawn (or right before it, while drawing upward from `first_id`).
+    ///
+    /// Call this right after drawing an item to jump over a run of items that would all take up
+    /// no space anyway, e.g. ones folded away behind a collapsed header, so they never get drawn,
+    /// kept around, or sent events. It's ignored unless `id` is further along in the direction
+    /// the list is currently being drawn in.
+    pub fn skip_to(&mut self, id: usize) {
+        self.skip_to = Some(id);
     }
 
     /// Sets the first visible item and scroll offset.
