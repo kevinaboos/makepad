@@ -112,8 +112,8 @@ enum ScrollState {
         /// Pixel offset from the top of the viewport where the target item's
         /// top edge should end up once scrolling completes.
         top_offset: f64,
-        /// Whether the target is the last item, which means going to the end of the list instead,
-        /// wherever that is by the time it gets there.
+        /// Whether this is going to the end of the list (see `smooth_scroll_to_end()`), wherever
+        /// that is by the time it gets there, instead of to the top of `target_id`.
         to_end: bool,
     },
     Tailing {
@@ -2021,11 +2021,8 @@ impl PortalList {
     /// Otherwise, the list animates until the target item's top edge is positioned at
     /// `top_offset` pixels below the viewport's top edge, or as close as the start or end
     /// of the list lets it get. A value of `0.0` places the item flush with the viewport
-    /// top; `20.0` leaves a 20 px margin. Negative values are clamped to `0.0`. The last
-    /// item is different: animating to it goes all the way to the end of the list (even
-    /// if that item's taller than the viewport), and has the list follow its end again.
-    /// Animating to any other item stops the list from following its end (see
-    /// `set_tail_range()`).
+    /// top; `20.0` leaves a 20 px margin. Negative values are clamped to `0.0`. This stops
+    /// the list from following its end (see `set_tail_range()`) until it ends up there anyway.
     pub fn smooth_scroll_to(
         &mut self,
         cx: &mut Cx,
@@ -2033,6 +2030,19 @@ impl PortalList {
         speed: f64,
         max_items_to_show: Option<usize>,
         top_offset: f64,
+    ) {
+        self.start_smooth_scroll(cx, target_id, speed, max_items_to_show, top_offset, false);
+    }
+
+    /// Starts a smooth scroll to the top of `target_id`, or to the end of the list if `to_end`.
+    fn start_smooth_scroll(
+        &mut self,
+        cx: &mut Cx,
+        target_id: usize,
+        speed: f64,
+        max_items_to_show: Option<usize>,
+        top_offset: f64,
+        to_end: bool,
     ) {
         if self.items.is_empty() {
             return;
@@ -2058,9 +2068,10 @@ impl PortalList {
                     item_top >= 0.0 && item_top < viewport_size
                 };
                 if settled {
-                    // Same as arriving under animation: we're at the end, so follow it.
-                    if target_id + 1 >= self.range_end {
-                        self.detect_tail_in_draw = true;
+                    // Already at the end, so follow it from now on. Do it right away: whoever's
+                    // appending hasn't drawn the new items yet, and that draw won't be at the end.
+                    if target_id + 1 >= self.range_end && self.auto_tail {
+                        self.tail_range = true;
                     }
                     cx.widget_action(self.widget_uid(), PortalListAction::SmoothScrollReached);
                     return;
@@ -2105,22 +2116,25 @@ impl PortalList {
         // leftover fling, bounce, or OS momentum stream can't fight or resume
         // after it finishes.
         self.stop_all_scroll_motion();
-        // Scrolling to any item but the last one also stops following the end,
-        // otherwise each draw would pull the list right back down to it.
-        if target_id + 1 < self.range_end {
+        // Scrolling anywhere but the end also stops following it (or getting back to it on the
+        // next draw), otherwise each draw would pull the list right back down there.
+        if !to_end {
             self.tail_range = false;
             self.tail_adjustment_needed = 0.0;
+            self.detect_tail_in_draw = false;
         }
         self.scroll_state = ScrollState::ScrollingTo {
             target_id,
             delta: speed.abs() * scroll_direction,
             next_frame: cx.new_next_frame(),
             top_offset,
-            to_end: target_id + 1 >= self.range_end,
+            to_end,
         };
     }
 
-    /// Trigger a scrolling animation to the end of the list.
+    /// Trigger a scrolling animation to the end of the list: that end lines up with the end of
+    /// the viewport (even if the last item's taller than the viewport), and the list follows
+    /// its end again from then on.
     pub fn smooth_scroll_to_end(
         &mut self,
         cx: &mut Cx,
@@ -2140,15 +2154,16 @@ impl PortalList {
             Some(bottom) => ((bottom - viewport_size).abs() / SMOOTH_SCROLL_TO_END_FRAMES).max(speed),
             None => speed,
         };
-        // Pass an unbounded window so `smooth_scroll_to` doesn't teleport the anchor
-        // to the last few items first; that jump is most of the travel, and it's why
-        // this only looked smooth when you were already near the bottom.
-        self.smooth_scroll_to(
+        // Pass an unbounded window so it doesn't teleport the anchor to the last few
+        // items first; that jump is most of the travel, and it's why this only looked
+        // smooth when you were already near the bottom.
+        self.start_smooth_scroll(
             cx,
             target_id,
             speed,
             max_items_to_show.or(Some(usize::MAX)),
             0.0,
+            true,
         );
     }
 
@@ -2808,9 +2823,11 @@ impl Widget for PortalList {
                     } else {
                         self.was_scrolling = false;
                         self.scroll_state = ScrollState::Stopped;
-                        // Going to the end means we're following it again,
-                        // so let the next draw pick tailing back up.
-                        if to_end {
+                        // Ending up at the end, even on the way to an earlier item, means we're
+                        // following it again. Or we will be, if the next draw says we got there.
+                        if self.at_end && self.auto_tail {
+                            self.tail_range = true;
+                        } else if to_end || target_id + 1 >= self.range_end {
                             self.detect_tail_in_draw = true;
                         }
                         cx.widget_action(uid, PortalListAction::SmoothScrollReached);
