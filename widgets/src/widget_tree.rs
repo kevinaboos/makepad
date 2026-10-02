@@ -168,9 +168,10 @@ struct WidgetTreeInner {
     // Only set when tree topology changes (nodes added/removed, parent changes).
     // Property-only changes (name, widget ref, skip_search) are patched in-place.
     structure_dirty: bool,
-    /// Parentless placeholders, made when a lookup starts at a widget nothing reports as a child
-    /// (like one made from a template) or a child gets inserted under one. Nothing else notices
-    /// when their widgets die, so `note_placeholder_root()` sweeps out the dead ones now and then.
+    /// Parentless placeholders, tracked so `note_placeholder_root()` can sweep out the dead ones.
+    ///
+    /// They're made when a lookup starts at a widget nothing reports as a child (like one made from
+    /// a template) or a child gets inserted under one. Nothing else notices when their widgets die.
     placeholder_roots: Vec<WidgetUid>,
     /// How many placeholder roots the last sweep kept. The next sweep waits for twice as many.
     placeholder_roots_kept: usize,
@@ -199,9 +200,9 @@ struct GraphNode {
     /// hosts like Dock-style containers own these children outside the
     /// widget's child vec. Cleared the moment the parent reports it.
     manual: bool,
-    /// Children kept in the graph after this widget stopped reporting them, since something
-    /// in them was still alive (like a pooled row). They still get removed once nothing in
-    /// them is alive, or along with this node.
+    /// Children this widget stopped reporting while something in them was alive, like a pooled row.
+    ///
+    /// They get removed once nothing in them is alive, or along with this node.
     detached: Vec<WidgetUid>,
 }
 
@@ -1717,16 +1718,14 @@ impl WidgetTree {
         // Remove the children this widget stopped reporting (like dropped list rows), since nothing
         // else would. Outside a full sync, keep any with something alive in them (see `detached`):
         // a pooled row may come back, and lookups may still start at content held elsewhere.
-        for removed_uid in unlinked {
-            let should_remove = inner
-                .graph
-                .get(&removed_uid)
-                .map_or(false, |node| node.parent == Some(uid))
-                && (mark_structure_dirty || Self::subtree_is_dead(inner, removed_uid));
-            if should_remove {
-                Self::remove_subtree(inner, removed_uid);
-            } else if inner.graph.get(&removed_uid).is_some_and(|node| node.parent == Some(uid)) {
-                still_detached.push(removed_uid);
+        for unlinked_uid in unlinked {
+            if !inner.graph.get(&unlinked_uid).is_some_and(|node| node.parent == Some(uid)) {
+                continue;
+            }
+            if mark_structure_dirty || Self::subtree_is_dead(inner, unlinked_uid) {
+                Self::remove_subtree(inner, unlinked_uid);
+            } else {
+                still_detached.push(unlinked_uid);
             }
         }
         if let Some(node) = inner.graph.get_mut(&uid) {
@@ -1736,7 +1735,7 @@ impl WidgetTree {
         true
     }
 
-    /// Whether everything `remove_subtree(uid)` would remove is already dead.
+    /// Returns whether everything `remove_subtree(uid)` would remove is already dead.
     fn subtree_is_dead(inner: &WidgetTreeInner, uid: WidgetUid) -> bool {
         let mut stack = vec![uid];
         while let Some(uid) = stack.pop() {
@@ -1753,9 +1752,11 @@ impl WidgetTree {
         true
     }
 
-    /// Tracks a new parentless placeholder at `uid`. Once there are twice as many as the last sweep
-    /// kept (amortized O(1) per placeholder), it sweeps out the ones with nothing alive in them.
-    /// A live but childless widget loses its placeholder too, but its next lookup makes a new one.
+    /// Tracks a new parentless placeholder at `uid`, sweeping out the dead ones now and then.
+    ///
+    /// A sweep happens once there are twice as many as the last sweep kept (amortized O(1) per
+    /// placeholder), and removes the ones with nothing alive in them. A live but childless widget
+    /// loses its placeholder too, but its next lookup makes a new one.
     fn note_placeholder_root(inner: &mut WidgetTreeInner, uid: WidgetUid) {
         let sweep_at = (2 * inner.placeholder_roots_kept).max(MIN_PLACEHOLDER_ROOTS_TO_SWEEP);
         if inner.placeholder_roots.len() >= sweep_at {
@@ -4557,8 +4558,9 @@ mod tests {
         );
     }
 
-    /// Rows a list drops leave the graph (subtrees and cached lookups too) instead of
-    /// piling up all session. A pooled row is still alive, so it stays.
+    /// Rows a list drops leave the graph, along with their subtrees and cached lookups.
+    ///
+    /// Otherwise they'd pile up all session. A pooled row is still alive, so it stays.
     #[test]
     fn rows_dropped_by_a_list_leave_the_graph() {
         let tree = WidgetTree::default();
@@ -4608,8 +4610,7 @@ mod tests {
         );
     }
 
-    /// A dropped row stays put while something inside it is still held elsewhere,
-    /// since lookups can still be anchored there.
+    /// A dropped row stays while something in it is held, since lookups can still start there.
     #[test]
     fn a_dropped_row_stays_while_something_in_it_is_held() {
         let tree = WidgetTree::default();
@@ -4638,8 +4639,10 @@ mod tests {
         assert_eq!(tree.widget(content.widget_uid()).widget_uid(), content.widget_uid());
     }
 
-    /// Widgets nothing reports as a child (like ones made from a template) get a placeholder
-    /// when a lookup is anchored at them, which gets swept out once they're gone.
+    /// Placeholders for widgets that are gone get swept out.
+    ///
+    /// A widget nothing reports as a child (like one made from a template) gets a placeholder
+    /// when a lookup starts at it.
     #[test]
     fn placeholders_for_dropped_widgets_get_swept() {
         let tree = WidgetTree::default();
@@ -4648,7 +4651,7 @@ mod tests {
         tree.observe_node(root_uid, name("root"), root.clone(), None);
         tree.sync_dirty();
 
-        // One that's still around keeps its placeholder (and working lookups) the whole time.
+        // A widget that's still held keeps its placeholder (and working lookups) the whole time.
         let label_uid = WidgetUid::new();
         let held = make_widget(WidgetUid::new(), vec![(name("label"), make_widget(label_uid, vec![]))]);
         tree.refresh_from_borrowed(held.widget_uid(), |visit| held.children(visit));
@@ -4668,8 +4671,10 @@ mod tests {
         assert!(inner.graph.contains_key(&held.widget_uid()));
     }
 
+    /// The placeholder for a FoldHeader's header survives sweeps until the FoldHeader is gone.
+    ///
     /// A FoldHeader reports its header's children as its own, so a lookup starting at the header
-    /// makes a placeholder for it. That placeholder survives sweeps until the FoldHeader is gone.
+    /// makes a placeholder for the header.
     #[test]
     fn placeholders_for_flattened_refs_stay_while_their_widget_does() {
         let tree = WidgetTree::default();
@@ -4710,8 +4715,9 @@ mod tests {
         assert!(header_uids.iter().all(|uid| !inner.graph.contains_key(uid)));
     }
 
-    /// A child unlinked while it's still alive (like a pooled row) stays,
-    /// but goes once it's dead, like when the list it was pooled in goes away.
+    /// A child unlinked while it's alive (like a pooled row) stays, but goes once it's dead.
+    ///
+    /// Here it dies when the list it was pooled in goes away.
     #[test]
     fn children_unlinked_while_alive_go_once_they_die() {
         let tree = WidgetTree::default();
@@ -4734,6 +4740,7 @@ mod tests {
         }
         *rows.borrow_mut() = pool.iter().enumerate().map(|(i, row)| (LiveId(i as u64 + 1), row.clone())).collect();
         tree.mark_dirty(list_uid);
+        // Sync the dirty nodes via a lookup, which (unlike `sync_dirty()`) keeps pooled rows.
         let _ = tree.find_within(root_uid, &[name("nothing")]);
         // Only 2 rows stay in use, and the rest sit in the list's pool, still alive.
         rows.borrow_mut().truncate(2);
@@ -4753,8 +4760,10 @@ mod tests {
         assert_eq!(dead, 0, "{dead} dead nodes left behind");
     }
 
-    /// Same when a widget that nothing reports as a child swaps out a child that's still alive:
-    /// once everything's dead, the old child goes when that widget's placeholder gets swept.
+    /// A child swapped out while it's alive goes once it's dead, even under a placeholder.
+    ///
+    /// Here the parent is a widget nothing reports as a child, so the old child goes
+    /// when that widget's placeholder gets swept.
     #[test]
     fn a_swapped_out_child_goes_once_it_dies() {
         let tree = WidgetTree::default();
