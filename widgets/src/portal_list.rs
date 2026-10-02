@@ -191,8 +191,21 @@ impl ListDrawState {
 struct AlignItem {
     align_range: TurtleAlignRange,
     size: Vec2d,
+    /// Where the item is along the list, from the start of the viewport: where it got drawn,
+    /// then where `end()` moved it to.
     shift: f64,
     index: usize,
+}
+
+/// Where an item was in a list's last draw (see [`PortalList::drawn_slot()`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawnSlot {
+    /// Where the item's slot started along the list, from the start of the viewport.
+    ///
+    /// That's the outer edge of the item's margin, like [`PortalList::set_first_id_and_scroll()`] takes.
+    pub start: f64,
+    /// How much room the item took up along the list, margins included.
+    pub size: f64,
 }
 
 /// Cache for computing average item height
@@ -1024,12 +1037,13 @@ impl PortalList {
                     };
 
                     let mut pos = first_pos.min(min);
-                    for item in list.iter() {
+                    for item in list.iter_mut() {
                         let shift = Vec2d::from_index_pair(vi, pos, 0.0);
                         cx.shift_align_range(
                             &item.align_range,
                             shift - Vec2d::from_index_pair(vi, item.shift, 0.0),
                         );
+                        item.shift = pos;
                         pos += item.size.index(vi);
                         visible_items += 1;
                         if item.index < self.range_end {
@@ -1075,7 +1089,7 @@ impl PortalList {
                     let start_pos = self.first_scroll + shift;
                     let mut pos = start_pos;
                     for i in (0..first_index).rev() {
-                        let item = &list[i];
+                        let item = &mut list[i];
                         let visible = pos > 0.0;
                         pos -= item.size.index(vi);
                         let shift = Vec2d::from_index_pair(vi, pos, 0.0);
@@ -1083,6 +1097,7 @@ impl PortalList {
                             &item.align_range,
                             shift - Vec2d::from_index_pair(vi, item.shift, 0.0),
                         );
+                        item.shift = pos;
                         if visible {
                             self.first_scroll = pos;
                             self.first_id = item.index;
@@ -1096,12 +1111,13 @@ impl PortalList {
 
                     let mut pos = start_pos;
                     for i in first_index..list.len() {
-                        let item = &list[i];
+                        let item = &mut list[i];
                         let shift = Vec2d::from_index_pair(vi, pos, 0.0);
                         cx.shift_align_range(
                             &item.align_range,
                             shift - Vec2d::from_index_pair(vi, item.shift, 0.0),
                         );
+                        item.shift = pos;
                         pos += item.size.index(vi);
                         let invisible = pos < 0.0;
                         if invisible {
@@ -2291,6 +2307,18 @@ impl PortalList {
     /// Returns whether this PortalList is currently filling the viewport.
     pub fn is_filling_viewport(&self) -> bool {
         !self.not_filling_viewport
+    }
+
+    /// Returns where the item `item_id` was in the list's last draw, if it got drawn.
+    ///
+    /// Unlike [`Self::position_of_item()`], this doesn't need a `Cx`, and it goes from the start of the
+    /// viewport like [`Self::first_scroll()`] does. So passing its `start` to [`Self::set_first_id_and_scroll()`]
+    /// puts the item right back where it was drawn, e.g. to keep it in place when items get added above it.
+    pub fn drawn_slot(&self, item_id: usize) -> Option<DrawnSlot> {
+        let vi = self.vec_index;
+        self.draw_align_list.iter()
+            .find(|item| item.index == item_id)
+            .map(|item| DrawnSlot { start: item.shift, size: item.size.index(vi) })
     }
 
     /// Returns the "start" position of the item with the given `entry_id`.
@@ -3897,6 +3925,11 @@ impl PortalListRef {
             return None;
         };
         inner.position_of_item(cx, entry_id)
+    }
+
+    /// See [`PortalList::drawn_slot()`].
+    pub fn drawn_slot(&self, item_id: usize) -> Option<DrawnSlot> {
+        self.borrow()?.drawn_slot(item_id)
     }
 
     pub fn items_with_actions(&self, actions: &Actions) -> ItemsWithActions {
