@@ -269,6 +269,46 @@ impl HeightTree {
         }
     }
 
+    /// Lets `edit` change each item's height and whether it was measured, then sums the tree back up.
+    ///
+    /// This works on the tree in place in O(n), which beats updating lots of items one at a time.
+    fn edit_heights(&mut self, edit: impl FnOnce(&mut [f64], &mut [bool])) {
+        // Undo `sum_up()`: take each node out of the next node up, going down.
+        for i in (1..=self.size).rev() {
+            let parent = i + (i & i.wrapping_neg());
+            if parent <= self.size {
+                self.tree[parent] -= self.tree[i];
+            }
+        }
+        edit(self.tree.get_mut(1..).unwrap_or_default(), &mut self.measured);
+        self.sum_up();
+    }
+
+    /// Starts the tree over with `size` unmeasured items at the default height, which `edit` can then change.
+    ///
+    /// Unlike [`Self::new()`], this reuses the tree's memory.
+    fn reset(&mut self, size: usize, edit: impl FnOnce(&mut [f64], &mut [bool])) {
+        self.tree.clear();
+        self.tree.resize(size + 1, self.default_height);
+        self.tree[0] = 0.0;
+        self.measured.clear();
+        self.measured.resize(size, false);
+        self.size = size;
+        edit(&mut self.tree[1..], &mut self.measured);
+        self.sum_up();
+    }
+
+    /// Turns `tree[1..]` from each item's own height into the sums the tree keeps.
+    fn sum_up(&mut self) {
+        // Each node holds the sum of the items it covers, so add each one into the next node up.
+        for i in 1..=self.size {
+            let parent = i + (i & i.wrapping_neg());
+            if parent <= self.size {
+                self.tree[parent] += self.tree[i];
+            }
+        }
+    }
+
     /// Forgets the height measured at index `i`, so it's estimated with the default height again.
     fn forget(&mut self, i: usize) {
         if i >= self.size || !self.measured[i] {
@@ -485,14 +525,39 @@ impl SkippedRuns {
             "skipped ranges must be in order, with no overlaps: {runs:?}"
         );
         if let Some(tree) = tree {
-            for run in ranges_minus(&self.0, runs) {
-                for index in tree_indices(run, range_start, tree.size) {
-                    tree.forget(index);
+            let unskipped = ranges_minus(&self.0, runs);
+            let newly_skipped = ranges_minus(runs, &self.0);
+            let num_changed: usize = unskipped.iter().chain(&newly_skipped)
+                .map(|run| tree_indices(run.clone(), range_start, tree.size).len())
+                .sum();
+            // Each item costs O(log n) to update, so once about an eighth of them change at once (like every
+            // run moving after items get added before them), it's quicker to rebuild the tree in O(n).
+            if num_changed > tree.size / 8 {
+                let (size, default_height) = (tree.size, tree.default_height);
+                tree.edit_heights(|heights, measured| {
+                    for run in unskipped {
+                        for index in tree_indices(run, range_start, size) {
+                            heights[index] = default_height;
+                            measured[index] = false;
+                        }
+                    }
+                    for run in newly_skipped {
+                        for index in tree_indices(run, range_start, size) {
+                            heights[index] = 0.0;
+                            measured[index] = true;
+                        }
+                    }
+                });
+            } else {
+                for run in unskipped {
+                    for index in tree_indices(run, range_start, tree.size) {
+                        tree.forget(index);
+                    }
                 }
-            }
-            for run in ranges_minus(runs, &self.0) {
-                for index in tree_indices(run, range_start, tree.size) {
-                    tree.update(index, 0.0);
+                for run in newly_skipped {
+                    for index in tree_indices(run, range_start, tree.size) {
+                        tree.update(index, 0.0);
+                    }
                 }
             }
         }
@@ -505,12 +570,24 @@ impl SkippedRuns {
     /// Any entries the resize adds or rebuilds start at the default height, so this sets the
     /// skipped ones among them back to zero.
     fn resize_tree(&self, tree: &mut HeightTree, range_start: usize, size: usize) {
-        // Growing keeps what's there, but shrinking starts the tree over.
-        let rebuilt_from = if size >= tree.size { tree.size } else { 0 };
+        // Growing keeps what's there, but shrinking starts the tree over, like a new one.
+        // Those get built at once, with the skipped items already at zero.
+        if tree.size == 0 || size < tree.size {
+            tree.reset(size, |heights, measured| {
+                for run in &self.0 {
+                    for index in tree_indices(run.clone(), range_start, size) {
+                        heights[index] = 0.0;
+                        measured[index] = true;
+                    }
+                }
+            });
+            return;
+        }
+        let old_size = tree.size;
         tree.resize(size);
         for run in &self.0 {
             let indices = tree_indices(run.clone(), range_start, size);
-            for index in indices.start.max(rebuilt_from)..indices.end {
+            for index in indices.start.max(old_size)..indices.end {
                 tree.update(index, 0.0);
             }
         }
@@ -4028,6 +4105,63 @@ mod height_tree_tests {
         // ...and those items still go back to the default height when they stop being skipped.
         runs.set(&[0..1, 4..5], 0, Some(&mut tree));
         assert_matches(&tree, &[0.0, 20.0, 20.0, 20.0, 0.0]);
+    }
+
+    #[test]
+    fn editing_heights_in_place_gives_each_one_and_sums_them_back_up() {
+        let heights: Vec<f64> = (0..37).map(|i| (i * 7 % 13) as f64 * 10.0).collect();
+        let mut tree = HeightTree::new(heights.len(), 20.0);
+        for (i, &height) in heights.iter().enumerate() {
+            tree.update(i, height);
+        }
+        tree.edit_heights(|seen, _| assert!(seen.iter().zip(&heights).all(|(a, b)| (a - b).abs() < 1e-6)));
+        assert_matches(&tree, &heights);
+        // Starting over puts every item at the default height before `edit` changes any.
+        tree.reset(5, |seen, measured| {
+            assert!(seen.iter().all(|&height| height == 20.0) && !measured.contains(&true));
+            seen[1] = 0.0;
+            measured[1] = true;
+        });
+        assert_matches(&tree, &[20.0, 0.0, 20.0, 20.0, 20.0]);
+        HeightTree::new(0, 20.0).edit_heights(|seen, measured| assert!(seen.is_empty() && measured.is_empty()));
+    }
+
+    #[test]
+    fn moving_lots_of_skipped_runs_rebuilds_the_tree_the_same() {
+        // Like items getting added before every run, which moves them all.
+        let mut heights = vec![20.0; 64];
+        let mut tree = HeightTree::new(64, 20.0);
+        for i in (0..64).step_by(5) {
+            heights[i] = 30.0 + i as f64;
+            tree.update(i, heights[i]);
+        }
+        let old_runs: Vec<_> = (0..60).step_by(10).map(|start| start + 1..start + 4).collect();
+        let mut runs = SkippedRuns::default();
+        runs.set(&old_runs, 0, Some(&mut tree));
+        for run in &old_runs {
+            heights[run.clone()].fill(0.0);
+        }
+        assert_matches(&tree, &heights);
+        let new_runs: Vec<_> = old_runs.iter().map(|run| run.start + 3..run.end + 3).collect();
+        runs.set(&new_runs, 0, Some(&mut tree));
+        // Items that aren't skipped anymore go back to the default height, like when they change one at a time.
+        for run in ranges_minus(&old_runs, &new_runs) {
+            heights[run].fill(20.0);
+        }
+        for run in &new_runs {
+            heights[run.clone()].fill(0.0);
+        }
+        assert_matches(&tree, &heights);
+        tree.update_default_height(40.0);
+        let unmeasured = |i: usize| !i.is_multiple_of(5) && !new_runs.iter().any(|run| run.contains(&i));
+        for (_, height) in heights.iter_mut().enumerate().filter(|&(i, _)| unmeasured(i)) {
+            *height = 40.0;
+        }
+        assert_matches(&tree, &heights);
+        // A small change updates just those items, the same way.
+        runs.set(&new_runs[..new_runs.len() - 1], 0, Some(&mut tree));
+        heights[new_runs[new_runs.len() - 1].clone()].fill(40.0);
+        assert_matches(&tree, &heights);
     }
 
     #[test]
