@@ -482,25 +482,25 @@ impl HeightTree {
     }
 }
 
-/// The runs of item ids to skip, in order and not overlapping.
+/// The ranges of item ids to skip, in order and not overlapping.
 ///
 /// See [`PortalList::set_skipped_ranges()`].
 #[derive(Default)]
-struct SkippedRuns(Vec<Range<usize>>);
+struct SkippedRanges(Vec<Range<usize>>);
 
-impl SkippedRuns {
-    /// Returns the run that item `id` is in, if any.
-    fn run_at(&self, id: usize) -> Option<&Range<usize>> {
-        let i = self.0.partition_point(|run| run.end <= id);
-        self.0.get(i).filter(|run| run.start <= id)
+impl SkippedRanges {
+    /// Returns the skipped range that item `id` is in, if any.
+    fn range_containing(&self, id: usize) -> Option<&Range<usize>> {
+        let i = self.0.partition_point(|range| range.end <= id);
+        self.0.get(i).filter(|range| range.start <= id)
     }
 
     /// Returns the first item after `id` that isn't skipped.
     fn next_unskipped_after(&self, id: usize) -> usize {
         let mut next = id + 1;
-        // Runs can touch, so keep jumping until `next` isn't in any run.
-        while let Some(run) = self.run_at(next) {
-            next = run.end;
+        // Ranges can touch, so keep jumping until `next` isn't in any of them.
+        while let Some(range) = self.range_containing(next) {
+            next = range.end;
         }
         next
     }
@@ -508,61 +508,61 @@ impl SkippedRuns {
     /// Returns the last item before `id` that isn't skipped, or item 0 if there isn't one.
     fn prev_unskipped_before(&self, id: usize) -> usize {
         let mut prev = id.saturating_sub(1);
-        while let Some(run) = self.run_at(prev) {
-            let Some(before) = run.start.checked_sub(1) else { return 0 };
+        while let Some(range) = self.range_containing(prev) {
+            let Some(before) = range.start.checked_sub(1) else { return 0 };
             prev = before;
         }
         prev
     }
 
-    /// Switches to the given runs and updates `tree` (whose first item is `range_start`) to match.
+    /// Switches to the given ranges and updates `tree` (whose first item is `range_start`) to match.
     ///
     /// Newly skipped items take up no space, and items that aren't skipped anymore get an estimated
     /// height again until they're drawn, since their old measured height wasn't kept.
-    fn set(&mut self, runs: &[Range<usize>], range_start: usize, tree: Option<&mut HeightTree>) {
+    fn set(&mut self, ranges: &[Range<usize>], range_start: usize, tree: Option<&mut HeightTree>) {
         debug_assert!(
-            runs.windows(2).all(|pair| pair[0].end <= pair[1].start),
-            "skipped ranges must be in order, with no overlaps: {runs:?}"
+            ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "skipped ranges must be in order, with no overlaps: {ranges:?}"
         );
         if let Some(tree) = tree {
-            let unskipped = ranges_minus(&self.0, runs);
-            let newly_skipped = ranges_minus(runs, &self.0);
+            let unskipped = ranges_minus(&self.0, ranges);
+            let newly_skipped = ranges_minus(ranges, &self.0);
             let num_changed: usize = unskipped.iter().chain(&newly_skipped)
-                .map(|run| tree_indices(run.clone(), range_start, tree.size).len())
+                .map(|range| tree_indices(range.clone(), range_start, tree.size).len())
                 .sum();
             // Each item costs O(log n) to update, so once about an eighth of them change at once (like every
-            // run moving after items get added before them), it's quicker to rebuild the tree in O(n).
+            // range moving after items get added before them), it's quicker to rebuild the tree in O(n).
             if num_changed > tree.size / 8 {
                 let (size, default_height) = (tree.size, tree.default_height);
                 tree.edit_heights(|heights, measured| {
-                    for run in unskipped {
-                        for index in tree_indices(run, range_start, size) {
+                    for range in unskipped {
+                        for index in tree_indices(range, range_start, size) {
                             heights[index] = default_height;
                             measured[index] = false;
                         }
                     }
-                    for run in newly_skipped {
-                        for index in tree_indices(run, range_start, size) {
+                    for range in newly_skipped {
+                        for index in tree_indices(range, range_start, size) {
                             heights[index] = 0.0;
                             measured[index] = true;
                         }
                     }
                 });
             } else {
-                for run in unskipped {
-                    for index in tree_indices(run, range_start, tree.size) {
+                for range in unskipped {
+                    for index in tree_indices(range, range_start, tree.size) {
                         tree.forget(index);
                     }
                 }
-                for run in newly_skipped {
-                    for index in tree_indices(run, range_start, tree.size) {
+                for range in newly_skipped {
+                    for index in tree_indices(range, range_start, tree.size) {
                         tree.update(index, 0.0);
                     }
                 }
             }
         }
         self.0.clear();
-        self.0.extend_from_slice(runs);
+        self.0.extend_from_slice(ranges);
     }
 
     /// Resizes `tree` (whose first item is `range_start`) to `size` items, keeping skipped items at zero.
@@ -574,8 +574,8 @@ impl SkippedRuns {
         // Those get built at once, with the skipped items already at zero.
         if tree.size == 0 || size < tree.size {
             tree.reset(size, |heights, measured| {
-                for run in &self.0 {
-                    for index in tree_indices(run.clone(), range_start, size) {
+                for range in &self.0 {
+                    for index in tree_indices(range.clone(), range_start, size) {
                         heights[index] = 0.0;
                         measured[index] = true;
                     }
@@ -585,8 +585,8 @@ impl SkippedRuns {
         }
         let old_size = tree.size;
         tree.resize(size);
-        for run in &self.0 {
-            let indices = tree_indices(run.clone(), range_start, size);
+        for range in &self.0 {
+            let indices = tree_indices(range.clone(), range_start, size);
             for index in indices.start.max(old_size)..indices.end {
                 tree.update(index, 0.0);
             }
@@ -774,7 +774,7 @@ pub struct PortalList {
     draw_align_list: Vec<AlignItem>,
     /// The items to skip, see [`Self::set_skipped_ranges()`].
     #[rust]
-    skipped: SkippedRuns,
+    skipped: SkippedRanges,
     /// The largest item id in the range that was on screen in the last draw.
     ///
     /// Skipped items leave gaps in the drawn ids, so `first_id + visible_items` can't be used to find it.
@@ -2010,7 +2010,7 @@ impl PortalList {
 
     /// Tells the list which items to skip, e.g. the ones in a collapsed group, besides its summary item.
     ///
-    /// `ranges` must be runs of item ids, in order and with no overlaps. The list skips right over
+    /// `ranges` are ranges of item ids, which must be in order with no overlaps. The list skips right over
     /// those items while drawing (so it doesn't keep them around or send them events), and counts
     /// them as taking up no space for scrolling. Items that aren't skipped anymore get an estimated
     /// height again until they're drawn.
@@ -2837,7 +2837,7 @@ impl Widget for PortalList {
         if pass_through_to_children {
             // Iterate in visual order (by item_id) for deterministic event handling.
             // Walk the live ids themselves rather than everything between the smallest and
-            // largest one, which can be far apart with a long skipped run between them.
+            // largest one, which can be far apart with a long skipped range between them.
             let mut item_ids = std::mem::take(&mut self.event_item_ids);
             item_ids.clear();
             item_ids.extend(self.items.keys().copied());
@@ -4032,7 +4032,7 @@ impl PortalListSet {
 
 #[cfg(test)]
 mod height_tree_tests {
-    use super::{ranges_minus, SkippedRuns, HeightTree};
+    use super::{ranges_minus, SkippedRanges, HeightTree};
 
     /// Checks every prefix sum against a plain vector of the same heights.
     fn assert_matches(tree: &HeightTree, heights: &[f64]) {
@@ -4057,14 +4057,14 @@ mod height_tree_tests {
     }
 
     #[test]
-    fn drawing_jumps_over_whole_skipped_runs() {
-        // Runs can touch, and empty ones don't count.
-        let runs = SkippedRuns(vec![2..4, 4..6, 8..8, 9..12]);
-        assert_eq!([0, 1, 6, 7, 8, 12].map(|id| runs.next_unskipped_after(id)), [1, 6, 7, 8, 12, 13]);
-        assert_eq!([1, 2, 6, 9, 12, 13].map(|id| runs.prev_unskipped_before(id)), [0, 1, 1, 8, 8, 12]);
+    fn drawing_jumps_over_whole_skipped_ranges() {
+        // Ranges can touch, and empty ones don't count.
+        let skipped = SkippedRanges(vec![2..4, 4..6, 8..8, 9..12]);
+        assert_eq!([0, 1, 6, 7, 8, 12].map(|id| skipped.next_unskipped_after(id)), [1, 6, 7, 8, 12, 13]);
+        assert_eq!([1, 2, 6, 9, 12, 13].map(|id| skipped.prev_unskipped_before(id)), [0, 1, 1, 8, 8, 12]);
         // If every item above is skipped, going up stops at the very first item.
-        let runs = SkippedRuns(vec![0..3, 5..6]);
-        assert_eq!([3, 6].map(|id| runs.prev_unskipped_before(id)), [0, 4]);
+        let skipped = SkippedRanges(vec![0..3, 5..6]);
+        assert_eq!([3, 6].map(|id| skipped.prev_unskipped_before(id)), [0, 4]);
     }
 
     #[test]
@@ -4072,38 +4072,38 @@ mod height_tree_tests {
         let mut tree = HeightTree::new(8, 20.0);
         tree.update(2, 50.0);
         tree.update(5, 40.0);
-        let mut runs = SkippedRuns::default();
-        runs.set(&[1..3, 5..7], 0, Some(&mut tree));
+        let mut skipped = SkippedRanges::default();
+        skipped.set(&[1..3, 5..7], 0, Some(&mut tree));
         assert_matches(&tree, &[20.0, 0.0, 0.0, 20.0, 20.0, 0.0, 0.0, 20.0]);
         // When item 2 stops being skipped, it goes back to the default height, not its old 50...
-        runs.set(&[1..2, 4..7], 0, Some(&mut tree));
+        skipped.set(&[1..2, 4..7], 0, Some(&mut tree));
         assert_matches(&tree, &[20.0, 0.0, 20.0, 20.0, 0.0, 0.0, 0.0, 20.0]);
         // ...and then changes along with the default height, while skipped items stay at zero.
         tree.update_default_height(30.0);
         assert_matches(&tree, &[30.0, 0.0, 30.0, 30.0, 0.0, 0.0, 0.0, 30.0]);
         // The tree's first item can be a later one in the list.
         let mut tree = HeightTree::new(4, 20.0);
-        SkippedRuns::default().set(&[1..3, 5..9], 2, Some(&mut tree));
+        SkippedRanges::default().set(&[1..3, 5..9], 2, Some(&mut tree));
         assert_matches(&tree, &[0.0, 20.0, 20.0, 0.0]);
     }
 
     #[test]
     fn skipped_items_stay_skipped_as_the_tree_grows_or_shrinks() {
-        // Runs can be set before the tree has their items.
+        // Ranges can be set before the tree has their items.
         // Those items take up no space once the tree grows to include them.
-        let mut runs = SkippedRuns::default();
-        runs.set(&[1..2, 3..6], 0, None);
+        let mut skipped = SkippedRanges::default();
+        skipped.set(&[1..2, 3..6], 0, None);
         let mut tree = HeightTree::new(0, 20.0);
-        runs.resize_tree(&mut tree, 0, 4);
+        skipped.resize_tree(&mut tree, 0, 4);
         assert_matches(&tree, &[20.0, 0.0, 20.0, 0.0]);
-        runs.resize_tree(&mut tree, 0, 8);
+        skipped.resize_tree(&mut tree, 0, 8);
         assert_matches(&tree, &[20.0, 0.0, 20.0, 0.0, 0.0, 0.0, 20.0, 20.0]);
         // Shrinking starts the tree over, but what's skipped stays skipped...
         tree.update(2, 50.0);
-        runs.resize_tree(&mut tree, 0, 5);
+        skipped.resize_tree(&mut tree, 0, 5);
         assert_matches(&tree, &[20.0, 0.0, 20.0, 0.0, 0.0]);
         // ...and those items still go back to the default height when they stop being skipped.
-        runs.set(&[0..1, 4..5], 0, Some(&mut tree));
+        skipped.set(&[0..1, 4..5], 0, Some(&mut tree));
         assert_matches(&tree, &[0.0, 20.0, 20.0, 20.0, 0.0]);
     }
 
@@ -4127,40 +4127,40 @@ mod height_tree_tests {
     }
 
     #[test]
-    fn moving_lots_of_skipped_runs_rebuilds_the_tree_the_same() {
-        // Like items getting added before every run, which moves them all.
+    fn moving_lots_of_skipped_ranges_rebuilds_the_tree_the_same() {
+        // Like items getting added before every skipped range, which moves them all.
         let mut heights = vec![20.0; 64];
         let mut tree = HeightTree::new(64, 20.0);
         for i in (0..64).step_by(5) {
             heights[i] = 30.0 + i as f64;
             tree.update(i, heights[i]);
         }
-        let old_runs: Vec<_> = (0..60).step_by(10).map(|start| start + 1..start + 4).collect();
-        let mut runs = SkippedRuns::default();
-        runs.set(&old_runs, 0, Some(&mut tree));
-        for run in &old_runs {
-            heights[run.clone()].fill(0.0);
+        let old_ranges: Vec<_> = (0..60).step_by(10).map(|start| start + 1..start + 4).collect();
+        let mut skipped = SkippedRanges::default();
+        skipped.set(&old_ranges, 0, Some(&mut tree));
+        for range in &old_ranges {
+            heights[range.clone()].fill(0.0);
         }
         assert_matches(&tree, &heights);
-        let new_runs: Vec<_> = old_runs.iter().map(|run| run.start + 3..run.end + 3).collect();
-        runs.set(&new_runs, 0, Some(&mut tree));
+        let new_ranges: Vec<_> = old_ranges.iter().map(|range| range.start + 3..range.end + 3).collect();
+        skipped.set(&new_ranges, 0, Some(&mut tree));
         // Items that aren't skipped anymore go back to the default height, like when they change one at a time.
-        for run in ranges_minus(&old_runs, &new_runs) {
-            heights[run].fill(20.0);
+        for range in ranges_minus(&old_ranges, &new_ranges) {
+            heights[range].fill(20.0);
         }
-        for run in &new_runs {
-            heights[run.clone()].fill(0.0);
+        for range in &new_ranges {
+            heights[range.clone()].fill(0.0);
         }
         assert_matches(&tree, &heights);
         tree.update_default_height(40.0);
-        let unmeasured = |i: usize| !i.is_multiple_of(5) && !new_runs.iter().any(|run| run.contains(&i));
+        let unmeasured = |i: usize| !i.is_multiple_of(5) && !new_ranges.iter().any(|range| range.contains(&i));
         for (_, height) in heights.iter_mut().enumerate().filter(|&(i, _)| unmeasured(i)) {
             *height = 40.0;
         }
         assert_matches(&tree, &heights);
         // A small change updates just those items, the same way.
-        runs.set(&new_runs[..new_runs.len() - 1], 0, Some(&mut tree));
-        heights[new_runs[new_runs.len() - 1].clone()].fill(40.0);
+        skipped.set(&new_ranges[..new_ranges.len() - 1], 0, Some(&mut tree));
+        heights[new_ranges[new_ranges.len() - 1].clone()].fill(40.0);
         assert_matches(&tree, &heights);
     }
 
