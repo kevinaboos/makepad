@@ -175,6 +175,12 @@ struct WidgetTreeInner {
     placeholder_roots: Vec<WidgetUid>,
     /// How many placeholder roots the last sweep kept. The next sweep waits for twice as many.
     placeholder_roots_kept: usize,
+    /// Children that a widget stopped reporting while something in them was alive (like a pooled row),
+    /// keyed by that widget's uid.
+    ///
+    /// They get removed once nothing in them is alive, or along with their parent. Most apps never
+    /// have any, so these live apart from the graph's nodes and only get looked at if there are some.
+    detached: HashMap<WidgetUid, Vec<WidgetUid>>,
 }
 
 struct WidgetTreeNode {
@@ -200,10 +206,6 @@ struct GraphNode {
     /// hosts like Dock-style containers own these children outside the
     /// widget's child vec. Cleared the moment the parent reports it.
     manual: bool,
-    /// Children this widget stopped reporting while something in them was alive, like a pooled row.
-    ///
-    /// They get removed once nothing in them is alive, or along with this node.
-    detached: Vec<WidgetUid>,
 }
 
 #[derive(Clone)]
@@ -442,7 +444,6 @@ impl WidgetTree {
                         children: Vec::new(),
                     nesting_depth: 0,
                     manual: false,
-                    detached: Vec::new(),
                     },
                 );
                 node_is_new = true;
@@ -567,7 +568,6 @@ impl WidgetTree {
                     children: Vec::new(),
                     nesting_depth: 0,
                     manual: false,
-                    detached: Vec::new(),
                 },
             );
             if inner.root_uid == WidgetUid(0) {
@@ -617,7 +617,6 @@ impl WidgetTree {
                         children: Vec::new(),
                         nesting_depth: 0,
                         manual: true,
-                        detached: Vec::new(),
                     },
                 );
                 child_is_new = true;
@@ -817,7 +816,6 @@ impl WidgetTree {
                 children: Vec::new(),
                     nesting_depth: 0,
                     manual: false,
-                    detached: Vec::new(),
             },
         );
         if inner.root_uid == WidgetUid(0) {
@@ -882,7 +880,6 @@ impl WidgetTree {
                         children: Vec::new(),
                     nesting_depth: 0,
                     manual: false,
-                    detached: Vec::new(),
                     },
                 );
                 node_is_new = true;
@@ -969,7 +966,6 @@ impl WidgetTree {
                     children: Vec::new(),
                     nesting_depth: 0,
                     manual: false,
-                    detached: Vec::new(),
                 },
             );
             if inner.root_uid == WidgetUid(0) {
@@ -1594,7 +1590,6 @@ impl WidgetTree {
                             children: Vec::new(),
                     nesting_depth: 0,
                     manual: false,
-                    detached: Vec::new(),
                         },
                     );
                     child_is_new = true;
@@ -1657,7 +1652,7 @@ impl WidgetTree {
 
         // Recheck the `detached` children: remove the ones with nothing alive left in them, and
         // stop tracking any that got reported again, moved to another parent, or are already gone.
-        let detached = inner.graph.get_mut(&uid).map(|node| std::mem::take(&mut node.detached)).unwrap_or_default();
+        let detached = if inner.detached.is_empty() { Vec::new() } else { inner.detached.remove(&uid).unwrap_or_default() };
         let mut still_detached = Vec::new();
         for old_uid in detached {
             if new_children.contains(&old_uid)
@@ -1665,9 +1660,7 @@ impl WidgetTree {
             {
                 continue;
             }
-            if Self::subtree_is_dead(inner, old_uid) {
-                Self::remove_subtree(inner, old_uid);
-            } else {
+            if !Self::remove_subtree_if_dead(inner, old_uid) {
                 still_detached.push(old_uid);
             }
         }
@@ -1722,33 +1715,54 @@ impl WidgetTree {
             if !inner.graph.get(&unlinked_uid).is_some_and(|node| node.parent == Some(uid)) {
                 continue;
             }
-            if mark_structure_dirty || Self::subtree_is_dead(inner, unlinked_uid) {
+            if mark_structure_dirty {
                 Self::remove_subtree(inner, unlinked_uid);
-            } else {
+            } else if !Self::remove_subtree_if_dead(inner, unlinked_uid) {
                 still_detached.push(unlinked_uid);
             }
         }
-        if let Some(node) = inner.graph.get_mut(&uid) {
-            node.detached = still_detached;
+        if !still_detached.is_empty() && inner.graph.contains_key(&uid) {
+            inner.detached.insert(uid, still_detached);
         }
 
         true
     }
 
-    /// Returns whether everything `remove_subtree(uid)` would remove is already dead.
-    fn subtree_is_dead(inner: &WidgetTreeInner, uid: WidgetUid) -> bool {
-        let mut stack = vec![uid];
-        while let Some(uid) = stack.pop() {
-            let Some(node) = inner.graph.get(&uid) else {
+    /// Removes the subtree at `uid` if nothing in it is alive, returning whether it's gone.
+    ///
+    /// That's one walk over the subtree, which checks each widget while collecting them.
+    fn remove_subtree_if_dead(inner: &mut WidgetTreeInner, uid: WidgetUid) -> bool {
+        // Most often the subtree's own widget is still alive (like a pooled row), so check that before walking it.
+        if inner.graph.get(&uid).is_some_and(|node| node.widget.upgrade().is_some()) {
+            return false;
+        }
+        let mut subtree = vec![uid];
+        let mut next = 0;
+        while let Some(&node_uid) = subtree.get(next) {
+            next += 1;
+            let Some(node) = inner.graph.get(&node_uid) else {
                 continue;
             };
             if node.widget.upgrade().is_some() {
                 return false;
             }
-            stack.extend(node.children.iter().chain(&node.detached).copied().filter(|child_uid| {
-                inner.graph.get(child_uid).is_some_and(|child| child.parent == Some(uid))
+            let detached = inner.detached.get(&node_uid).into_iter().flatten();
+            subtree.extend(node.children.iter().chain(detached).copied().filter(|child_uid| {
+                inner.graph.get(child_uid).is_some_and(|child| child.parent == Some(node_uid))
             }));
         }
+        for node_uid in subtree {
+            if inner.graph.remove(&node_uid).is_some() {
+                if !inner.dirty.is_empty() {
+                    inner.dirty.remove(&node_uid);
+                }
+                if !inner.detached.is_empty() {
+                    inner.detached.remove(&node_uid);
+                }
+                inner.path_cache.remove(&node_uid);
+            }
+        }
+        inner.structure_dirty = true;
         true
     }
 
@@ -1776,11 +1790,7 @@ impl WidgetTree {
                 let lists_live_child = node.children.iter().any(|child_uid| {
                     inner.graph.get(child_uid).is_some_and(|child| child.widget.upgrade().is_some())
                 });
-                if root == inner.root_uid || lists_live_child || !Self::subtree_is_dead(inner, root) {
-                    return true;
-                }
-                Self::remove_subtree(inner, root);
-                false
+                root == inner.root_uid || lists_live_child || !Self::remove_subtree_if_dead(inner, root)
             });
             inner.placeholder_roots_kept = roots.len();
             inner.placeholder_roots = roots;
@@ -1796,8 +1806,9 @@ impl WidgetTree {
         inner.dirty.remove(&uid);
         inner.path_cache.remove(&uid);
         inner.structure_dirty = true;
+        let detached = if inner.detached.is_empty() { Vec::new() } else { inner.detached.remove(&uid).unwrap_or_default() };
 
-        for child_uid in node.children.into_iter().chain(node.detached) {
+        for child_uid in node.children.into_iter().chain(detached) {
             let has_same_parent = inner
                 .graph
                 .get(&child_uid)
