@@ -1968,6 +1968,18 @@ impl PortalList {
 
     /// Sets the first visible item and scroll offset.
     pub fn set_first_id_and_scroll(&mut self, first_id: usize, first_scroll: f64) {
+        self.set_first_id_and_scroll_in_place(first_id, first_scroll);
+        // The list was repositioned by code, so showing the start/end now is
+        // news again (e.g. a list re-purposed for other content).
+        self.forget_reached_edges();
+    }
+
+    /// Sets the first visible item and scroll offset to keep showing the same content.
+    ///
+    /// This is for when the items changed but the view shouldn't move, e.g. after items got added
+    /// above the first one. Unlike [`Self::set_first_id_and_scroll()`], a start or end of the list
+    /// that's already on screen doesn't get announced again (see [`PortalListAction::ReachedStart`]).
+    pub fn set_first_id_and_scroll_in_place(&mut self, first_id: usize, first_scroll: f64) {
         self.first_id = first_id;
         // A positive offset on the first item means a gap above the start edge;
         // when that edge doesn't bounce, pin to it rather than letting a
@@ -1977,9 +1989,6 @@ impl PortalList {
         } else {
             first_scroll
         };
-        // The list was repositioned by code, so showing the start/end now is
-        // news again (e.g. a list re-purposed for other content).
-        self.forget_reached_edges();
     }
 
     /// Forget that we already announced the start/end being on screen, so the
@@ -3592,6 +3601,13 @@ impl PortalListRef {
     pub fn set_first_id_and_scroll(&self, id: usize, s: f64) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_first_id_and_scroll(id, s);
+        }
+    }
+
+    /// See [`PortalList::set_first_id_and_scroll_in_place()`].
+    pub fn set_first_id_and_scroll_in_place(&self, first_id: usize, first_scroll: f64) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_first_id_and_scroll_in_place(first_id, first_scroll);
         }
     }
 
