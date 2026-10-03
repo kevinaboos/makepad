@@ -2508,11 +2508,6 @@ impl Cx {
                     self.os.timers.timers.remove(&timer_id);
                 }
                 CxOsOp::ShowTextIME(_area, _pos, config) => unsafe {
-                    // A show queued by a draw during the keyboard's hide animation only runs after
-                    // the system has dismissed the keyboard (e.g., via Back), so it mustn't re-open it.
-                    if self.keyboard.text_ime_dismissed {
-                        continue;
-                    }
                     // A focused `TextInput` re-issues `ShowTextIME` on every
                     // draw. Calling into Java each time thrashes the IME:
                     // `configure_keyboard` can restart the input connection,
