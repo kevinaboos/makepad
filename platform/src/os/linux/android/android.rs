@@ -1470,6 +1470,9 @@ impl Cx {
                     vm.gc();
                 }
             });
+        } else {
+            #[cfg(not(use_vulkan))]
+            self.maintain_instance_retirements();
         }
     }
 
@@ -2393,6 +2396,11 @@ impl Cx {
                     self.draw_pass_to_texture_for_active_backend(*draw_pass_id);
                 }
             }
+        }
+        // If no render ran the retirement step under this beat's repaint_id, run it here.
+        #[cfg(not(use_vulkan))]
+        if self.draw_lists.1.retirement_frame != Some(self.repaint_id) {
+            self.maintain_instance_retirements();
         }
 
         let timestamp_ns = (self.os.timers.time_now().max(0.0) * 1_000_000_000.0) as u64;
