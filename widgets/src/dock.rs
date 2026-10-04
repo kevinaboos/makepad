@@ -464,10 +464,17 @@ impl<'a> Iterator for DockVisibleItemIterator<'a> {
 
 struct TabBarWrap {
     tab_bar: TabBar,
-    /// Showing a different tab redraws this along with its children, since that tab's
-    /// retained draw lists missed any redraws while it was hidden.
     contents_draw_list: DrawList2d,
     contents_rect: Rect,
+}
+
+impl TabBarWrap {
+    /// Redraws this panel's contents and every retained draw list in them, since a hidden tab
+    /// misses any redraws meant for those. The plain redraw is what gets the parents to draw.
+    fn redraw_contents(&self, cx: &mut Cx) {
+        self.contents_draw_list.redraw(cx);
+        self.contents_draw_list.redraw_self_and_children(cx);
+    }
 }
 
 #[derive(Copy, Debug, Clone)]
@@ -1241,7 +1248,7 @@ impl Dock {
                 *selected = tabs.len() - 1;
             }
             if let Some(tab_bar) = self.tab_bars.get(&tabs_id) {
-                tab_bar.contents_draw_list.redraw_self_and_children(cx);
+                tab_bar.redraw_contents(cx);
             }
             true
         } else {
@@ -1278,7 +1285,7 @@ impl Dock {
             return false;
         };
         if let Some(tab_bar) = self.tab_bars.get(&tab_bar_id) {
-            tab_bar.contents_draw_list.redraw_self_and_children(cx);
+            tab_bar.redraw_contents(cx);
         }
         true
     }
@@ -1351,7 +1358,7 @@ impl Dock {
                         self.needs_save = true;
                         *selected = pos;
                         if let Some(tab_bar) = self.tab_bars.get(&tabs_id) {
-                            tab_bar.contents_draw_list.redraw_self_and_children(cx);
+                            tab_bar.redraw_contents(cx);
                         }
                         return;
                     }
@@ -1437,7 +1444,7 @@ impl Dock {
                             // contents still changed to a different item, so redraw them
                             // explicitly or the closed tab's pixels stay on screen.
                             if let Some(tab_bar) = self.tab_bars.get(&tabs_id) {
-                                tab_bar.contents_draw_list.redraw_self_and_children(cx);
+                                tab_bar.redraw_contents(cx);
                             }
                             if !keep_item {
                                 self.dock_items.remove(&tab_id);
@@ -1817,7 +1824,6 @@ impl Dock {
             }
         }
         for (panel_id, tab_bar) in self.tab_bars.iter_mut() {
-            let contents_view = &mut tab_bar.contents_draw_list;
             for action in cx.capture_actions(|cx| tab_bar.tab_bar.handle_event(cx, event, scope)) {
                 match action.as_widget_action().cast() {
                     TabBarAction::ShouldTabStartDrag(item) => {
@@ -1850,7 +1856,7 @@ impl Dock {
                         {
                             if let Some(sel) = tabs.iter().position(|v| *v == tab_id) {
                                 *selected = sel;
-                                contents_view.redraw_self_and_children(cx);
+                                tab_bar.redraw_contents(cx);
                                 cx.widget_action(uid, DockAction::TabWasPressed(tab_id))
                             } else {
                                 log!("Cannot find tab {}", tab_id.0);
