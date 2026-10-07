@@ -364,6 +364,12 @@ pub struct Window {
     show_performance_view: bool,
     #[rust]
     has_focus: bool,
+    /// Whether the platform has ever said whether this window has focus.
+    /// A window never told (a hidden window, a host that does not forward
+    /// focus) counts as focused for cancel gestures: the keys it receives
+    /// are its own, and without this an open modal in it never owned Escape.
+    #[rust]
+    focus_known: bool,
     /// The calculated value of the caption bar height, a value that will result in
     /// the window chrome buttons being nicely vertically centered within the caption bar.
     /// `None` means no geometry has been reported by the platform yet.
@@ -1503,7 +1509,7 @@ impl WindowRef {
 
 impl Widget for Window {
     fn visit_cancel(&self, visit: &mut dyn FnMut(LiveId, WidgetRef)) -> bool {
-        self.has_focus && self.cancel_children_impl(visit)
+        (self.has_focus || !self.focus_known) && self.cancel_children_impl(visit)
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
@@ -1745,6 +1751,7 @@ impl Widget for Window {
             Event::WindowGotFocus(window_id) => {
                 if *window_id == self.window.window_id() {
                     self.has_focus = true;
+                    self.focus_known = true;
                     cx.set_key_focus(self.last_known_area);
                 }
 
@@ -1753,6 +1760,7 @@ impl Widget for Window {
             Event::WindowLostFocus(window_id) => {
                 if *window_id == self.window.window_id() {
                     self.has_focus = false;
+                    self.focus_known = true;
                     self.last_known_area = cx.key_focus();
                     cx.set_key_focus(Area::Empty);
                 }
