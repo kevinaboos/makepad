@@ -83,6 +83,7 @@ script_mod! {
 
         heading_margin: Inset{top: 1.0, bottom: 0.1}
         paragraph_margin: Inset{top: 0.33, bottom: 0.33}
+        collapse_block_margins: true
 
         font_size: theme.font_size_p
         font_color: theme.color_label_inner
@@ -908,6 +909,8 @@ impl Widget for Html {
                         ..
                     }) = self.details_stack.last()
                     {
+                        // The fold button doesn't draw through draw_text, so apply the pending block margin first.
+                        self.text_flow.flush_block_margin(cx);
                         let fb_ref = self.text_flow.item_with_scope(
                             cx,
                             &mut Scope::empty(),
@@ -989,6 +992,8 @@ impl Widget for Html {
                             if needs_seed {
                                 self.seen_details.insert(details_id);
                             }
+                            // The summary text after the triangle still trims its leading whitespace.
+                            self.text_flow.first_thing_on_a_line = true;
                         }
                     }
                     // Start tracking the glyph rects that get drawn for the
@@ -1172,9 +1177,16 @@ fn handle_custom_widget(
         // for; when it overruns that line it is cut at the edge with an
         // ellipsis. `end_inline_content` also charges the row the widget landed
         // on, which costs a line even when no text run follows to notice it.
+        let block_start_state = tf.block_start_state();
         let hold = tf.begin_inline_content(cx);
+        if tf.is_content_truncated() {
+            return resume;
+        }
+        let start_pos = cx.turtle().pos();
         let mut draw_scope = Scope::with_data(tf);
         item.draw_all(cx, &mut draw_scope);
+        // An element that draws nothing (e.g., an empty <span>) shouldn't use up its container's start.
+        tf.end_inline_widget(cx.turtle().pos() != start_pos, block_start_state);
         tf.end_inline_content(cx, hold);
     }
     resume
