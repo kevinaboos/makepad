@@ -2542,6 +2542,8 @@ pub fn load_image_file_by_path_async(
     image_path: &Path,
 ) -> Result<AsyncLoadResult, ImageError> {
     ensure_image_cache_inner(cx);
+    // It's wanted again, so it stays cached once its decode lands.
+    cx.get_global::<ImageCache>().evicted_while_decoding.remove(image_path);
     if let Some(result) = get_cached_load_result(cx, image_path, None) {
         return Ok(result);
     }
@@ -2552,6 +2554,8 @@ pub fn load_image_file_by_path_async(
 pub fn load_image_http_by_url_async(cx: &mut Cx, url: &str) -> Result<AsyncLoadResult, ImageError> {
     ensure_image_cache_inner(cx);
     let image_path = PathBuf::from(url);
+    // It's wanted again, so it stays cached once its decode lands.
+    cx.get_global::<ImageCache>().evicted_while_decoding.remove(&image_path);
     if let Some(result) = get_cached_load_result(cx, &image_path, None) {
         return Ok(result);
     }

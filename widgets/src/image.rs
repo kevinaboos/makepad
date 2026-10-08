@@ -755,6 +755,20 @@ impl Image {
         let rect = cx.peek_walk_turtle(walk);
         let dpi = cx.current_dpi_factor();
 
+        // A decode that landed while this wasn't getting events (e.g., in a closed modal) is picked up now.
+        let missed_decode = self.async_image_path.as_deref().and_then(|image_path| {
+            let drawn_size = self.encoded_image.as_ref()
+                .filter(|encoded_image| encoded_image.image_path == image_path)
+                .and_then(|encoded_image| encoded_image.drawn_size);
+            if is_decoding_image(cx, image_path, drawn_size) {
+                return None;
+            }
+            load_image_from_cache(cx, image_path).map(|texture| (image_path.to_path_buf(), texture))
+        });
+        if let Some((image_path, texture)) = missed_decode {
+            self.set_texture(Some(texture), 0);
+            self.finish_async_load(cx, &image_path);
+        }
         // A decode of the image that's loading (just with fewer pixels) is drawn like any other,
         // so an animation keeps playing while it waits for a bigger decode.
         let is_showing_loading_image = self.async_image_path.is_some()
@@ -809,13 +823,20 @@ impl Image {
                 }
                 if !matches!(self.animation, ImageAnimation::Natural) {
                     self.next_frame = cx.new_next_frame();
-                } else if num_frames > 1 && self.next_frame_time.is_none() {
-                    // Drawing a natural animation (re)starts it, e.g., after it was off screen.
-                    let frame_delay = image_texture.animation(cx).as_ref().map_or(
-                        DEFAULT_FRAME_DELAY_SECS,
-                        |animation| get_frame_delay(animation, self.animation_frame as usize),
-                    );
-                    let next_frame_time = get_aligned_frame_time(Cx::monotonic_now(), frame_delay);
+                } else if num_frames > 1 {
+                    // Drawing a natural animation (re)starts it, e.g., after it was off screen,
+                    // or after something it's in kept the clock's tick from reaching it.
+                    let now = Cx::monotonic_now();
+                    let next_frame_time = match self.next_frame_time {
+                        Some(time) if time + ANIMATION_TICK_SLACK_SECS >= now => time,
+                        _ => {
+                            let frame_delay = image_texture.animation(cx).as_ref().map_or(
+                                DEFAULT_FRAME_DELAY_SECS,
+                                |animation| get_frame_delay(animation, self.animation_frame as usize),
+                            );
+                            get_aligned_frame_time(now, frame_delay)
+                        }
+                    };
                     self.next_frame_time = Some(next_frame_time);
                     request_animation_tick(cx, next_frame_time);
                 }
