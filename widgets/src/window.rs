@@ -884,6 +884,45 @@ impl Window {
         (visible, caption_rect, buttons_rect)
     }
 
+    /// The rects of the controls an app put in the caption bar, where a press is a click rather than a window drag.
+    /// We look into plain views and skip labels, so the bar's empty space and its text still drag the window.
+    fn caption_app_rects(&self, cx: &mut Cx) -> Vec<Rect> {
+        fn collect(cx: &mut Cx, children: Vec<WidgetRef>, rects: &mut Vec<Rect>) {
+            for child in children {
+                if !child.visible() {
+                    continue;
+                }
+                let view_children = child.borrow::<View>()
+                    .map(|view| view.children.iter().map(|(_, c)| c.clone()).collect());
+                if let Some(view_children) = view_children {
+                    collect(cx, view_children, rects);
+                } else if child.borrow::<Label>().is_none() {
+                    let rect = child.area().rect(cx);
+                    if rect.size.x > 0.0 && rect.size.y > 0.0 {
+                        rects.push(rect);
+                    }
+                }
+            }
+        }
+        let is_stock_bar_child = |id: LiveId| matches!(id,
+            id!(caption_label) | id!(voice_wave) | id!(windows_buttons) | id!(web_fullscreen));
+        let is_stock_label_child = |id: LiveId| matches!(id, id!(caption_icon) | id!(label));
+        let mut rects = Vec::new();
+        for (path, is_stock) in [
+            (ids!(caption_bar), &is_stock_bar_child as &dyn Fn(LiveId) -> bool),
+            (ids!(caption_label), &is_stock_label_child),
+        ] {
+            let app_children = self.view(cx, path).borrow().map(|view| view.children.iter()
+                .filter(|(id, _)| !is_stock(*id))
+                .map(|(_, c)| c.clone())
+                .collect());
+            if let Some(app_children) = app_children {
+                collect(cx, app_children, &mut rects);
+            }
+        }
+        rects
+    }
+
     fn sync_caption_bar_height(&mut self, cx: &mut Cx) {
         // Explicit DSL override takes priority, then system-calculated.
         let height = self
@@ -904,8 +943,11 @@ impl Window {
     /// When the window is too narrow, the padding gracefully reduces to 0,
     /// transitioning to a left-aligned title.
     fn sync_caption_centering(&mut self, cx: &mut Cx) {
+        // An Overlay caption label lays out its title apart from the app's controls, so we still center that title.
+        let is_overlay = self.view(cx, ids!(caption_label)).borrow()
+            .is_some_and(|view| view.layout.flow == Flow::Overlay);
         // App toolbars own their layout, including padding supplied by a theme.
-        if self.caption_contains_app_content(cx) {
+        if self.caption_contains_app_content(cx) && !is_overlay {
             return;
         }
         let bar_width = self.view(cx, ids!(caption_bar)).area().rect(cx).size.x;
@@ -922,6 +964,19 @@ impl Window {
         // At narrow widths: padding shrinks toward 0, so the title
         // shifts left to maximize the available text space.
         let padding_left = buttons_width.min((fill_width - buttons_width).max(0.0));
+
+        if is_overlay {
+            // Padding would move the app's controls too, so just the title gets a left margin,
+            // which moves a centered overlay child the same way.
+            let label = self.label(cx, ids!(caption_label.label));
+            if let Some(mut inner) = label.borrow_mut() {
+                if (inner.walk.margin.left - padding_left).abs() > 0.1 {
+                    inner.walk.margin.left = padding_left;
+                    inner.redraw(cx);
+                }
+            }
+            return;
+        }
 
         let caption_label = self.view(cx, ids!(caption_label));
         if let Some(mut inner) = caption_label.borrow_mut() {
@@ -1729,6 +1784,13 @@ impl Widget for Window {
                         WindowDragQueryResponse::Client => {
                             dq.response.set(WindowDragQueryResponse::Client);
                             cx.set_cursor(MouseCursor::Default);
+                        }
+                        // A press on a control that the app put in the caption bar is a click,
+                        // and that control sets its own cursor when it's hovered.
+                        WindowDragQueryResponse::Caption
+                            if self.caption_app_rects(cx).iter().any(|rect| rect.contains(dq.abs)) =>
+                        {
+                            dq.response.set(WindowDragQueryResponse::Client);
                         }
                         WindowDragQueryResponse::Caption if content_toolbar => {
                             dq.response.set(WindowDragQueryResponse::Client);
