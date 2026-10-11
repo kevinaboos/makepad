@@ -6583,6 +6583,7 @@ impl CxVulkan {
 
                 if sh.mapping.uses_time {
                     cx.demo_time_repaint = true;
+                    cx.passes[draw_pass_id].repaint_next = true;
                 }
 
                 draw_call.resolve_zbias(*zbias, sploded, uniforms_gen);

@@ -598,10 +598,6 @@ impl Cx {
                     }
                 }
 
-                if sh.mapping.uses_time {
-                    self.demo_time_repaint = true;
-                }
-
                 if debug_dump {
                     println!(
                         "  [item {}] instance_dirty={} instances_len={}",
@@ -644,6 +640,11 @@ impl Cx {
 
                 if instances == 0 {
                     continue;
+                }
+
+                if sh.mapping.uses_time {
+                    self.demo_time_repaint = true;
+                    self.passes[draw_pass_id].repaint_next = true;
                 }
 
                 let encoder = encoders.group(draw_call.draw_shader_id.index, sh);
