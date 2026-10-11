@@ -624,7 +624,8 @@ pub fn define_cocoa_view_class() -> *const Class {
         let cw = get_cocoa_window(this);
         unsafe {
             if cw.mouse_down_can_drag_window() {
-                // AppKit doesn't handle our title bar (see `mouse_down_can_move_window`), so we do its double-click too.
+                // AppKit doesn't handle our title bar (see `opaque_rect_for_window_move_when_in_titlebar`),
+                // so we do its double-click too.
                 let click_count: isize = msg_send![event, clickCount];
                 if click_count == 2 {
                     perform_title_bar_double_click_action(cw.window);
@@ -638,8 +639,13 @@ pub fn define_cocoa_view_class() -> *const Class {
         cw.send_mouse_down(MouseButton::PRIMARY, modifiers);
     }
 
-    // AppKit would move the window from a drag anywhere atop its title bar, even on a control
-    // that the app put there, so only the app's `WindowDragQuery` answer moves it (see `mouse_down`).
+    // AppKit moves the window from a drag on any part of its title bar that no view claims (like `NSControl` does),
+    // even on a control the app put there. So our view claims all of it, and only the app's `WindowDragQuery` moves it.
+    extern "C" fn opaque_rect_for_window_move_when_in_titlebar(this: &Object, _sel: Sel) -> NSRect {
+        unsafe { msg_send![this, bounds] }
+    }
+
+    // Older macOS versions may only ask this, rather than the above, before moving the window.
     extern "C" fn mouse_down_can_move_window(_this: &Object, _sel: Sel) -> BOOL {
         NO
     }
@@ -1336,6 +1342,10 @@ pub fn define_cocoa_view_class() -> *const Class {
         decl.add_method(
             sel!(mouseDown:),
             mouse_down as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(_opaqueRectForWindowMoveWhenInTitlebar),
+            opaque_rect_for_window_move_when_in_titlebar as extern "C" fn(&Object, Sel) -> NSRect,
         );
         decl.add_method(
             sel!(mouseDownCanMoveWindow),
