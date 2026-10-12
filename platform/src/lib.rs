@@ -183,6 +183,9 @@ pub use {
         draw_vars::DrawVars,
         sploded::{SplodedParams, SplodedView},
         event::{
+            BackGestureEdge,
+            BackGestureEvent,
+            BackGestureState,
             CancelScope,
             CancelScopeKind,
             CharOffset,

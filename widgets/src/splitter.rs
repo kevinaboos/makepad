@@ -287,6 +287,7 @@ impl Widget for Splitter {
                 }
                 self.animator_play(cx, ids!(hover.drag));
                 self.drag_start_align = Some(self.align);
+                cx.claim_finger_drag(fe.digit_id);
             }
             Hit::FingerUp(f) => {
                 self.drag_start_align = None;

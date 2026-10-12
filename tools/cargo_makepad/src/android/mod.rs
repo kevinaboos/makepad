@@ -89,6 +89,7 @@ impl AndroidVariant {
                     android:supportsRtl="true"
                     android:debuggable="{debuggable_str}"
                     android:largeHeap="true"
+                    android:enableOnBackInvokedCallback="true"
                     tools:targetApi="{target_sdk_version}">
                     <meta-data android:name="android.max_aspect" android:value="2.1" />
                     <activity
@@ -177,6 +178,7 @@ impl AndroidVariant {
                     android:supportsRtl="true"
                     android:debuggable="{debuggable_str}"
                     android:largeHeap="true"
+                    android:enableOnBackInvokedCallback="true"
                     tools:targetApi="{target_sdk_version}">
                     <!-- Quest 3-only CPU/GPU trade: prefer one extra CPU level over one GPU level. -->
                     <meta-data
@@ -993,5 +995,13 @@ mod tests {
         assert!(xml.contains("android:versionCode=\"42\""));
         assert!(xml.contains("android:versionName=\"2.7.3\""));
         assert!(xml.contains("android:debuggable=\"false\""));
+    }
+
+    #[test]
+    fn manifests_opt_into_predictive_back() {
+        for variant in [AndroidVariant::Default, AndroidVariant::Quest] {
+            let xml = variant.manifest_xml(&test_args("App", "dev.makepad.app"));
+            assert!(xml.contains("android:enableOnBackInvokedCallback=\"true\""));
+        }
     }
 }

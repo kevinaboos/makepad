@@ -12,7 +12,7 @@ use {
         event::keyboard::CharOffset,
         event::xr::XrAnchor,
         event::{
-            video_playback::CameraPreviewMode, DragItem, Event, NextFrame, QuitReason,
+            video_playback::CameraPreviewMode, DigitId, DragItem, Event, NextFrame, QuitReason,
             QuitRequestedEvent, Timer, Trigger, VideoSource,
         },
         gpu_info::GpuInfo,
@@ -1615,6 +1615,18 @@ impl Cx {
     /// inside one of its children. Returns true if a child capture was dropped.
     pub fn promote_finger_capture_over(&mut self, over: Area) -> bool {
         self.fingers.promote_capture_over(over)
+    }
+
+    /// Call on `Hit::FingerDown` when your widget gives this finger's drag its own meaning
+    /// (text selection, a slider), so containers won't turn the drag into their own gesture.
+    pub fn claim_finger_drag(&mut self, digit_id: DigitId) {
+        self.fingers.claim_drag(digit_id);
+    }
+
+    /// Drops every widget's capture of the touch with the given uid, so the rest of that touch hits nothing.
+    /// Call it once those widgets saw the touch get canceled.
+    pub fn release_touch_captures(&mut self, uid: u64) {
+        self.fingers.release_digit(live_id_num!(touch, uid).into());
     }
 
     pub fn sweep_unlock(&mut self, value: Area) {
