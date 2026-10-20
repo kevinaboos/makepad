@@ -408,6 +408,17 @@ mod imp {
             /// drag samples with their own times drive velocity-dependent
             /// gestures (a flick's momentum) the same way every run.
             time: Option<f64>,
+            /// A scroll's trackpad gesture phase (`/m?k=scroll&phase=`); `None` is a wheel.
+            phase: crate::event::ScrollPhase,
+        },
+        /// One step of a touch (`/m?k=touch&phase=start|move|stop|cancel&id=`).
+        Touch {
+            x: f64,
+            y: f64,
+            uid: u64,
+            state: crate::event::TouchState,
+            mods: RemoteKeyModifiers,
+            time: Option<f64>,
         },
         /// One step of a trackpad pinch (`/m?k=pinch&scale=&phase=`).
         Pinch {
@@ -1277,6 +1288,7 @@ mod imp {
                         mods,
                         hw: true,
                         time: at,
+                        phase,
                     } = input
                     {
                         let time = at.unwrap_or(time);
@@ -1328,16 +1340,17 @@ mod imp {
                                 );
                             }
                             MouseKind::Scroll => {
-                                cx.dispatch_studio_msg(
-                                    StudioToApp::Scroll(RemoteScroll {
+                                cx.dispatch_scroll_msg(
+                                    RemoteScroll {
                                         time,
                                         x,
                                         y,
                                         sx: dx,
                                         sy: dy,
-                                        is_mouse: true,
+                                        is_mouse: phase == crate::event::ScrollPhase::None,
                                         modifiers: mods,
-                                    }),
+                                    },
+                                    phase,
                                     window_id,
                                     dvec2(0.0, 0.0),
                                 );
@@ -1356,6 +1369,7 @@ mod imp {
                             mods,
                             hw: _,
                             time: at,
+                            phase,
                         } => {
                             let time = at.unwrap_or(time);
                             // Remote /click and /m are window-local layout points.
@@ -1387,6 +1401,23 @@ mod imp {
                                     button_raw_bits: 1 << button,
                                     modifiers: mods,
                                 }),
+                                MouseKind::Scroll if phase != crate::event::ScrollPhase::None => {
+                                    cx.dispatch_scroll_msg(
+                                        RemoteScroll {
+                                            time,
+                                            x: native.x,
+                                            y: native.y,
+                                            sx: dx,
+                                            sy: dy,
+                                            is_mouse: false,
+                                            modifiers: mods,
+                                        },
+                                        phase,
+                                        window_id,
+                                        dvec2(0.0, 0.0),
+                                    );
+                                    continue;
+                                }
                                 MouseKind::Scroll => StudioToApp::Scroll(RemoteScroll {
                                     time,
                                     x: native.x,
@@ -1397,6 +1428,28 @@ mod imp {
                                     modifiers: mods,
                                 }),
                             }
+                        }
+                        Input::Touch {
+                            x,
+                            y,
+                            uid,
+                            state,
+                            mods,
+                            time: at,
+                        } => {
+                            // Through native points and back, like the mouse routes above.
+                            let native = cx.windows[window_id]
+                                .layout_vec2d_to_native_points(dvec2(x, y));
+                            let abs = cx.stdin_pointer_abs(native, dvec2(0.0, 0.0), window_id);
+                            cx.dispatch_remote_touch(
+                                window_id,
+                                abs,
+                                uid,
+                                state,
+                                mods.into_key_modifiers(),
+                                at.unwrap_or(time),
+                            );
+                            continue;
                         }
                         Input::Pinch {
                             x,
@@ -2088,7 +2141,9 @@ mod imp {
              /gseq?n=8&every_ms=50&scale=1  a separate present per deadline; n=1..64, every_ms>=8, span<=60s; {{\"png\":[paths],\"frames\":[per-frame timings]}}\n\
              \x20                 scheduled_ms and pixels_ms share the request origin; capture_ms = pixels_ms - scheduled_ms; cadence never waits for PNG encoding\n\
              \x20                 commands follow UI queue order (concurrent sockets have no client-time order); macOS wait=1 input replies after submitting its applied frame\n\
-             /m?k=&x=&y=&w=    mouse. k=move|down|up|click|scroll|pinch  b=0 left,1 right,2 middle  scroll: dx=,dy=  pinch: scale= (relative to the previous step), phase=begin|update|end\n\
+             /m?k=&x=&y=&w=    mouse. k=move|down|up|click|scroll|pinch|touch  b=0 left,1 right,2 middle  scroll: dx=,dy=  pinch: scale= (relative to the previous step), phase=begin|update|end\n\
+             \x20                 trackpad scroll: phase=began|changed|ended|momentum|momentum_ended|touched (default none: a mouse wheel)\n\
+             \x20                 touch: k=touch&phase=start|move|stop|cancel&id=N (one finger; id tells fingers apart)\n\
                                time= stamps the event in app-clock seconds (default: now) so drag samples carry their own timing\n\
                                add hw=1 to take the hardware pointer path (pointer-lock/pin transform included)\n\
              /click?x=&y=      alias for /m?k=click\n\
@@ -2267,6 +2322,19 @@ mod imp {
         let mods = p.mods();
         let hw = p.flag(&["hw"]);
         let time = p.get(&["time"]).and_then(|v| v.parse::<f64>().ok());
+        let phase = match p.get(&["phase"]) {
+            Some(phase) if matches!(kind.as_str(), "scroll" | "wheel") => match phase {
+                "none" => crate::event::ScrollPhase::None,
+                "began" => crate::event::ScrollPhase::Began,
+                "changed" => crate::event::ScrollPhase::Changed,
+                "ended" => crate::event::ScrollPhase::Ended,
+                "momentum" => crate::event::ScrollPhase::Momentum,
+                "momentum_ended" => crate::event::ScrollPhase::MomentumEnded,
+                "touched" => crate::event::ScrollPhase::Touched,
+                other => return err(&format!("bad scroll phase {other}")),
+            },
+            _ => crate::event::ScrollPhase::None,
+        };
         let mouse = |kind| Input::Mouse {
             kind,
             x,
@@ -2277,6 +2345,7 @@ mod imp {
             mods,
             hw,
             time,
+            phase,
         };
         let inputs = match kind.as_str() {
             "move" => vec![mouse(MouseKind::Move)],
@@ -2288,6 +2357,23 @@ mod imp {
                 mouse(MouseKind::Up),
             ],
             "scroll" | "wheel" => vec![mouse(MouseKind::Scroll)],
+            "touch" => {
+                let state = match p.get(&["phase"]).unwrap_or("move") {
+                    "start" => crate::event::TouchState::Start,
+                    "move" => crate::event::TouchState::Move,
+                    "stop" => crate::event::TouchState::Stop,
+                    "cancel" => crate::event::TouchState::Cancel,
+                    other => return err(&format!("bad touch phase {other}")),
+                };
+                vec![Input::Touch {
+                    x,
+                    y,
+                    uid: p.f64(&["id"], 1.0).max(0.0) as u64,
+                    state,
+                    mods,
+                    time,
+                }]
+            }
             "pinch" => {
                 let phase = match p.get(&["phase"]).unwrap_or("update") {
                     "begin" => PinchPhase::Begin,

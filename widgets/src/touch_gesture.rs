@@ -1,4 +1,4 @@
-use crate::{Area, Cx, Event, Hit, MouseCursor, NextFrame};
+use crate::{makepad_draw::Vec2Index, Area, Cx, Event, Hit, MouseCursor, NextFrame};
 
 #[derive(Clone, Copy, Debug)]
 struct ScrollSample {
@@ -177,7 +177,8 @@ impl TouchGesture {
         }
 
         match event.hits_with_capture_overload(cx, area, true) {
-            Hit::FingerDown(e) => {
+            // A scroller inside that took this drag keeps it.
+            Hit::FingerDown(e) if cx.is_scroll_drag_owner(e.digit_id, Vec2Index::Y, area) => {
                 self.scroll_state = ScrollState::Drag {
                     samples: vec![ScrollSample {
                         abs: e.abs.y,

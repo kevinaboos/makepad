@@ -451,6 +451,10 @@ impl Widget for ChartView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         match event.hits_with_capture_overload(cx, self.draw_bg.area(), true) {
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                // Panning takes the drag both ways, so no scrollable around the chart moves with it.
+                let area = self.draw_bg.area();
+                cx.is_scroll_drag_owner(fe.digit_id, Vec2Index::X, area);
+                cx.is_scroll_drag_owner(fe.digit_id, Vec2Index::Y, area);
                 self.drag_start_abs = Some(fe.abs);
                 self.drag_start_viewport = self.viewport.clone();
                 cx.set_cursor(MouseCursor::Grabbing);
@@ -478,12 +482,23 @@ impl Widget for ChartView {
                 cx.set_cursor(MouseCursor::Grab);
             }
             Hit::FingerScroll(fs) => {
-                let scroll = if fs.scroll.y.abs() > f64::EPSILON {
-                    fs.scroll.y
-                } else {
-                    fs.scroll.x
+                // Zooming takes the whole gesture, so the page under the chart stays put.
+                let is_owner = match event {
+                    Event::Scroll(se) => {
+                        let area = self.draw_bg.area();
+                        let is_owner_x = cx.is_scroll_owner(se, area, Vec2Index::X, true);
+                        cx.is_scroll_owner(se, area, Vec2Index::Y, true) || is_owner_x
+                    }
+                    _ => false,
                 };
-                self.zoom_at(cx, scroll, fs.abs);
+                if is_owner {
+                    let scroll = if fs.scroll.y.abs() > f64::EPSILON {
+                        fs.scroll.y
+                    } else {
+                        fs.scroll.x
+                    };
+                    self.zoom_at(cx, scroll, fs.abs);
+                }
             }
             _ => {}
         }

@@ -720,7 +720,7 @@ impl Widget for StackNavigation {
                         self.swipe_back_candidate = Some(candidate);
                     } else if let (true, Some(current)) = (
                         delta.x >= SWIPE_BACK_DIRECTION_RATIO * delta.y.abs()
-                            && !cx.fingers.is_touch_drag_claimed(touch.uid)
+                            && !is_swipe_taken(cx, touch.uid)
                             && self.transition.is_none(),
                         self.current_view,
                     ) {
@@ -751,7 +751,7 @@ impl Widget for StackNavigation {
                 }
                 self.forward_event_to_views(cx, event, scope);
                 // A widget that gives this finger's drag its own meaning keeps it.
-                if self.swipe_back_candidate.is_some_and(|candidate| cx.fingers.is_touch_drag_claimed(candidate.uid)) {
+                if self.swipe_back_candidate.is_some_and(|candidate| is_swipe_taken(cx, candidate.uid)) {
                     self.swipe_back_candidate = None;
                 }
             }
@@ -1671,6 +1671,13 @@ impl StackNavigationRef {
     pub fn show_stack_view_by_id(&self, view_id: LiveId, cx: &mut Cx) {
         self.push(cx, view_id);
     }
+}
+
+/// Whether a widget in the view keeps this touch's drag: one that gives it its own meaning,
+/// or a scroller that took its horizontal drag.
+fn is_swipe_taken(cx: &Cx, uid: u64) -> bool {
+    cx.fingers.is_touch_drag_claimed(uid)
+        || cx.fingers.scroll_drag_owner(live_id_num!(touch, uid).into(), Vec2Index::X).is_some()
 }
 
 /// A copy of `e` with just the given touches, canceled and not yet hit by anything,
