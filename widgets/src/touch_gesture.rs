@@ -192,6 +192,15 @@ impl TouchGesture {
                 cx.set_cursor(MouseCursor::Default);
                 match &mut self.scroll_state {
                     ScrollState::Drag { samples } => {
+                        // A drag we share with a scroller along the other axis keeps to the way it started out.
+                        match cx.lock_scroll_drag(e.digit_id, e.abs - e.abs_start) {
+                            None => return TouchMotionChange::None,
+                            Some(direction) if !direction.allows(Vec2Index::Y) => {
+                                self.scroll_state = ScrollState::Stopped;
+                                return TouchMotionChange::ScrollStateChanged;
+                            }
+                            Some(_) => {}
+                        }
                         let new_abs = e.abs.y;
                         let old_sample = *samples.last().unwrap();
                         samples.push(ScrollSample {

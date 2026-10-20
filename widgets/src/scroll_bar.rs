@@ -483,6 +483,10 @@ impl ScrollBar {
         self.view_total - self.view_visible > 0.5
     }
 
+    pub fn drag_scrolling(&self) -> bool {
+        self.drag_scrolling
+    }
+
     /// Reveals an auto-hiding bar and starts its hide countdown afresh.
     fn show(&mut self, cx: &mut Cx) {
         if !self.auto_hide {
@@ -892,6 +896,45 @@ impl ScrollBar {
         }
     }
 
+    /// Stops a drag and lets go of any rubber band it stretched.
+    fn stop_drag(&mut self, cx: &mut Cx, dispatch_action: &mut dyn FnMut(&mut Cx, ScrollBarAction)) {
+        self.scroll_state = ScrollState::Stopped;
+        if self.overscroll != 0.0 {
+            self.overscroll = 0.0;
+            dispatch_action(cx, self.make_scroll_action());
+        }
+    }
+
+    /// Stops whatever is moving the content (a drag, fling, bounce or trackpad coast)
+    /// and lets go of any stretched rubber band.
+    pub fn stop_motion(&mut self) {
+        self.scroll_state = ScrollState::Stopped;
+        self.overscroll = 0.0;
+        self.coasting = false;
+        self.owns_gesture = false;
+        self.caught_fling = None;
+        self.touch_caught_motion_at = None;
+        self.momentum_cut_at = None;
+        self.last_finger_scroll_time = None;
+    }
+
+    /// Gives a drag up to another gesture, springing back any rubber band it stretched.
+    fn yield_drag(&mut self, cx: &mut Cx, dispatch_action: &mut dyn FnMut(&mut Cx, ScrollBarAction)) {
+        if self.overscroll == 0.0 {
+            self.scroll_state = ScrollState::Stopped;
+            return;
+        }
+        self.scroll_state = ScrollState::Bounce {
+            next_frame: cx.new_next_frame(),
+            x0: self.overscroll,
+            v0: 0.0,
+            clock: FrameClock::default(),
+            touch: true,
+        };
+        // Keeps the stretch on screen until the spring's first frame moves it.
+        dispatch_action(cx, self.make_scroll_action());
+    }
+
     /// Handles touch-based drag scrolling
     fn handle_touch_based_drag(
         &mut self,
@@ -909,45 +952,78 @@ impl ScrollBar {
         // `overscroll` set with the spring stopped would freeze the stretch on
         // screen with nothing left to pull it back.
         if !cx.is_scrolling_allowed_within(&scroll_area) {
-            self.scroll_state = ScrollState::Stopped;
-            if self.overscroll != 0.0 {
-                self.overscroll = 0.0;
-                dispatch_action(cx, self.make_scroll_action());
-            }
-            return;
+            return self.stop_drag(cx, dispatch_action);
         }
 
         // Check if scroll bar handle is not captured
         if self.is_area_captured(cx) {
-            self.scroll_state = ScrollState::Stopped;
-            if self.overscroll != 0.0 {
-                self.overscroll = 0.0;
-                dispatch_action(cx, self.make_scroll_action());
-            }
-            return;
+            return self.stop_drag(cx, dispatch_action);
         }
 
-        match event.hits(cx, scroll_area) {
-            // A drag moves only the innermost scrollable that can scroll its way.
+        let axis = self.axis.vec_index();
+        // We can share a press that only nested drag scrollers hold, along an axis none of them took.
+        let joins = self.scrollable()
+            && match event {
+                Event::MouseDown(e) => {
+                    e.button.is_primary()
+                        && cx.fingers.can_join_scroll_drag(live_id!(mouse).into(), axis, scroll_area)
+                }
+                Event::TouchUpdate(e) => {
+                    let mut held = e
+                        .touches
+                        .iter()
+                        .filter(|t| {
+                            t.state == TouchState::Start
+                                && !t.handled.get().is_empty()
+                                && t.handled.get() != scroll_area
+                                && scroll_area.clipped_rect(cx).contains(t.abs)
+                        })
+                        .peekable();
+                    held.peek().is_some()
+                        && held.all(|t| {
+                            cx.fingers.can_join_scroll_drag(live_id_num!(touch, t.uid).into(), axis, scroll_area)
+                        })
+                }
+                _ => false,
+            };
+
+        match event.hits_with_capture_overload(cx, scroll_area, joins) {
+            // A second finger on content we already hold doesn't start a drag of its own.
             Hit::FingerDown(fe)
-                if fe.is_primary_hit()
-                    && self.scrollable()
-                    && cx.is_scroll_drag_owner(fe.digit_id, self.axis.vec_index(), scroll_area) =>
-            {
-                let abs = match self.axis {
-                    ScrollAxis::Horizontal => fe.abs.x,
-                    ScrollAxis::Vertical => fe.abs.y,
-                };
-                self.scroll_state = ScrollState::Drag {
-                    samples: vec![ScrollSample { abs, time: fe.time }],
-                };
+                if cx.fingers.find_digit_for_captured_area(scroll_area).is_some_and(|digit| digit != fe.digit_id) => {}
+            // A press that a widget claimed (like a text selection) never drags us, but it still stops our fling.
+            Hit::FingerDown(fe) if fe.is_primary_hit() && cx.fingers.is_drag_claimed(fe.digit_id) => {
+                self.stop_fling(fe.time);
+            }
+            Hit::FingerDown(fe) if fe.is_primary_hit() => {
+                // So a scroller around us can share this drag along an axis we don't take.
+                cx.hold_scroll_drag(fe.digit_id, scroll_area);
+                // A drag moves only the innermost scrollable that can scroll its way.
+                if self.scrollable() && cx.is_scroll_drag_owner(fe.digit_id, axis, scroll_area) {
+                    let abs = match self.axis {
+                        ScrollAxis::Horizontal => fe.abs.x,
+                        ScrollAxis::Vertical => fe.abs.y,
+                    };
+                    self.scroll_state = ScrollState::Drag {
+                        samples: vec![ScrollSample { abs, time: fe.time }],
+                    };
+                }
             }
             Hit::FingerMove(e) => match &mut self.scroll_state {
+                // A widget that claimed the drag after we took it (its own hits run after ours) keeps it.
+                ScrollState::Drag { .. } if cx.fingers.is_drag_claimed(e.digit_id) => self.yield_drag(cx, dispatch_action),
                 ScrollState::Drag { samples } => {
                     let new_abs = match self.axis {
                         ScrollAxis::Horizontal => e.abs.x,
                         ScrollAxis::Vertical => e.abs.y,
                     };
+                    // A drag we share with a scroller along the other axis keeps to the way it started out.
+                    // Until that's clear, we keep only the press's sample, so the content catches up after.
+                    match cx.lock_scroll_drag(e.digit_id, e.abs - e.abs_start) {
+                        None => return,
+                        Some(direction) if !direction.allows(axis) => return self.yield_drag(cx, dispatch_action),
+                        Some(_) => {}
+                    }
                     let old_sample = *samples.last().unwrap();
                     push_sample(samples, new_abs, e.time);
 
@@ -1004,12 +1080,8 @@ impl ScrollBar {
                     if update.touches.iter().any(|touch| touch.uid == *uid && touch.state == TouchState::Cancel)) =>
             {
                 // Cancellation releases the held stretch without starting a flick.
-                self.scroll_state = ScrollState::Stopped;
                 self.caught_fling = None;
-                if self.overscroll != 0.0 {
-                    self.overscroll = 0.0;
-                    dispatch_action(cx, self.make_scroll_action());
-                }
+                self.stop_drag(cx, dispatch_action);
             }
             Hit::FingerUp(fe) if fe.is_primary_hit() => match &mut self.scroll_state {
                 ScrollState::Drag { samples } => {
