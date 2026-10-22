@@ -555,7 +555,9 @@ pub struct TextInput {
 
     #[live]
     is_password: bool,
+    #[imperative]
     #[live]
+    #[apply_state]
     is_read_only: bool,
     #[live]
     is_numeric_only: bool,
