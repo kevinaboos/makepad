@@ -1712,9 +1712,13 @@ impl Dock {
         template: LiveId,
         insert_after: Option<usize>,
     ) -> Option<WidgetRef> {
-        if let Some(DockItem::Tabs { tabs, .. }) = self.dock_items.get_mut(&parent) {
+        if let Some(DockItem::Tabs { tabs, selected, .. }) = self.dock_items.get_mut(&parent) {
             if let Some(after) = insert_after {
                 tabs.insert(after + 1, item);
+                // Inserting a tab left of the active tab keeps that same tab active.
+                if after < *selected {
+                    *selected += 1;
+                }
             } else {
                 tabs.push(item);
             }
@@ -1841,6 +1845,9 @@ impl Dock {
         bodies: BodyDispatch,
     ) {
         let uid = self.widget_uid();
+        // While an open overlay (like a drop-down's list) holds the sweep lock, presses are its own,
+        // so only a press claimed inside a tab's contents can make that tab bar current.
+        let is_sweep_locked = cx.sweep_lock_area().is_some();
         let dock_items = &mut self.dock_items;
         for (panel_id, splitter) in self.splitters.iter_mut() {
             for action in cx.capture_actions(|cx| splitter.handle_event(cx, event, scope)) {
@@ -1982,12 +1989,22 @@ impl Dock {
         }
         // A press claimed by a tab's contents belongs to that tab, even on a popup hanging past
         // its tab bar, and any other press belongs to the tab bar it landed in.
+        let is_touch_press = matches!(event, Event::TouchUpdate(_));
         let pressed_tabs_id = press_abs.and_then(|abs| match claimed_by {
             Some(tab_id) => self.find_tab_bar_of_tab(tab_id).map(|(tabs_id, _)| tabs_id),
+            None if is_sweep_locked => None,
             None => self
                 .tab_bars
                 .iter()
                 .find(|(_, tab_bar)| tab_bar.contents_rect.contains(abs))
+                // A tap on a background tab selects that tab once it ends,
+                // so its touch-down doesn't make the bar's front tab current first.
+                .filter(|(_, tab_bar)| {
+                    !is_touch_press
+                        || tab_bar.tab_bar.is_over_tab(cx, abs).is_none_or(|(tab_id, _)| {
+                            tab_bar.tab_bar.active_tab_id() == Some(tab_id)
+                        })
+                })
                 .map(|(tabs_id, _)| *tabs_id),
         });
         // A hidden tab bar has no tab to show as current, so it never takes it.
@@ -2716,6 +2733,20 @@ mod tests {
             DockItem::Tabs { tabs, selected, .. } => assert_eq!(tabs[*selected], id!(second)),
             _ => panic!("the root should still be a tab bar"),
         }
+    }
+
+    #[test]
+    fn creating_a_tab_left_of_the_current_tab_keeps_it_current() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (dock, _bodies) = dock_with_tabs(&mut cx);
+        dock.select_tab(&mut cx, id!(third));
+        let mut dock = dock.borrow_mut().unwrap();
+        dock.create_tab(&mut cx, id!(root), id!(fourth), id!(TestBody), "fourth".into(), id!(TestTab), Some(0));
+        let Some(DockItem::Tabs { tabs, selected, .. }) = dock.dock_items.get(&id!(root)) else {
+            panic!("the root should still be a tab bar");
+        };
+        assert_eq!(tabs[*selected], id!(third));
+        assert_eq!(dock.current_tab, Some(id!(third)));
     }
 
     fn initial_style_test_dock(vm: &mut ScriptVm) -> ScriptValue {

@@ -1054,6 +1054,12 @@ impl CxFingers {
         }
     }
 
+    /// Returns the area that holds the sweep lock, if any.
+    pub fn sweep_lock_area(&self) -> Option<Area> {
+        let is_expired = self.sweep_lock_owner.as_ref().is_some_and(|owner| owner.strong_count() == 0);
+        self.sweep_lock.filter(|_| !is_expired)
+    }
+
     pub fn acquire_sweep_lock(&mut self, area: Area) -> Option<SweepLock> {
         self.clear_expired_sweep_lock();
         if self.sweep_lock.is_some() {

@@ -1595,6 +1595,11 @@ impl Cx {
         self.fingers.sweep_lock(value);
     }
 
+    /// Returns the area that holds the sweep lock, if any, e.g. an open drop-down that owns the pointer.
+    pub fn sweep_lock_area(&self) -> Option<Area> {
+        self.fingers.sweep_lock_area()
+    }
+
     /// Locks pointer sweeps while the returned guard lives, or returns `None` if already locked.
     pub fn acquire_sweep_lock(&mut self, value: Area) -> Option<crate::event::SweepLock> {
         self.fingers.acquire_sweep_lock(value)
