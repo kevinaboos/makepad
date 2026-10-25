@@ -3602,6 +3602,7 @@ mod uniform_generation_tests {
             dyn_uniforms: call.dyn_uniforms,
             texture_slots: call.texture_slots.clone(),
             uniform_buffer_slots: call.uniform_buffer_slots.clone(),
+            dyn_instances_pad: Default::default(),
             dyn_instances: [0.0; crate::draw_vars::DRAW_CALL_DYN_INSTANCES],
         };
         vars.dyn_uniforms[0] += 1.0;
