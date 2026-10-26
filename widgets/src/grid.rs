@@ -955,8 +955,8 @@ impl Grid {
             let cell = self.child_walks[index].cell.unwrap_or_default();
             let col_span = normalized_span(cell.col_span).min(MAX_TRACKS);
             let row_span = normalized_span(cell.row_span).min(MAX_TRACKS);
-            let fixed_col = (cell.col != 0).then_some(cell.col as usize - 1);
-            let fixed_row = (cell.row != 0).then_some(cell.row as usize - 1);
+            let fixed_col = (cell.col != 0).then(|| cell.col as usize - 1);
+            let fixed_row = (cell.row != 0).then(|| cell.row as usize - 1);
             let placement = find_auto_placement(
                 &self.occupancy,
                 self.expanded_columns.len(),
