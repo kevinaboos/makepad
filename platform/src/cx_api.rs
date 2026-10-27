@@ -1716,9 +1716,22 @@ impl Cx {
     }
 
     /// The way `digit_id`'s drag may go once it has traveled the tap distance, or `None` until then.
-    /// A drag that only one scroller takes is never held back.
+    /// A drag that only one scroller takes is never held back, unless it took the press over from a widget.
     pub fn lock_scroll_drag(&mut self, digit_id: DigitId, travel: Vec2d) -> Option<ScrollDirection> {
         self.fingers.lock_scroll_drag(digit_id, travel)
+    }
+
+    /// Takes `digit_id`'s press from the widgets inside `area` that hold it (like a button), once it has
+    /// traveled the tap distance `axis`'s way, so they each get one last FingerUp as a sweep instead of a tap.
+    /// Returns the way the drag goes, or `None` until that's clear.
+    pub fn take_over_press(
+        &mut self,
+        digit_id: DigitId,
+        axis: Vec2Index,
+        area: Area,
+        travel: Vec2d,
+    ) -> Option<ScrollDirection> {
+        self.fingers.take_over_press(digit_id, axis, area, travel)
     }
 
     pub fn start_timeout(&mut self, delay: f64) -> Timer {
