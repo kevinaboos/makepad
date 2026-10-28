@@ -1552,7 +1552,8 @@ impl Event {
         if !matches!(self, Event::Draw(_)) {
             cx.validate_scoped_sweep_lock();
         }
-        if !area.is_valid(cx) {
+        // Nothing below handles a NextFrame.
+        if matches!(self, Event::NextFrame(_)) || !area.is_valid(cx) {
             return Hit::Nothing;
         }
         match self {
