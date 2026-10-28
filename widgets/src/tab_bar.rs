@@ -649,10 +649,6 @@ impl TabBar {
         LiveId::from_str_with_lut(&name).unwrap_or_else(|_| LiveId::from_str(&name))
     }
 
-    pub(crate) fn tab_ref(&self, tab_id: LiveId) -> Option<(LiveId, WidgetRef)> {
-        self.tabs.get(&tab_id).map(|(tab, _)| (Self::tab_node_name(tab_id), tab.clone()))
-    }
-
     pub(crate) fn tab_widget(&self, tab_id: LiveId) -> Option<WidgetRef> {
         self.tabs.get(&tab_id).map(|(tab, _)| tab.clone())
     }
