@@ -1606,6 +1606,19 @@ pub unsafe fn to_java_show_keyboard(visible: bool) {
     ndk_utils::call_void_method!(env, get_activity(), "showKeyboard", "(Z)V", visible as i32);
 }
 
+pub unsafe fn to_java_set_frame_rate_boost(boost: bool) {
+    // The fallback render loop keeps the rate it read at startup, so a faster mode can't help it.
+    #[cfg(not(no_android_choreographer))]
+    let follows_vsync = matches!(CHOREOGRAPHER_POST_CALLBACK_FN, Some(_));
+    #[cfg(no_android_choreographer)]
+    let follows_vsync = false;
+    if !follows_vsync {
+        return;
+    }
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "setFrameRateBoost", "(Z)V", boost as i32);
+}
+
 pub unsafe fn to_java_copy_to_clipboard(content: String) {
     let env = attach_jni_env();
     let content = CString::new(content.clone()).unwrap();
