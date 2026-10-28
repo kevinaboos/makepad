@@ -101,6 +101,7 @@ pub mod cached_widget;
 pub mod root;
 
 pub mod dock;
+mod next_frame_gate;
 pub mod tab;
 pub mod tab_bar;
 pub mod tab_close_button;

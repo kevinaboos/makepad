@@ -2101,6 +2101,11 @@ impl Cx {
         res
     }
 
+    /// Goes up every time a frame is requested, so a caller can tell whether code it ran asked for one.
+    pub fn next_frame_id(&self) -> u64 {
+        self.next_frame_id
+    }
+
     /// Keeps the display at its fastest refresh rate for about another second. Input already does this,
     /// so it's for content that keeps moving on its own, like a fling. Only Android needs it so far.
     pub fn boost_frame_rate(&mut self) {
