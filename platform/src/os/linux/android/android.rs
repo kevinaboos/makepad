@@ -22,6 +22,7 @@ use {
         android_jni::{self, *},
         android_keycodes::android_to_makepad_key_code,
         android_media::CxAndroidMedia,
+        android_performance_hint::PerformanceHint,
         android_video_playback::{force_native_video, force_software_video, AndroidVideoConfig},
         ndk_sys,
     },
@@ -319,13 +320,22 @@ impl Cx {
             // Wait for the next message, blocking until one is received.
             // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
             match from_java_rx.recv() {
-                Ok(FromJavaMessage::RenderLoop) => {
+                Ok(FromJavaMessage::RenderLoop(vsync_time)) => {
+                    if let Some(hint) = &mut self.os.performance_hint {
+                        hint.start_cycle(vsync_time);
+                    }
                     // Drain all pending messages, coalescing consecutive touch-move
                     // events to avoid redundant event dispatch before painting.
                     // Start/Stop events are never dropped — only pure-Move events
                     // are replaced by the next one.
                     let mut pending_touch_move: Option<FromJavaMessage> = None;
                     while let Ok(msg) = from_java_rx.try_recv() {
+                        // A tick we fell behind on still marks a vsync, which the hint's period needs.
+                        if let FromJavaMessage::RenderLoop(vsync_time) = msg {
+                            if let Some(hint) = &mut self.os.performance_hint {
+                                hint.record_vsync(vsync_time);
+                            }
+                        }
                         if let FromJavaMessage::Touch(ref touches) = msg {
                             if touches
                                 .iter()
@@ -597,7 +607,7 @@ impl Cx {
                     }
                 }
             }
-            FromJavaMessage::RenderLoop => {
+            FromJavaMessage::RenderLoop(_) => {
                 // This should not happen here, as it's handled in the main loop
             }
             // A `Wake` that came in during a `RenderLoop` is covered by its `handle_other_events`.
@@ -1541,6 +1551,9 @@ impl Cx {
                     vm.gc();
                 }
             });
+            if let Some(hint) = &mut self.os.performance_hint {
+                hint.mark_frame_drawn();
+            }
         } else {
             #[cfg(not(use_vulkan))]
             self.maintain_instance_retirements();
@@ -2048,8 +2061,9 @@ impl Cx {
             let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
 
             cx.os.activity_thread_id = Some(activity_thread_id);
-            cx.os.render_thread_id =
-                Some(unsafe { libc_sys::syscall(libc_sys::SYS_GETTID) as u64 });
+            let render_thread_id = unsafe { libc_sys::syscall(libc_sys::SYS_GETTID) };
+            cx.os.render_thread_id = Some(render_thread_id as u64);
+            cx.os.performance_hint = PerformanceHint::new(render_thread_id as i32);
 
             let mut initial_params: Option<AndroidParams> = None;
             let mut initial_surface: Option<(*mut ndk_sys::ANativeWindow, i32, i32)> = None;
@@ -3494,6 +3508,7 @@ impl Default for CxOs {
             openxr: CxOpenXr::default(),
             activity_thread_id: None,
             render_thread_id: None,
+            performance_hint: None,
             ignore_destroy: false,
             in_xr_mode: false,
             xr_buffer_scale_active: ANDROID_XR_BUFFER_SCALE_DEFAULT,
@@ -3655,6 +3670,7 @@ pub struct CxOs {
     pub(crate) openxr: CxOpenXr,
     pub(crate) activity_thread_id: Option<u64>,
     pub(crate) render_thread_id: Option<u64>,
+    pub(crate) performance_hint: Option<PerformanceHint>,
     pub(crate) ignore_destroy: bool,
     pub(crate) in_xr_mode: bool,
     pub(crate) xr_buffer_scale_active: f32,
