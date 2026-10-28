@@ -22,7 +22,7 @@ pub struct PerformanceHint {
     target: Duration,
     gaps: [Duration; PERIOD_GAPS],
     gap_count: usize,
-    last_vsync: Instant,
+    last_vsync: Option<Instant>,
     cycle_start: Duration,
     frame_drawn: bool,
 }
@@ -56,7 +56,7 @@ impl PerformanceHint {
             target,
             gaps: [Duration::ZERO; PERIOD_GAPS],
             gap_count: 0,
-            last_vsync: Instant::now(),
+            last_vsync: None,
             cycle_start: thread_cpu_time(),
             frame_drawn: false,
         })
@@ -64,8 +64,8 @@ impl PerformanceHint {
 
     /// Called for every vsync tick, even one we fell behind on, with when its callback ran.
     pub fn record_vsync(&mut self, vsync_time: Instant) {
-        self.gaps[self.gap_count] = vsync_time.saturating_duration_since(self.last_vsync);
-        self.last_vsync = vsync_time;
+        let Some(last_vsync) = self.last_vsync.replace(vsync_time) else { return };
+        self.gaps[self.gap_count] = vsync_time.saturating_duration_since(last_vsync);
         self.gap_count += 1;
         if self.gap_count == PERIOD_GAPS {
             // The median ignores both a late tick's long gap and the short one right after it.
@@ -77,6 +77,12 @@ impl PerformanceHint {
             }
             self.gap_count = 0;
         }
+    }
+
+    /// Called when vsync ticks start again after a pause, which isn't a vsync period or part of a frame's work.
+    pub fn handle_vsync_restart(&mut self) {
+        self.last_vsync = None;
+        self.frame_drawn = false;
     }
 
     /// Called on each vsync tick the render loop handles, before its events.

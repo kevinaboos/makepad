@@ -89,9 +89,9 @@ use {
     std::collections::HashMap,
     std::ffi::CString,
     std::rc::Rc,
-    std::sync::mpsc,
+    std::sync::mpsc::{self, RecvTimeoutError},
     //std::os::raw::{c_void},
-    std::time::Instant,
+    std::time::{Duration, Instant},
 };
 
 const ANDROID_XR_BUFFER_SCALE_MIN: f32 = 0.75;
@@ -311,15 +311,59 @@ impl Cx {
         self.start_network_live_file_watcher();
 
         while !self.os.quit {
+            #[cfg(not(use_vulkan))]
+            let has_pending_gl_retirements = self.has_pending_gl_resource_retirements();
+            #[cfg(use_vulkan)]
+            let has_pending_gl_retirements = false;
+            // Drawing only happens on ticks with a live surface, and a new surface asks for its own redraw.
+            let is_draw_pending = self.os.has_drawable_surface()
+                && (self.os.needs_first_draw
+                    || self.any_passes_dirty()
+                    || self.need_redrawing()
+                    || !self.new_next_frames.is_empty()
+                    || self.demo_time_repaint
+                    || has_pending_gl_retirements);
+            let now = Cx::monotonic_now();
+            let next_timer_wait = self.os.timers.timers.values()
+                .map(|timer| timer.time_until_due(now))
+                .reduce(f64::min);
+            // The rest of a tick's work runs with or without a surface.
+            // Overdue timers fire once per tick, so a timer that never catches up can't starve messages.
+            let is_render_loop_wanted = is_draw_pending
+                || self.os.in_xr_mode
+                || self.os.pending_ime_hide
+                || !self.platform_ops.is_empty()
+                || self.pending_script_reapply
+                || self.pending_live_edit_request
+                || !self.os.video_surfaces.is_empty()
+                || !self.os.camera_players.is_empty()
+                || !self.os.software_video_players.is_empty()
+                || next_timer_wait.is_some_and(|wait| wait <= 0.0);
+            if is_render_loop_wanted && !self.os.was_render_loop_wanted {
+                if let Some(hint) = &mut self.os.performance_hint {
+                    hint.handle_vsync_restart();
+                }
+            }
+            self.os.was_render_loop_wanted = is_render_loop_wanted;
+            android_jni::set_render_loop_wanted(is_render_loop_wanted);
+
             if self.os.in_xr_mode {
                 if self.openxr_render_loop(&from_java_rx) {
                     continue;
                 };
             }
 
-            // Wait for the next message, blocking until one is received.
+            // Wait for the next message, or while ticks are paused, for the next due timer or boost release.
             // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
-            match from_java_rx.recv() {
+            let boost_wait = self.os.frame_rate_boost
+                .then(|| (self.os.frame_rate_boost_time + 1.0 - self.os.timers.time_now()).max(0.0));
+            let message = match next_timer_wait.into_iter().chain(boost_wait).reduce(f64::min) {
+                Some(wait) if !is_render_loop_wanted => from_java_rx.recv_timeout(
+                    Duration::try_from_secs_f64(wait).unwrap_or(Duration::MAX)
+                ),
+                _ => from_java_rx.recv().map_err(RecvTimeoutError::from),
+            };
+            match message {
                 Ok(FromJavaMessage::RenderLoop(vsync_time)) => {
                     if let Some(hint) = &mut self.os.performance_hint {
                         hint.start_cycle(vsync_time);
@@ -411,7 +455,7 @@ impl Cx {
                         self.os.last_ime_config = None;
                     }
                 }
-                Ok(FromJavaMessage::Wake) => {
+                Ok(FromJavaMessage::Wake) | Err(RecvTimeoutError::Timeout) => {
                     self.handle_other_events();
                 }
                 Ok(message) => {
@@ -424,6 +468,11 @@ impl Cx {
                     crate::error!("Error receiving message: {:?}", e);
                     break;
                 }
+            }
+            // Checked after each pass handles its input, so a looping animation like a spinner can't hold the boost.
+            if self.os.frame_rate_boost && self.os.timers.time_now() - self.os.frame_rate_boost_time > 1.0 {
+                self.os.frame_rate_boost = false;
+                unsafe { android_jni::to_java_set_frame_rate_boost(false); }
             }
         }
         #[cfg(use_vulkan)]
@@ -1516,11 +1565,6 @@ impl Cx {
     }
 
     pub(crate) fn handle_drawing(&mut self) {
-        // Checked on every tick, so looping animations like a spinner can't hold the boost.
-        if self.os.frame_rate_boost && self.os.timers.time_now() - self.os.frame_rate_boost_time > 1.0 {
-            self.os.frame_rate_boost = false;
-            unsafe { android_jni::to_java_set_frame_rate_boost(false); }
-        }
         if self.any_passes_dirty()
             || self.need_redrawing()
             || !self.new_next_frames.is_empty()
@@ -3490,6 +3534,7 @@ impl Default for CxOs {
             pending_ime_hide: false,
             frame_rate_boost: false,
             frame_rate_boost_time: 0.0,
+            was_render_loop_wanted: true,
             media: CxAndroidMedia::default(),
             display: None,
             surface_alive: false,
@@ -3640,6 +3685,7 @@ pub struct CxOs {
     /// Whether we've asked for the display's fastest mode, see `boost_frame_rate`.
     pub frame_rate_boost: bool,
     pub frame_rate_boost_time: f64,
+    pub(crate) was_render_loop_wanted: bool,
     pub frame_time: i64,
     pub quit: bool,
     pub fullscreen: bool,
