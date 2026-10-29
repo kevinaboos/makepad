@@ -347,6 +347,10 @@ pub enum TabAction {
         abs: Vec2d,
         time: f64,
     },
+    /// This tab was clicked or tapped: a primary press on it was released over it without a drag.
+    WasClicked {
+        device: DigitDevice,
+    },
 }
 
 impl Tab {
@@ -464,6 +468,7 @@ impl Tab {
                 }
             }
             Hit::FingerUp(fue) => {
+                let was_dragging = self.is_dragging;
                 if self.is_dragging {
                     dispatch_action(cx, TabAction::ShouldTabStopDrag);
                     self.is_dragging = false;
@@ -493,7 +498,10 @@ impl Tab {
                     // not a scroll gesture or long-press drag.
                     if fue.was_tap() {
                         dispatch_action(cx, TabAction::WasPressed);
+                        dispatch_action(cx, TabAction::WasClicked { device: fue.device.clone() });
                     }
+                } else if fue.is_over && fue.is_primary_hit() && !was_dragging {
+                    dispatch_action(cx, TabAction::WasClicked { device: fue.device.clone() });
                 }
             }
             Hit::FingerDown(fde) => {

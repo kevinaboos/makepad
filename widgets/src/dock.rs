@@ -3,6 +3,7 @@ use crate::{
     makepad_derive_widget::*,
     makepad_draw::*,
     makepad_micro_serde::*,
+    next_frame_gate::NextFrameGates,
     splitter::{Splitter, SplitterAction, SplitterAlign, SplitterAxis},
     tab::Tab,
     tab_bar::{TabBar, TabBarAction},
@@ -201,6 +202,8 @@ pub struct Dock {
     #[rust]
     items: ComponentMap<LiveId, (LiveId, WidgetRef)>,
     #[rust]
+    item_frame_gates: NextFrameGates,
+    #[rust]
     drop_state: Option<DropPosition>,
     /// Info about the tab currently being dragged, for ghost tab rendering.
     #[rust]
@@ -317,6 +320,7 @@ impl ScriptHook for Dock {
 
         // Update existing items if templates changed
         if apply.is_reload() {
+            self.item_frame_gates.mark_all_wanting_frame();
             for (kind, widget) in self.items.values_mut() {
                 if let Some(template_ref) = self.templates.get(kind) {
                     let template_value: ScriptValue = template_ref.as_object().into();
@@ -388,9 +392,10 @@ impl WidgetNode for Dock {
                 Some(DockItem::Tabs { tabs, selected, hide_tab_bar, .. }) => {
                     if !hide_tab_bar {
                         if let Some(tab_bar) = dock.tab_bars.get(&id) {
+                            // Cancel walks ignore names.
                             for id in tabs {
-                                if let Some((name, tab)) = tab_bar.tab_bar.tab_ref(*id) {
-                                    visit(name, tab);
+                                if let Some(tab) = tab_bar.tab_bar.tab_widget(*id) {
+                                    visit(*id, tab);
                                 }
                             }
                         }
@@ -514,6 +519,10 @@ pub enum DockAction {
     },
     /// A tab was pressed, or a press elsewhere in its tab bar or contents made it current.
     TabWasPressed(LiveId),
+    /// A tab itself was clicked or tapped, i.e., released over it without being dragged.
+    ///
+    /// Unlike `TabWasPressed`, a press in the tab's contents doesn't count.
+    TabWasClicked { tab_id: LiveId, device: DigitDevice },
     TabCloseWasPressed(LiveId),
     ShouldTabStartDrag(LiveId),
     Drag(DragHitEvent),
@@ -1407,6 +1416,23 @@ impl Dock {
         }
     }
 
+    fn set_tab_bar_hidden(&mut self, cx: &mut Cx, tabs_id: LiveId, hidden: bool) {
+        if let Some(DockItem::Tabs { hide_tab_bar, .. }) = self.dock_items.get_mut(&tabs_id) {
+            if *hide_tab_bar == hidden {
+                return;
+            }
+            self.needs_save = true;
+            *hide_tab_bar = hidden;
+            // A hidden bar doesn't draw its tabs, so they'd keep stale states like hover. We drop them instead.
+            if hidden {
+                if let Some(tab_bar) = self.tab_bars.get_mut(&tabs_id) {
+                    tab_bar.tab_bar.clear_tabs();
+                }
+            }
+            self.area.redraw(cx);
+        }
+    }
+
     fn redraw_tab(&mut self, cx: &mut Cx, tab_id: LiveId) {
         for (tabs_id, item) in self.dock_items.iter_mut() {
             match item {
@@ -1944,6 +1970,9 @@ impl Dock {
                             }
                         }
                     }
+                    TabBarAction::TabWasClicked { tab_id, device } => {
+                        cx.widget_action(uid, DockAction::TabWasClicked { tab_id, device });
+                    }
                     TabBarAction::TabCloseWasPressed(tab_id) => {
                         cx.widget_action(uid, DockAction::TabCloseWasPressed(tab_id));
                         self.needs_save = true;
@@ -1984,9 +2013,19 @@ impl Dock {
                 dispatch_to_bodies(cx);
             }
         } else {
-            for (_id, (_templ_id, item)) in self.items.iter_mut() {
-                item.handle_event(cx, event, scope);
+            let visible_ids: SmallVec<[LiveId; 8]> = self.visible_items().map(|(id, _)| id).collect();
+            for (id, (_templ_id, item)) in self.items.iter_mut() {
+                self.item_frame_gates.get_or_insert(item.widget_uid()).deliver_event(
+                    cx,
+                    event,
+                    visible_ids.contains(id),
+                    |cx| item.handle_event(cx, event, scope),
+                );
             }
+            let items = &self.items;
+            self.item_frame_gates.prune(items.len(), |uid| {
+                items.values().any(|(_, item)| item.widget_uid() == uid)
+            });
         }
         // A press claimed by a tab's contents belongs to that tab, even on a popup hanging past
         // its tab bar, and any other press belongs to the tab bar it landed in.
@@ -2268,6 +2307,7 @@ impl Widget for Dock {
                             if !existed {
                                 cx.widget_tree_insert_child_deep(self.uid, id, entry.clone());
                             }
+                            self.item_frame_gates.get_or_insert(entry.widget_uid()).mark_drawn(cx);
                             entry.draw(cx, scope)?;
                         }
                     }
@@ -2303,6 +2343,18 @@ impl DockRef {
         WidgetRef::empty()
     }
 
+    /// Returns the `Tab` widget in the tab bar that holds the given tab,
+    /// or an empty ref if that bar hasn't drawn the tab yet.
+    pub fn tab_widget(&self, tab_id: LiveId) -> WidgetRef {
+        let Some(dock) = self.borrow() else {
+            return WidgetRef::empty();
+        };
+        dock.find_tab_bar_of_tab(tab_id)
+            .and_then(|(tabs_id, _)| dock.tab_bars.get(&tabs_id))
+            .and_then(|tab_bar| tab_bar.tab_bar.tab_widget(tab_id))
+            .unwrap_or_else(WidgetRef::empty)
+    }
+
     pub fn item_or_create(
         &self,
         cx: &mut Cx,
@@ -2318,6 +2370,14 @@ impl DockRef {
     pub fn close_tab(&self, cx: &mut Cx, tab_id: LiveId) {
         if let Some(mut dock) = self.borrow_mut() {
             dock.close_tab(cx, tab_id, false);
+        }
+    }
+
+    /// Closes the given tab but keeps its body, which creating a tab with the same ID later reuses.
+    pub fn close_tab_preserving_item(&self, cx: &mut Cx, tab_id: LiveId) {
+        if let Some(mut dock) = self.borrow_mut() {
+            dock.close_tab(cx, tab_id, true);
+            dock.dock_items.remove(&tab_id);
         }
     }
 
@@ -2427,6 +2487,15 @@ impl DockRef {
             return None;
         };
         dock.replace_tab(cx, tab_item_id, new_kind, new_name, select)
+    }
+
+    /// Hides or shows the given tab bar, whose active tab then fills the whole panel while it's hidden.
+    ///
+    /// Like any hidden tab bar, it isn't a drop target, and presses in it never make its tab current.
+    pub fn set_tab_bar_hidden(&self, cx: &mut Cx, tabs_id: LiveId, hidden: bool) {
+        if let Some(mut dock) = self.borrow_mut() {
+            dock.set_tab_bar_hidden(cx, tabs_id, hidden);
+        }
     }
 
     pub fn set_tab_title(&self, cx: &mut Cx, tab: LiveId, title: String) {
@@ -2748,6 +2817,58 @@ mod tests {
         };
         assert_eq!(tabs[*selected], id!(third));
         assert_eq!(dock.current_tab, Some(id!(third)));
+    }
+
+    #[test]
+    fn hiding_a_tab_bar_keeps_its_tabs() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (dock, bodies) = dock_with_tabs(&mut cx);
+        let is_hidden = |dock: &DockRef| matches!(
+            dock.borrow().unwrap().dock_items.get(&id!(root)),
+            Some(DockItem::Tabs { hide_tab_bar: true, .. })
+        );
+        dock.set_tab_bar_hidden(&mut cx, id!(root), true);
+        assert!(is_hidden(&dock));
+        assert!(dock.check_and_clear_need_save());
+        assert_intact(&dock, &bodies, id!(first));
+
+        // Hiding it again, or a tab or missing item, changes nothing.
+        dock.set_tab_bar_hidden(&mut cx, id!(root), true);
+        dock.set_tab_bar_hidden(&mut cx, id!(first), true);
+        dock.set_tab_bar_hidden(&mut cx, id!(missing), true);
+        assert!(!dock.check_and_clear_need_save());
+
+        dock.set_tab_bar_hidden(&mut cx, id!(root), false);
+        assert!(!is_hidden(&dock));
+        assert!(dock.check_and_clear_need_save());
+    }
+
+    #[test]
+    fn creating_a_tab_again_reuses_its_preserved_body() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let dock = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let value = initial_style_test_dock(vm);
+            Dock::script_from_value(vm, value)
+        });
+        let dock = WidgetRef::new_with_inner(Box::new(dock)).as_dock();
+        let body = dock.item(id!(second));
+        body.set_text(&mut cx, "preserved content");
+        dock.close_tab_preserving_item(&mut cx, id!(second));
+        assert!(dock.find_tab_bar_of_tab(id!(second)).is_none());
+        assert!(!dock.borrow().unwrap().dock_items.contains_key(&id!(second)));
+
+        let created = dock.create_tab(
+            &mut cx,
+            id!(work_tabs),
+            id!(second),
+            id!(Body),
+            "second".into(),
+            id!(CloseableTab),
+            None,
+        );
+        assert!(created.is_some_and(|created| created == body));
+        assert_eq!(dock.item(id!(second)).text(), "preserved content");
     }
 
     fn initial_style_test_dock(vm: &mut ScriptVm) -> ScriptValue {

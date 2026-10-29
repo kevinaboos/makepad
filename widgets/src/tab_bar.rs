@@ -361,6 +361,9 @@ impl Widget for TabBar {
                     cx.widget_action(uid, TabBarAction::ShouldTabStartDrag(*tab_id));
                 }
                 TabAction::ShouldTabStopDrag => {}
+                TabAction::WasClicked { device } => {
+                    cx.widget_action(uid, TabBarAction::TabWasClicked { tab_id: *tab_id, device });
+                }
                 TabAction::TouchDown { abs, time, digit_id } => {
                     // An overflowing strip takes the horizontal drag, so nothing around it moves too.
                     let is_overflowing = self.scroll_bars.get_scroll_view_total().x
@@ -649,8 +652,13 @@ impl TabBar {
         LiveId::from_str_with_lut(&name).unwrap_or_else(|_| LiveId::from_str(&name))
     }
 
-    pub(crate) fn tab_ref(&self, tab_id: LiveId) -> Option<(LiveId, WidgetRef)> {
-        self.tabs.get(&tab_id).map(|(tab, _)| (Self::tab_node_name(tab_id), tab.clone()))
+    pub(crate) fn tab_widget(&self, tab_id: LiveId) -> Option<WidgetRef> {
+        self.tabs.get(&tab_id).map(|(tab, _)| tab.clone())
+    }
+
+    /// Drops all of this bar's tab widgets, so the next draw creates them from scratch.
+    pub(crate) fn clear_tabs(&mut self) {
+        self.tabs.clear();
     }
 
     /// The tabs as widgets, for whoever enumerates children (the Dock).
@@ -751,6 +759,7 @@ impl TabBar {
 #[derive(Clone, Debug, Default)]
 pub enum TabBarAction {
     TabWasPressed(LiveId),
+    TabWasClicked { tab_id: LiveId, device: DigitDevice },
     ShouldTabStartDrag(LiveId),
     TabCloseWasPressed(LiveId),
     #[default]

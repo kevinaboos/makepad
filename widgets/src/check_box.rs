@@ -531,6 +531,10 @@ impl Widget for CheckBox {
             self.draw_bg.redraw(cx);
         }
 
+        if let Event::ClearHover = event {
+            self.animator_cut(cx, ids!(hover.off));
+        }
+
         match event.hits(cx, self.draw_bg.area()) {
             Hit::KeyFocus(_) => {
                 self.animator_play(cx, ids!(focus.on));
@@ -547,33 +551,44 @@ impl Widget for CheckBox {
                 self.animator_play(cx, ids!(hover.off));
             }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                self.set_key_focus(cx);
-                let new_active = if self.animator_in_state(cx, ids!(active.on)) {
-                    self.animator_play(cx, ids!(active.off));
-                    cx.widget_action_with_data(
-                        &self.action_data,
-                        uid,
-                        CheckBoxAction::Change(false),
-                    );
-                    false
-                } else {
-                    self.animator_play(cx, ids!(active.on));
-                    cx.widget_action_with_data(
-                        &self.action_data,
-                        uid,
-                        CheckBoxAction::Change(true),
-                    );
-                    true
-                };
-                cx.widget_to_script_call(
-                    uid,
-                    NIL,
-                    self.source.clone(),
-                    self.on_click.clone(),
-                    &[ScriptValue::from_bool(new_active)],
-                );
+                self.animator_play(cx, ids!(hover.down));
             }
-            Hit::FingerUp(_fe) => {}
+            Hit::FingerUp(fe) if fe.is_primary_hit() => {
+                // Touch never gets a hover-out, so only a hovering pointer stays hovered here.
+                if fe.is_over && fe.device.has_hovers() {
+                    self.animator_play(cx, ids!(hover.on));
+                } else {
+                    self.animator_play(cx, ids!(hover.off));
+                }
+                // We flip on release, so a press dragged off us, or taken over by a scroll, leaves us as we were.
+                if fe.is_over {
+                    self.set_key_focus(cx);
+                    let new_active = if self.animator_in_state(cx, ids!(active.on)) {
+                        self.animator_play(cx, ids!(active.off));
+                        cx.widget_action_with_data(
+                            &self.action_data,
+                            uid,
+                            CheckBoxAction::Change(false),
+                        );
+                        false
+                    } else {
+                        self.animator_play(cx, ids!(active.on));
+                        cx.widget_action_with_data(
+                            &self.action_data,
+                            uid,
+                            CheckBoxAction::Change(true),
+                        );
+                        true
+                    };
+                    cx.widget_to_script_call(
+                        uid,
+                        NIL,
+                        self.source.clone(),
+                        self.on_click.clone(),
+                        &[ScriptValue::from_bool(new_active)],
+                    );
+                }
+            }
             Hit::FingerMove(_fe) => {}
             _ => (),
         }
