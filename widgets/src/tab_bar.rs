@@ -656,6 +656,11 @@ impl TabBar {
         self.tabs.get(&tab_id).map(|(tab, _)| tab.clone())
     }
 
+    /// Drops all of this bar's tab widgets, so the next draw creates them from scratch.
+    pub(crate) fn clear_tabs(&mut self) {
+        self.tabs.clear();
+    }
+
     /// The tabs as widgets, for whoever enumerates children (the Dock).
     pub fn tab_refs(&self) -> impl Iterator<Item = (LiveId, WidgetRef)> + '_ {
         self.tabs
