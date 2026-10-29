@@ -519,6 +519,10 @@ pub enum DockAction {
     },
     /// A tab was pressed, or a press elsewhere in its tab bar or contents made it current.
     TabWasPressed(LiveId),
+    /// A tab itself was clicked or tapped, i.e., released over it without being dragged.
+    ///
+    /// Unlike `TabWasPressed`, a press in the tab's contents doesn't count.
+    TabWasClicked { tab_id: LiveId, device: DigitDevice },
     TabCloseWasPressed(LiveId),
     ShouldTabStartDrag(LiveId),
     Drag(DragHitEvent),
@@ -1948,6 +1952,9 @@ impl Dock {
                                 log!("Cannot find tab {}", tab_id.0);
                             }
                         }
+                    }
+                    TabBarAction::TabWasClicked { tab_id, device } => {
+                        cx.widget_action(uid, DockAction::TabWasClicked { tab_id, device });
                     }
                     TabBarAction::TabCloseWasPressed(tab_id) => {
                         cx.widget_action(uid, DockAction::TabCloseWasPressed(tab_id));
