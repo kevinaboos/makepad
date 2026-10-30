@@ -961,7 +961,8 @@ impl ScrollBar {
         }
 
         let axis = self.axis.vec_index();
-        // We can share a press that only nested drag scrollers hold, along an axis none of them took.
+        // We can share a press that only nested drag scrollers hold, along an axis none of them took,
+        // and a touch that widgets inside us hold, which we take from them once it's a drag our way.
         let joins = self.scrollable()
             && match event {
                 Event::MouseDown(e) => {
@@ -981,7 +982,7 @@ impl ScrollBar {
                         .peekable();
                     held.peek().is_some()
                         && held.all(|t| {
-                            cx.fingers.can_join_scroll_drag(live_id_num!(touch, t.uid).into(), axis, scroll_area)
+                            cx.fingers.can_take_over_press(live_id_num!(touch, t.uid).into(), axis, scroll_area)
                         })
                 }
                 _ => false,
@@ -1017,9 +1018,16 @@ impl ScrollBar {
                         ScrollAxis::Horizontal => e.abs.x,
                         ScrollAxis::Vertical => e.abs.y,
                     };
+                    let travel = e.abs - e.abs_start;
+                    // A widget inside us, like a button, keeps the press until it turns out to be a drag our way.
+                    if cx.fingers.is_press_held_by_widget(e.digit_id, scroll_area)
+                        && cx.take_over_press(e.digit_id, axis, scroll_area, travel).is_none()
+                    {
+                        return;
+                    }
                     // A drag we share with a scroller along the other axis keeps to the way it started out.
                     // Until that's clear, we keep only the press's sample, so the content catches up after.
-                    match cx.lock_scroll_drag(e.digit_id, e.abs - e.abs_start) {
+                    match cx.lock_scroll_drag(e.digit_id, travel) {
                         None => return,
                         Some(direction) if !direction.allows(axis) => return self.yield_drag(cx, dispatch_action),
                         Some(_) => {}
@@ -1181,6 +1189,7 @@ impl ScrollBar {
             match event.hits(cx, self.draw_bg.area()) {
                 Hit::FingerDown(fe) if fe.is_primary_hit() => {
                     self.animator_play(cx, ids!(hover.drag));
+                    cx.claim_finger_drag(fe.digit_id);
                     let rel = fe.abs - fe.rect.pos;
                     let rel = match self.axis {
                         ScrollAxis::Horizontal => rel.x,
@@ -1312,6 +1321,8 @@ impl ScrollBar {
         let min_velocity = self.flick_scroll_minimum * PER_FRAME_TO_PER_SECOND;
         let step = if let ScrollState::Flick { fling, next_frame } = &mut self.scroll_state {
             if let Some(ne) = next_frame.is_event(event) {
+                // A fling keeps moving after the finger lifts, so it keeps the display fast too.
+                cx.boost_frame_rate();
                 Some((fling.step(ne.time), fling.is_active(min_velocity), fling.velocity))
             } else {
                 None

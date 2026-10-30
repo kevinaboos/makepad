@@ -98,7 +98,7 @@ pub(crate) fn wake_ui_event_loop() {
 #[cfg(target_os = "android")]
 pub(crate) fn wake_ui_event_loop() {
     android::android_jni::send_from_java_message(
-        android::android_jni::FromJavaMessage::RenderLoop,
+        android::android_jni::FromJavaMessage::Wake,
     );
 }
 

@@ -194,9 +194,11 @@ impl Widget for Modal {
         let draw_list = self.draw_list.as_mut().unwrap();
         draw_list.begin_overlay_reuse(cx);
         cx.begin_root_turtle_for_pass(self.view.layout);
-        self.draw_bg.begin(cx, Walk::fill(), self.view.layout);
 
+        // Even an invisible `draw_bg` costs the GPU a full-window pass every frame,
+        // so a closed modal leaves its overlay empty.
         if self.is_open {
+            self.draw_bg.begin(cx, Walk::fill(), self.view.layout);
             let bg_view = self.view.widget(cx, ids!(bg_view));
             let _ = bg_view.draw_walk(
                 cx,
@@ -206,9 +208,9 @@ impl Widget for Modal {
 
             let content = self.view.widget(cx, ids!(content));
             let _ = content.draw_all(cx, scope);
+            self.draw_bg.end(cx);
         }
 
-        self.draw_bg.end(cx);
         cx.end_pass_sized_turtle();
         self.draw_list.as_mut().unwrap().end(cx);
 

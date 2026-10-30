@@ -22,6 +22,7 @@ use {
         android_jni::{self, *},
         android_keycodes::android_to_makepad_key_code,
         android_media::CxAndroidMedia,
+        android_performance_hint::PerformanceHint,
         android_video_playback::{force_native_video, force_software_video, AndroidVideoConfig},
         ndk_sys,
     },
@@ -88,9 +89,9 @@ use {
     std::collections::HashMap,
     std::ffi::CString,
     std::rc::Rc,
-    std::sync::mpsc,
+    std::sync::mpsc::{self, RecvTimeoutError},
     //std::os::raw::{c_void},
-    std::time::Instant,
+    std::time::{Duration, Instant},
 };
 
 const ANDROID_XR_BUFFER_SCALE_MIN: f32 = 0.75;
@@ -310,22 +311,75 @@ impl Cx {
         self.start_network_live_file_watcher();
 
         while !self.os.quit {
+            #[cfg(not(use_vulkan))]
+            let has_pending_gl_retirements = self.has_pending_gl_resource_retirements();
+            #[cfg(use_vulkan)]
+            let has_pending_gl_retirements = false;
+            // Drawing only happens on ticks with a live surface, and a new surface asks for its own redraw.
+            let is_draw_pending = self.os.has_drawable_surface()
+                && (self.os.needs_first_draw
+                    || self.any_passes_dirty()
+                    || self.need_redrawing()
+                    || !self.new_next_frames.is_empty()
+                    || self.demo_time_repaint
+                    || has_pending_gl_retirements);
+            let now = Cx::monotonic_now();
+            let next_timer_wait = self.os.timers.timers.values()
+                .map(|timer| timer.time_until_due(now))
+                .reduce(f64::min);
+            // The rest of a tick's work runs with or without a surface.
+            // Overdue timers fire once per tick, so a timer that never catches up can't starve messages.
+            let is_render_loop_wanted = is_draw_pending
+                || self.os.in_xr_mode
+                || self.os.pending_ime_hide
+                || !self.platform_ops.is_empty()
+                || self.pending_script_reapply
+                || self.pending_live_edit_request
+                || !self.os.video_surfaces.is_empty()
+                || !self.os.camera_players.is_empty()
+                || !self.os.software_video_players.is_empty()
+                || next_timer_wait.is_some_and(|wait| wait <= 0.0);
+            if is_render_loop_wanted && !self.os.was_render_loop_wanted {
+                if let Some(hint) = &mut self.os.performance_hint {
+                    hint.handle_vsync_restart();
+                }
+            }
+            self.os.was_render_loop_wanted = is_render_loop_wanted;
+            android_jni::set_render_loop_wanted(is_render_loop_wanted);
+
             if self.os.in_xr_mode {
                 if self.openxr_render_loop(&from_java_rx) {
                     continue;
                 };
             }
 
-            // Wait for the next message, blocking until one is received.
+            // Wait for the next message, or while ticks are paused, for the next due timer or boost release.
             // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
-            match from_java_rx.recv() {
-                Ok(FromJavaMessage::RenderLoop) => {
+            let boost_wait = self.os.frame_rate_boost
+                .then(|| (self.os.frame_rate_boost_time + 1.0 - self.os.timers.time_now()).max(0.0));
+            let message = match next_timer_wait.into_iter().chain(boost_wait).reduce(f64::min) {
+                Some(wait) if !is_render_loop_wanted => from_java_rx.recv_timeout(
+                    Duration::try_from_secs_f64(wait).unwrap_or(Duration::MAX)
+                ),
+                _ => from_java_rx.recv().map_err(RecvTimeoutError::from),
+            };
+            match message {
+                Ok(FromJavaMessage::RenderLoop(vsync_time)) => {
+                    if let Some(hint) = &mut self.os.performance_hint {
+                        hint.start_cycle(vsync_time);
+                    }
                     // Drain all pending messages, coalescing consecutive touch-move
                     // events to avoid redundant event dispatch before painting.
                     // Start/Stop events are never dropped — only pure-Move events
                     // are replaced by the next one.
                     let mut pending_touch_move: Option<FromJavaMessage> = None;
                     while let Ok(msg) = from_java_rx.try_recv() {
+                        // A tick we fell behind on still marks a vsync, which the hint's period needs.
+                        if let FromJavaMessage::RenderLoop(vsync_time) = msg {
+                            if let Some(hint) = &mut self.os.performance_hint {
+                                hint.record_vsync(vsync_time);
+                            }
+                        }
                         if let FromJavaMessage::Touch(ref touches) = msg {
                             if touches
                                 .iter()
@@ -401,6 +455,9 @@ impl Cx {
                         self.os.last_ime_config = None;
                     }
                 }
+                Ok(FromJavaMessage::Wake) | Err(RecvTimeoutError::Timeout) => {
+                    self.handle_other_events();
+                }
                 Ok(message) => {
                     self.handle_message(message);
                     // Dispatch platform ops immediately after non-RenderLoop messages.
@@ -411,6 +468,11 @@ impl Cx {
                     crate::error!("Error receiving message: {:?}", e);
                     break;
                 }
+            }
+            // Checked after each pass handles its input, so a looping animation like a spinner can't hold the boost.
+            if self.os.frame_rate_boost && self.os.timers.time_now() - self.os.frame_rate_boost_time > 1.0 {
+                self.os.frame_rate_boost = false;
+                unsafe { android_jni::to_java_set_frame_rate_boost(false); }
             }
         }
         #[cfg(use_vulkan)]
@@ -573,6 +635,15 @@ impl Cx {
     }
 
     pub(crate) fn handle_message(&mut self, msg: FromJavaMessage) {
+        if matches!(msg,
+            FromJavaMessage::Touch(_) | FromJavaMessage::LongClick { .. }
+            | FromJavaMessage::BackPressed | FromJavaMessage::BackGesture { .. }
+            | FromJavaMessage::KeyDown { .. } | FromJavaMessage::KeyUp { .. }
+            | FromJavaMessage::Character { .. } | FromJavaMessage::SelectionHandleDrag { .. }
+            | FromJavaMessage::ImeTextStateChanged { .. } | FromJavaMessage::ImeEditorAction { .. }
+        ) {
+            self.os.boost_frame_rate();
+        }
         match msg {
             FromJavaMessage::SwitchedActivity(activity_handle, activity_thread_id) => {
                 self.os.activity_thread_id = Some(activity_thread_id);
@@ -585,9 +656,11 @@ impl Cx {
                     }
                 }
             }
-            FromJavaMessage::RenderLoop => {
+            FromJavaMessage::RenderLoop(_) => {
                 // This should not happen here, as it's handled in the main loop
             }
+            // A `Wake` that came in during a `RenderLoop` is covered by its `handle_other_events`.
+            FromJavaMessage::Wake => {}
             FromJavaMessage::BackPressed => {
                 self.call_event_handler(&Event::BackPressed {
                     handled: Cell::new(false),
@@ -719,6 +792,11 @@ impl Cx {
                 width,
                 height,
             } => {
+                // The window may be new or on another panel now, like after a fold,
+                // so we ask again for the fastest mode of the display it's on.
+                if self.os.frame_rate_boost && !self.os.in_xr_mode {
+                    unsafe { android_jni::to_java_set_frame_rate_boost(true); }
+                }
                 #[cfg(use_vulkan)]
                 let _has_vulkan = self.os.vulkan.is_some();
                 #[cfg(not(use_vulkan))]
@@ -1005,6 +1083,8 @@ impl Cx {
                     }
                     self.os.last_ime_visible = true;
                     self.os.last_ime_height = height_logical;
+                    // The keyboard's slide sends us no input, so each step of it boosts here instead.
+                    self.os.boost_frame_rate();
                     self.call_event_handler(&Event::VirtualKeyboard(
                         VirtualKeyboardEvent::DidShow {
                             height: height_logical,
@@ -1515,6 +1595,9 @@ impl Cx {
                     vm.gc();
                 }
             });
+            if let Some(hint) = &mut self.os.performance_hint {
+                hint.mark_frame_drawn();
+            }
         } else {
             #[cfg(not(use_vulkan))]
             self.maintain_instance_retirements();
@@ -2022,8 +2105,9 @@ impl Cx {
             let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
 
             cx.os.activity_thread_id = Some(activity_thread_id);
-            cx.os.render_thread_id =
-                Some(unsafe { libc_sys::syscall(libc_sys::SYS_GETTID) as u64 });
+            let render_thread_id = unsafe { libc_sys::syscall(libc_sys::SYS_GETTID) };
+            cx.os.render_thread_id = Some(render_thread_id as u64);
+            cx.os.performance_hint = PerformanceHint::new(render_thread_id as i32);
 
             let mut initial_params: Option<AndroidParams> = None;
             let mut initial_surface: Option<(*mut ndk_sys::ANativeWindow, i32, i32)> = None;
@@ -3448,6 +3532,9 @@ impl Default for CxOs {
             last_ime_visible: false,
             last_ime_config: None,
             pending_ime_hide: false,
+            frame_rate_boost: false,
+            frame_rate_boost_time: 0.0,
+            was_render_loop_wanted: true,
             media: CxAndroidMedia::default(),
             display: None,
             surface_alive: false,
@@ -3466,6 +3553,7 @@ impl Default for CxOs {
             openxr: CxOpenXr::default(),
             activity_thread_id: None,
             render_thread_id: None,
+            performance_hint: None,
             ignore_destroy: false,
             in_xr_mode: false,
             xr_buffer_scale_active: ANDROID_XR_BUFFER_SCALE_DEFAULT,
@@ -3594,6 +3682,10 @@ pub struct CxOs {
     /// Set by `HideTextIME`, which waits until after the next draw, so that moving focus
     /// from one text input to another keeps the keyboard up instead of hiding it.
     pub pending_ime_hide: bool,
+    /// Whether we've asked for the display's fastest mode, see `boost_frame_rate`.
+    pub frame_rate_boost: bool,
+    pub frame_rate_boost_time: f64,
+    pub(crate) was_render_loop_wanted: bool,
     pub frame_time: i64,
     pub quit: bool,
     pub fullscreen: bool,
@@ -3624,6 +3716,7 @@ pub struct CxOs {
     pub(crate) openxr: CxOpenXr,
     pub(crate) activity_thread_id: Option<u64>,
     pub(crate) render_thread_id: Option<u64>,
+    pub(crate) performance_hint: Option<PerformanceHint>,
     pub(crate) ignore_destroy: bool,
     pub(crate) in_xr_mode: bool,
     pub(crate) xr_buffer_scale_active: f32,
@@ -3647,6 +3740,19 @@ pub struct CxOs {
 impl CxOs {
     pub(crate) fn gl(&self) -> &LibGl {
         &self.display.as_ref().unwrap().libgl
+    }
+
+    /// Some Android skins hold apps to 60Hz, so while the user interacts or content keeps moving,
+    /// we ask for the display's fastest mode, and stop once a second passes with neither.
+    pub(crate) fn boost_frame_rate(&mut self) {
+        if self.in_xr_mode {
+            return;
+        }
+        self.frame_rate_boost_time = self.timers.time_now();
+        if !self.frame_rate_boost {
+            self.frame_rate_boost = true;
+            unsafe { android_jni::to_java_set_frame_rate_boost(true); }
+        }
     }
 
     /// True while the Vulkan renderer exists. A Vulkan build whose

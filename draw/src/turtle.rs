@@ -1147,6 +1147,42 @@ mod tests {
     }
 
     #[test]
+    fn a_retained_list_redraws_when_the_clip_around_it_moves() {
+        use crate::draw_list_2d::DrawList2d;
+        // A list 500 tall at the top of a viewport that a bar resizes, inside a turtle that's still growing.
+        fn will_redraw(cx: &mut Cx2d, list: &mut DrawList2d, viewport: f64) -> bool {
+            cx.begin_turtle(
+                Walk { abs_pos: Some(dvec2(0.0, 0.0)), ..Walk::fixed(300.0, viewport) },
+                Layout::flow_down(),
+            );
+            cx.begin_turtle(Walk::fit(), Layout::flow_down());
+            let redraw = cx.will_redraw(list, Walk::fixed(300.0, 500.0));
+            cx.end_turtle();
+            cx.end_turtle();
+            redraw
+        }
+        with_turtle(dvec2(300.0, 600.0), Layout::flow_down(), |cx| {
+            let mut list = DrawList2d::new(cx);
+            assert!(will_redraw(cx, &mut list, 200.0));
+            assert!(!will_redraw(cx, &mut list, 200.0), "a growing turtle's clip doesn't redraw it every frame");
+            assert!(will_redraw(cx, &mut list, 150.0), "the viewport shrank");
+            assert!(!will_redraw(cx, &mut list, 150.0));
+        });
+    }
+
+    #[test]
+    fn the_turtle_clip_starts_over_at_a_root_turtle() {
+        with_turtle(dvec2(300.0, 600.0), Layout::flow_down(), |cx| {
+            cx.begin_turtle(Walk::fixed(100.0, 50.0), Layout::flow_down());
+            assert_eq!(cx.turtle_clip(), (dvec2(0.0, 0.0), dvec2(100.0, 50.0)));
+            // Like a tooltip drawn from inside that view.
+            cx.begin_root_turtle(dvec2(300.0, 600.0), Layout::flow_down());
+            assert_eq!(cx.turtle_clip(), (dvec2(0.0, 0.0), dvec2(300.0, 600.0)));
+            cx.end_pass_sized_turtle();
+        });
+    }
+
+    #[test]
     fn current_turtle_bounds_combine_legacy_and_walk_limits() {
         with_turtle(dvec2(300.0, 300.0), Layout::default(), |cx| {
             cx.begin_turtle(
@@ -3092,6 +3128,7 @@ pub struct Turtle {
     pos: Vec2d,
     origin: Vec2d,
     guard: Area,
+    root: bool,
 }
 
 impl Turtle {
@@ -4246,6 +4283,25 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         (top, bottom)
     }
 
+    /// What the open turtles clip the next walk to, back to the root turtle where clipping starts over.
+    /// f64 max/min skip the NaN of an axis a turtle doesn't clip, or can't yet while it grows.
+    pub(crate) fn turtle_clip(&self) -> (Vec2d, Vec2d) {
+        let mut clip = (
+            dvec2(f64::NEG_INFINITY, f64::NEG_INFINITY),
+            dvec2(f64::INFINITY, f64::INFINITY),
+        );
+        for turtle in self.turtles.iter().rev() {
+            if let AlignEntry::BeginClip(min, max) = &self.align_list[turtle.align_start] {
+                clip.0 = dvec2(clip.0.x.max(min.x), clip.0.y.max(min.y));
+                clip.1 = dvec2(clip.1.x.min(max.x), clip.1.y.min(max.y));
+            }
+            if turtle.root {
+                break;
+            }
+        }
+        clip
+    }
+
     fn content_bounds_for_turtle(
         &self,
         walk: &Walk,
@@ -4607,6 +4663,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             prev_row_metrics: Metrics::default(),
             current_row_metrics: Metrics::default(),
             guard: Area::Empty,
+            root: true,
         };
 
         self.turtles.push(turtle);
@@ -4712,6 +4769,7 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             prev_row_metrics: Metrics::default(),
             current_row_metrics: Metrics::default(),
             guard,
+            root: false,
         };
 
         self.turtles.push(turtle);
@@ -4829,20 +4887,14 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                                 .total_resolved_delta_to(walk.deferred_before_count),
                         )
                     };
-                    let rank = distribution_rank(
-                        &self.finished_walks[turtle_walks_start..walks_end],
-                        flow_index,
-                    );
-                    let distributed = if in_flow {
-                        group.map_or(0.0, |group| group.offset(distribute, rank))
-                    } else {
-                        0.0
-                    };
                     let main = delta
                         + if use_start {
                             start_dx
-                        } else if role == RowAlignRole::Shiftable {
-                            distributed
+                        } else if in_flow && role == RowAlignRole::Shiftable {
+                            group.map_or(0.0, |group| {
+                                let walks = &self.finished_walks[turtle_walks_start..walks_end];
+                                group.offset(distribute, distribution_rank(walks, flow_index))
+                            })
                         } else {
                             0.0
                         };
@@ -4894,14 +4946,13 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                                 walk.align_role,
                             )
                         };
-                        let rank = distribution_rank(
-                            &self.finished_walks[row_start..row_end],
-                            flow_index,
-                        );
                         let dx = if use_start {
                             start_dx
                         } else if in_flow && role == RowAlignRole::Shiftable {
-                            group.map_or(0.0, |group| group.offset(distribute, rank))
+                            group.map_or(0.0, |group| {
+                                let walks = &self.finished_walks[row_start..row_end];
+                                group.offset(distribute, distribution_rank(walks, flow_index))
+                            })
                         } else {
                             0.0
                         };
@@ -4956,20 +5007,14 @@ impl<'a, 'b> Cx2d<'a, 'b> {
                                 .total_resolved_delta_to(walk.deferred_before_count),
                         )
                     };
-                    let rank = distribution_rank(
-                        &self.finished_walks[turtle_walks_start..walks_end],
-                        flow_index,
-                    );
-                    let distributed = if in_flow {
-                        group.map_or(0.0, |group| group.offset(distribute, rank))
-                    } else {
-                        0.0
-                    };
                     let main = delta
                         + if use_start {
                             start_dy
-                        } else if role == RowAlignRole::Shiftable {
-                            distributed
+                        } else if in_flow && role == RowAlignRole::Shiftable {
+                            group.map_or(0.0, |group| {
+                                let walks = &self.finished_walks[turtle_walks_start..walks_end];
+                                group.offset(distribute, distribution_rank(walks, flow_index))
+                            })
                         } else {
                             0.0
                         };
@@ -5159,6 +5204,12 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             *clip_min = rect.pos;
             *clip_max = rect.pos + rect.size;
         }
+    }
+
+    /// Removes a clip rect from [`Self::push_clip_rect_tracked`] instead of popping it, so it clips nothing.
+    pub fn remove_clip_rect_at(&mut self, index: usize) {
+        debug_assert!(matches!(self.align_list[index], AlignEntry::BeginClip(..)));
+        self.align_list[index] = AlignEntry::Unset;
     }
 
     // Returns the end of the align list of the finished walk with the given index.
