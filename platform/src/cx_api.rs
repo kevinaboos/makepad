@@ -1668,6 +1668,12 @@ impl Cx {
         self.fingers.block_scrolling_within_area(None);
     }
 
+    /// Sets whether the mouse can drag-scroll, which it can by default.
+    /// A trackpad's click and drag counts as the mouse, while touches can always drag-scroll.
+    pub fn set_mouse_drag_scrolling(&mut self, is_enabled: bool) {
+        self.fingers.set_mouse_drag_scrolling(is_enabled);
+    }
+
     /// Whether `area` owns this scroll along `axis`. Each gesture goes to the first caller (call it
     /// after your children) that is a candidate: under the pointer and able to scroll that way.
     pub fn is_scroll_owner(&mut self, e: &ScrollEvent, area: Area, axis: Vec2Index, is_candidate: bool) -> bool {

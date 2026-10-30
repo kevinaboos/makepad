@@ -748,6 +748,9 @@ pub struct PortalList {
     grab_key_focus: bool,
     #[live(true)]
     drag_scrolling: bool,
+    /// Whether a horizontal list also scrolls sideways on vertical scrolls, like a mouse wheel's.
+    #[live]
+    use_vertical_finger_scroll: bool,
     /// The minimum distance (in pixels) a finger/mouse must move before a drag is
     /// "committed" and treated as a scroll gesture rather than a tap/click.
     /// This prevents accidental micro-scrolling when tapping interactive items.
@@ -1835,15 +1838,13 @@ impl PortalList {
     }
 
     /// Applies a wheel or trackpad scroll event that this list owns (see [`Cx::is_scroll_owner`]).
-    fn handle_scroll(&mut self, cx: &mut Cx, e: &ScrollEvent) {
-        let vi = self.vec_index;
+    fn handle_scroll(&mut self, cx: &mut Cx, e: &ScrollEvent, delta: f64) {
         // Trackpad scrolling on macOS is a gesture with phases: user-driven deltas
         // while the fingers move (`Began`/`Changed`), then the OS's own decaying
         // `Momentum` deltas after they lift. Both are applied exactly as delivered,
         // so the feel and the deceleration are the native ones, and the OS ending
         // its stream on a touch gives the native instant stop. Phase-less events
         // (`None`: wheels, X11, Windows) apply their delta directly.
-        let delta = -e.scroll.index(vi);
         match e.phase {
             ScrollPhase::Momentum => {
                 // Only a stream this list is expecting, applying, or riding
@@ -3058,7 +3059,7 @@ impl Widget for PortalList {
             && self.is_scrollable()
             && matches!(event.hits(cx, self.area), Hit::FingerScroll(_));
         let container_axes = match self.vec_index {
-            Vec2Index::X => [is_scroll_container, false],
+            Vec2Index::X => [is_scroll_container, is_scroll_container && self.use_vertical_finger_scroll],
             Vec2Index::Y => [false, is_scroll_container],
         };
         cx.begin_scroll_container(container_axes);
@@ -3353,8 +3354,17 @@ impl Widget for PortalList {
                 // unless a scrollable around it can.
                 let is_candidate = is_over && (self.is_scrollable() || !cx.is_inside_scroll_container(vi));
                 let is_owner = cx.is_scroll_owner(e, self.area, vi, is_candidate);
-                if is_owner || (is_over && e.phase == ScrollPhase::Touched) {
-                    self.handle_scroll(cx, e);
+                let mut delta = if is_owner { -e.scroll.index(vi) } else { 0.0 };
+                // Only a list that can scroll takes vertical scrolls sideways,
+                // so a horizontal list that fits leaves them to whatever's around it.
+                let is_vertical_owner = self.use_vertical_finger_scroll
+                    && vi == Vec2Index::X
+                    && cx.is_scroll_owner(e, self.area, Vec2Index::Y, is_over && self.is_scrollable());
+                if is_vertical_owner {
+                    delta -= e.scroll.y;
+                }
+                if is_owner || is_vertical_owner || (is_over && e.phase == ScrollPhase::Touched) {
+                    self.handle_scroll(cx, e, delta);
                 }
             }
             match hit {
@@ -3499,6 +3509,7 @@ impl Widget for PortalList {
                             self.update_item_selections(cx);
                         }
                     } else if self.drag_scrolling && fe.is_primary_hit()
+                        && (!fe.device.is_mouse() || cx.fingers.can_mouse_drag_scroll())
                         && cx.is_scrolling_allowed_within(&self.area)
                         && self.is_drag_scroll_allowed(cx, fe.digit_id)
                     {
