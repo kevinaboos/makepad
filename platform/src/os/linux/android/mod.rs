@@ -12,6 +12,8 @@ pub mod android_media;
 pub mod android_midi;
 pub mod android_network;
 pub mod android_performance_hint;
+#[cfg(not(use_vulkan))]
+pub mod android_shader_worker;
 pub mod android_video_playback;
 pub mod ndk_sys;
 pub mod ndk_utils;

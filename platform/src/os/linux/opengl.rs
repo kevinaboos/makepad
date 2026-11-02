@@ -555,8 +555,6 @@ impl Cx {
                     self.render_view_inner(draw_pass_id, sub_list_id, child_zbias, zbias_step);
                 }
             } else {
-                let gl = self.os.gl();
-
                 let (draw_list, upload_budget) =
                     self.draw_lists.list_and_upload_budget(draw_list_id);
                 let draw_item = &mut draw_list.draw_items[draw_item_id];
@@ -578,6 +576,22 @@ impl Cx {
 
                 let shader_variant = self.passes[draw_pass_id].os.shader_variant;
 
+                // After the first frame, a program that isn't built yet loads from the cache,
+                // or we skip its draw until the background worker delivers it.
+                #[cfg(all(target_os = "android", not(use_vulkan)))]
+                if shader_variant == SHADER_VARIANT_WINDOW
+                    && matches!(shp.gl_shader[shader_variant], None | Some(GlShaderState::Queued))
+                    && !self.os.load_shader_worker_program(
+                        shp,
+                        sh.os_shader_id.unwrap(),
+                        &sh.mapping,
+                        &self.os_type,
+                        draw_pass_id,
+                    )
+                {
+                    continue;
+                }
+
                 shp.ensure_gl_shader_started(
                     self.os.gl(),
                     shader_variant,
@@ -585,15 +599,17 @@ impl Cx {
                     &self.os_type,
                 );
                 shp.poll_gl_shader_ready(self.os.gl(), shader_variant, &sh.mapping, &self.os_type);
-                let Some(shgl) = shp.gl_shader[shader_variant]
-                    .as_ref()
-                    .and_then(GlShaderState::as_ready)
-                else {
-                    crate::trace!("gl.repaint", "shader not ready");
-                    self.demo_time_repaint = true;
-                    self.passes[draw_pass_id].repaint_next = true;
-                    continue;
+                let shgl = match &shp.gl_shader[shader_variant] {
+                    Some(GlShaderState::Ready(shgl)) => shgl,
+                    Some(GlShaderState::Queued | GlShaderState::Failed) => continue,
+                    Some(GlShaderState::Pending(_)) | None => {
+                        crate::trace!("gl.repaint", "shader not ready");
+                        self.demo_time_repaint = true;
+                        self.passes[draw_pass_id].repaint_next = true;
+                        continue;
+                    }
                 };
+                let gl = self.os.gl();
                 let trace_draw = crate::makepad_error_log::trace_enabled("gl.draw");
 
                 // A refused retained allocation leaves this item without
@@ -1101,7 +1117,16 @@ impl Cx {
                                 (gl.glBindTexture)(bind_target, 0);
                             }
                         } else {
-                            (gl.glBindTexture)(expected_target, 0);
+                            // GL's texture 0 samples as opaque black, so an empty slot (like a still-loading
+                            // image) gets the transparent null texture instead, matching the other backends.
+                            let null_texture_id = if expected_target == gl_sys::TEXTURE_CUBE_MAP {
+                                self.null_cube_texture.texture_id()
+                            } else {
+                                self.null_texture.texture_id()
+                            };
+                            let null_texture = &mut self.textures[null_texture_id];
+                            null_texture.update_vec_texture(gl, &self.os_type);
+                            (gl.glBindTexture)(expected_target, null_texture.os.gl_texture.unwrap_or(0));
                         }
                         // Each sampler uniform's unit is set once at link, and since we never create
                         // sampler objects (see `opengl_create_samplers`), every unit stays on sampler 0.
@@ -1428,9 +1453,11 @@ impl Cx {
 
     pub fn opengl_compile_shaders(&mut self) {
         let compile_set = std::mem::take(&mut self.draw_shaders.compile_set);
+        // Without parallel compiles every program blocks this thread, so we leave each one
+        // to its first draw, or to Android's background worker once that's running.
+        let compile_ahead = GlShader::supports_parallel_compile(self.os.gl());
 
         for shader_index in compile_set {
-            let mapping = self.draw_shaders.shaders[shader_index].mapping.clone();
             let os_shader_id = {
                 let cx_shader = &mut self.draw_shaders.shaders[shader_index];
                 if cx_shader.os_shader_id.is_none() {
@@ -1455,13 +1482,23 @@ impl Cx {
                     if cx_shader.os_shader_id.is_none() {
                         let shp = CxOsDrawShader::new(self.os.gl(), &vertex, &pixel, &self.os_type);
                         cx_shader.os_shader_id = Some(self.draw_shaders.os_shaders.len());
+                        #[cfg(all(target_os = "android", not(use_vulkan)))]
+                        self.os.queue_shader_worker_build(
+                            self.draw_shaders.os_shaders.len(),
+                            &shp,
+                            &self.os_type,
+                        );
                         self.draw_shaders.os_shaders.push(shp);
                     }
                 }
                 cx_shader.os_shader_id
             };
 
+            if !compile_ahead {
+                continue;
+            }
             if let Some(os_shader_id) = os_shader_id {
+                let mapping = self.draw_shaders.shaders[shader_index].mapping.clone();
                 let os_shader = &mut self.draw_shaders.os_shaders[os_shader_id];
                 os_shader.ensure_gl_shader_started(
                     self.os.gl(),
@@ -1515,11 +1552,33 @@ impl Cx {
         }
     }
 
-    pub fn is_draw_shader_window_ready(&self, shader_id: DrawShaderId) -> bool {
-        let Some(os_shader_id) = self.draw_shaders.shaders[shader_id.index].os_shader_id else {
+    pub fn is_draw_shader_window_ready(&mut self, shader_id: DrawShaderId) -> bool {
+        // Vulkan has no GL context to compile with, so its shaders never count as ready here.
+        #[cfg(use_vulkan)]
+        if self.os.vulkan_active() {
+            return false;
+        }
+        let cx_shader = &self.draw_shaders.shaders[shader_id.index];
+        let Some(os_shader_id) = cx_shader.os_shader_id else {
             return false;
         };
-        self.draw_shaders.os_shaders[os_shader_id].is_window_gl_shader_ready()
+        // A shader may be waiting for its first draw to compile, so asking about it starts that.
+        let os_shader = &mut self.draw_shaders.os_shaders[os_shader_id];
+        os_shader.ensure_gl_shader_started(self.os.gl(), SHADER_VARIANT_WINDOW, &cx_shader.mapping, &self.os_type);
+        os_shader.poll_gl_shader_ready(self.os.gl(), SHADER_VARIANT_WINDOW, &cx_shader.mapping, &self.os_type);
+        os_shader.is_window_gl_shader_ready()
+    }
+
+    /// Whether this shader might still become ready, which it can't once the driver rejects it or while Vulkan renders.
+    pub fn can_draw_shader_window_become_ready(&self, shader_id: DrawShaderId) -> bool {
+        #[cfg(use_vulkan)]
+        if self.os.vulkan_active() {
+            return false;
+        }
+        self.draw_shaders.shaders[shader_id.index].os_shader_id.is_none_or(|os_shader_id| !matches!(
+            self.draw_shaders.os_shaders[os_shader_id].gl_shader[SHADER_VARIANT_WINDOW],
+            Some(GlShaderState::Failed)
+        ))
     }
     /*
     pub fn maybe_warn_hardware_support(&self) {
@@ -1580,20 +1639,18 @@ pub struct GlShaderUniforms {
 pub enum GlShaderState {
     Ready(GlShader),
     Pending(PendingGlShader),
+    /// Android's background worker is building it, so we skip its draws until it arrives.
+    Queued,
+    /// The driver rejected this shader, so its draws are skipped.
+    Failed,
 }
 
 impl GlShaderState {
-    fn as_ready(&self) -> Option<&GlShader> {
-        match self {
-            Self::Ready(shader) => Some(shader),
-            Self::Pending(_) => None,
-        }
-    }
-
     fn free_resources(self, gl: &LibGl) {
         match self {
             Self::Ready(shader) => shader.free_resources(gl),
             Self::Pending(shader) => shader.free_resources(gl),
+            Self::Queued | Self::Failed => {}
         }
     }
 }
@@ -1613,7 +1670,7 @@ impl PendingGlShader {
         }
     }
 
-    fn free_resources(self, gl: &LibGl) {
+    pub(crate) fn free_resources(self, gl: &LibGl) {
         unsafe {
             (gl.glDeleteShader)(self.vertex_shader);
             (gl.glDeleteShader)(self.fragment_shader);
@@ -1701,7 +1758,7 @@ impl GlShader {
             .collect()
     }
 
-    fn supports_parallel_compile(gl: &LibGl) -> bool {
+    pub(crate) fn supports_parallel_compile(gl: &LibGl) -> bool {
         *gl.parallel_compile.get_or_init(|| {
             let supported = get_gl_string(gl, gl_sys::EXTENSIONS)
                 .split_whitespace()
@@ -1720,7 +1777,7 @@ impl GlShader {
     }
 
     #[cfg(not(ohos_sim))]
-    fn program_cache_path(
+    pub(crate) fn program_cache_path(
         gl: &LibGl,
         cache_dir: &str,
         vertex: &str,
@@ -1762,65 +1819,72 @@ impl GlShader {
     }
 
     #[cfg(not(ohos_sim))]
-    fn read_program_cache(gl: &LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Option<u32> {
-        if let Some(cache_dir) = os_type.get_cache_dir() {
-            let filename = Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
-
-            if let Ok(mut cache_file) = File::open(&filename) {
-                let mut binary = Vec::new();
-                let mut format_bytes = [0u8; 4];
-                match cache_file.read(&mut format_bytes) {
-                    Ok(_bytes_read) => {
-                        let binary_format = u32::from_be_bytes(format_bytes);
-                        match cache_file.read_to_end(&mut binary) {
-                            Ok(_full_bytes) => unsafe {
-                                let program = (gl.glCreateProgram)();
-                                (gl.glProgramBinary)(
-                                    program,
-                                    binary_format,
-                                    binary.as_ptr() as *const _,
-                                    binary.len() as i32,
-                                );
-                                if let Some(error) = GlShader::opengl_has_shader_error(
-                                    gl,
-                                    false,
-                                    program as usize,
-                                    "",
-                                ) {
-                                    // A cached program binary that no longer loads is
-                                    // expected and recoverable (e.g. after a GPU driver
-                                    // update changes the binary format). The caller falls
-                                    // back to compiling from source and overwrites this
-                                    // stale entry, so warn rather than error.
-                                    crate::warning!(
-                                        "Ignoring stale shader cache entry (will recompile): SHADER::CACHE::PROGRAM_BINARY_FAILED\n{}",
-                                        error
-                                    );
-                                    (gl.glDeleteProgram)(program);
-                                    let _ = remove_file(&filename);
-                                    return None;
-                                }
-                                return Some(program);
-                            },
-                            Err(e) => {
-                                crate::warning!(
-                                    "Failed to read the full shader cache file {filename}, error: {e}"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        crate::warning!(
-                            "Failed to read format bytes from shader cache file {filename}, error: {e}"
-                        );
-                    }
-                }
+    pub(crate) fn read_program_cache(
+        gl: &LibGl,
+        vertex: &str,
+        pixel: &str,
+        os_type: &OsType,
+    ) -> Option<u32> {
+        let cache_dir = os_type.get_cache_dir()?;
+        let filename = Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
+        let mut cache_file = File::open(&filename).ok()?;
+        let mut format_bytes = [0u8; 4];
+        if let Err(e) = cache_file.read(&mut format_bytes) {
+            crate::warning!(
+                "Failed to read format bytes from shader cache file {filename}, error: {e}"
+            );
+            return None;
+        }
+        let mut binary = Vec::new();
+        if let Err(e) = cache_file.read_to_end(&mut binary) {
+            crate::warning!("Failed to read the full shader cache file {filename}, error: {e}");
+            return None;
+        }
+        match Self::load_program_binary(gl, u32::from_be_bytes(format_bytes), &binary) {
+            Ok(program) => Some(program),
+            Err(error) => {
+                // A cached program binary that no longer loads is
+                // expected and recoverable (e.g. after a GPU driver
+                // update changes the binary format). The caller falls
+                // back to compiling from source and overwrites this
+                // stale entry, so warn rather than error.
+                crate::warning!(
+                    "Ignoring stale shader cache entry (will recompile): SHADER::CACHE::PROGRAM_BINARY_FAILED\n{}",
+                    error
+                );
+                let _ = remove_file(&filename);
+                None
             }
         }
-        None
     }
 
-    fn start_pending_program_compile(
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn load_program_binary(
+        gl: &LibGl,
+        binary_format: u32,
+        binary: &[u8],
+    ) -> Result<u32, String> {
+        unsafe {
+            let program = (gl.glCreateProgram)();
+            // Without a current context we'd get 0 back, and its error check would still pass.
+            if program == 0 {
+                return Err("no GL context is current".to_string());
+            }
+            (gl.glProgramBinary)(
+                program,
+                binary_format,
+                binary.as_ptr() as *const _,
+                binary.len() as i32,
+            );
+            if let Some(error) = GlShader::opengl_has_shader_error(gl, false, program as usize, "") {
+                (gl.glDeleteProgram)(program);
+                return Err(error);
+            }
+            Ok(program)
+        }
+    }
+
+    pub(crate) fn start_pending_program_compile(
         gl: &LibGl,
         vertex: &str,
         pixel: &str,
@@ -1910,6 +1974,14 @@ impl GlShader {
             let program = (gl.glCreateProgram)();
             (gl.glAttachShader)(program, vs);
             (gl.glAttachShader)(program, fs);
+            // A driver may only hand back a binary for our cache if we ask before linking.
+            if let Some(set_program_parameter) = gl.glProgramParameteri {
+                set_program_parameter(
+                    program,
+                    gl_sys::PROGRAM_BINARY_RETRIEVABLE_HINT,
+                    gl_sys::TRUE as i32,
+                );
+            }
             (gl.glLinkProgram)(program);
 
             PendingGlShader {
@@ -1922,65 +1994,99 @@ impl GlShader {
 
     #[cfg(not(ohos_sim))]
     fn write_program_cache(gl: &LibGl, program: u32, vertex: &str, pixel: &str, os_type: &OsType) {
-        if let Some(cache_dir) = os_type.get_cache_dir() {
-            unsafe {
-                let mut binary = Vec::new();
-                let mut binary_len = 0;
-                (gl.glGetProgramiv)(program, gl_sys::PROGRAM_BINARY_LENGTH, &mut binary_len);
-                if binary_len != 0 {
-                    binary.resize(binary_len as usize, 0u8);
-                    let mut return_size = 0i32;
-                    let mut binary_format = 0u32;
-                    (gl.glGetProgramBinary)(
-                        program,
-                        binary.len() as i32,
-                        &mut return_size as *mut _,
-                        &mut binary_format as *mut _,
-                        binary.as_mut_ptr() as *mut _,
-                    );
-                    if return_size != 0 {
-                        let filename =
-                            Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
-                        binary.resize(return_size as usize, 0u8);
-                        match File::create(&filename) {
-                            Ok(mut cache) => {
-                                let res1 = cache.write_all(&binary_format.to_be_bytes());
-                                let res2 = cache.write_all(&binary);
-                                if res1.is_err() || res2.is_err() {
-                                    crate::error!(
-                                        "Failed to write shader binary to shader cache {filename}"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                crate::error!(
-                                    "Failed to write shader cache to {filename}, error: {e}"
-                                );
-                            }
-                        }
-                        // On Android, the first write in a context deletes the binaries an
-                        // older OS build, GL driver or key hasher left behind.
-                        if let Some(suffix) = gl.android_cache_suffix.get() {
-                            gl.stale_cache_sweep.call_once(|| {
-                                let Ok(entries) = std::fs::read_dir(&cache_dir) else {
-                                    return;
-                                };
-                                for entry in entries.flatten() {
-                                    let name = entry.file_name();
-                                    let name = name.to_string_lossy();
-                                    if name.starts_with("shader_")
-                                        && name.ends_with(".bin")
-                                        && !name.ends_with(suffix.as_str())
-                                    {
-                                        let _ = remove_file(entry.path());
-                                    }
-                                }
-                            });
-                        }
-                    }
+        let Some(cache_dir) = os_type.get_cache_dir() else {
+            return;
+        };
+        let Some((binary_format, binary)) = Self::get_program_binary(gl, program) else {
+            return;
+        };
+        let filename = Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
+        if let Err(e) = Self::write_cache_file(&filename, binary_format, &binary) {
+            crate::error!("Failed to write shader cache to {filename}, error: {e}");
+        }
+        // On Android, the first write in a context deletes the binaries an
+        // older OS build, GL driver or key hasher left behind.
+        gl.stale_cache_sweep.call_once(|| {
+            let android_suffix = gl.android_cache_suffix.get().map(String::as_str);
+            Self::remove_stale_cache_files(&cache_dir, android_suffix);
+        });
+    }
+
+    /// Also deletes the temp files a process left behind when it got killed mid-write. Desktop apps
+    /// share one cache dir, so we only take those whose process is gone.
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn remove_stale_cache_files(cache_dir: &str, android_suffix: Option<&str>) {
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_stale = match name.rsplit_once(".bin.") {
+                Some((_, temp)) => {
+                    temp.ends_with(".tmp")
+                        && temp.split_once('-').is_none_or(|(pid, _)| {
+                            !std::path::Path::new(&format!("/proc/{pid}")).exists()
+                        })
                 }
+                None => android_suffix
+                    .is_some_and(|suffix| name.ends_with(".bin") && !name.ends_with(suffix)),
+            };
+            if name.starts_with("shader_") && is_stale {
+                let _ = remove_file(entry.path());
             }
         }
+    }
+
+    /// The driver's binary for a linked program, if it hands one back.
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn get_program_binary(gl: &LibGl, program: u32) -> Option<(u32, Vec<u8>)> {
+        unsafe {
+            let mut binary_len = 0;
+            (gl.glGetProgramiv)(program, gl_sys::PROGRAM_BINARY_LENGTH, &mut binary_len);
+            if binary_len == 0 {
+                return None;
+            }
+            let mut binary = vec![0u8; binary_len as usize];
+            let mut return_size = 0i32;
+            let mut binary_format = 0u32;
+            (gl.glGetProgramBinary)(
+                program,
+                binary.len() as i32,
+                &mut return_size as *mut _,
+                &mut binary_format as *mut _,
+                binary.as_mut_ptr() as *mut _,
+            );
+            if return_size == 0 {
+                return None;
+            }
+            binary.truncate(return_size as usize);
+            Some((binary_format, binary))
+        }
+    }
+
+    /// Writes through a temp file, so a reader never sees half of a cache file.
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn write_cache_file(
+        filename: &str,
+        binary_format: u32,
+        binary: &[u8],
+    ) -> std::io::Result<()> {
+        let temp_filename = format!(
+            "{filename}.{}-{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let result = File::create(&temp_filename)
+            .and_then(|mut cache| {
+                cache.write_all(&binary_format.to_be_bytes())?;
+                cache.write_all(binary)
+            })
+            .and_then(|()| std::fs::rename(&temp_filename, filename));
+        if result.is_err() {
+            let _ = remove_file(&temp_filename);
+        }
+        result
     }
 
     #[cfg(ohos_sim)]
@@ -1998,32 +2104,13 @@ impl GlShader {
         pending: PendingGlShader,
         vertex: &str,
         pixel: &str,
+        mapping: &CxDrawShaderMapping,
         os_type: &OsType,
-    ) -> u32 {
-        Self::opengl_log_shader_info(gl, true, pending.vertex_shader as usize, "vertex", vertex);
-        if let Some(error) =
-            Self::opengl_has_shader_error(gl, true, pending.vertex_shader as usize, vertex)
-        {
-            panic!("ERROR::SHADER::VERTEX::COMPILATION_FAILED\n{}", error);
-        }
-
-        Self::opengl_log_shader_info(
-            gl,
-            true,
-            pending.fragment_shader as usize,
-            "fragment",
-            pixel,
-        );
-        if let Some(error) =
-            Self::opengl_has_shader_error(gl, true, pending.fragment_shader as usize, pixel)
-        {
-            panic!("ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n{}", error);
-        }
-
-        Self::opengl_log_shader_info(gl, false, pending.program as usize, "program", "");
-        if let Some(error) = Self::opengl_has_shader_error(gl, false, pending.program as usize, "")
-        {
-            panic!("ERROR::SHADER::LINK::COMPILATION_FAILED\n{}", error);
+    ) -> GlShaderState {
+        if let Some(error) = Self::get_pending_program_error(gl, &pending, vertex, pixel) {
+            crate::error!("{}", error);
+            pending.free_resources(gl);
+            return GlShaderState::Failed;
         }
 
         unsafe {
@@ -2031,10 +2118,38 @@ impl GlShader {
             (gl.glDeleteShader)(pending.fragment_shader);
         }
         Self::write_program_cache(gl, pending.program, vertex, pixel, os_type);
-        pending.program
+        GlShaderState::Ready(Self::build_from_program(gl, pending.program, mapping))
     }
 
-    fn build_from_program(gl: &LibGl, program: u32, mapping: &CxDrawShaderMapping) -> Self {
+    /// The driver's compile or link error for a program, after logging its info logs.
+    pub(crate) fn get_pending_program_error(
+        gl: &LibGl,
+        pending: &PendingGlShader,
+        vertex: &str,
+        pixel: &str,
+    ) -> Option<String> {
+        Self::opengl_log_shader_info(gl, true, pending.vertex_shader as usize, "vertex", vertex);
+        Self::opengl_has_shader_error(gl, true, pending.vertex_shader as usize, vertex)
+            .map(|error| format!("ERROR::SHADER::VERTEX::COMPILATION_FAILED\n{}", error))
+            .or_else(|| {
+                Self::opengl_log_shader_info(
+                    gl,
+                    true,
+                    pending.fragment_shader as usize,
+                    "fragment",
+                    pixel,
+                );
+                Self::opengl_has_shader_error(gl, true, pending.fragment_shader as usize, pixel)
+                    .map(|error| format!("ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n{}", error))
+            })
+            .or_else(|| {
+                Self::opengl_log_shader_info(gl, false, pending.program as usize, "program", "");
+                Self::opengl_has_shader_error(gl, false, pending.program as usize, "")
+                    .map(|error| format!("ERROR::SHADER::LINK::COMPILATION_FAILED\n{}", error))
+            })
+    }
+
+    pub(crate) fn build_from_program(gl: &LibGl, program: u32, mapping: &CxDrawShaderMapping) -> Self {
         unsafe {
             (gl.glUseProgram)(program);
 
@@ -2114,9 +2229,14 @@ impl GlShader {
             ));
         }
 
+        // This compile blocks our thread, so we ask Java to explain the wait.
+        // It only shows its compile screen if our first frame hasn't been drawn yet.
+        #[cfg(target_os = "android")]
+        unsafe {
+            crate::os::linux::android::android_jni::to_java_show_shader_compile_screen();
+        }
         let pending = Self::start_pending_program_compile(gl, vertex, pixel, os_type);
-        let program = Self::finish_pending_program_compile(gl, pending, vertex, pixel, os_type);
-        GlShaderState::Ready(Self::build_from_program(gl, program, mapping))
+        Self::finish_pending_program_compile(gl, pending, vertex, pixel, mapping, os_type)
     }
 
     pub fn set_uniform_array(gl: &LibGl, loc: &OpenglUniform, array: &[f32]) {
@@ -2458,23 +2578,21 @@ impl CxOsDrawShader {
             return;
         }
 
-        let program = GlShader::finish_pending_program_compile(
+        self.gl_shader[shader_variant] = Some(GlShader::finish_pending_program_compile(
             gl,
             pending,
             &self.vertex[shader_variant],
             &self.pixel[shader_variant],
+            mapping,
             os_type,
-        );
-        self.gl_shader[shader_variant] = Some(GlShaderState::Ready(GlShader::build_from_program(
-            gl, program, mapping,
-        )));
+        ));
     }
 
     pub fn is_window_gl_shader_ready(&self) -> bool {
-        self.gl_shader[SHADER_VARIANT_WINDOW]
-            .as_ref()
-            .and_then(GlShaderState::as_ready)
-            .is_some()
+        matches!(
+            self.gl_shader[SHADER_VARIANT_WINDOW],
+            Some(GlShaderState::Ready(_))
+        )
     }
 
     #[cfg(use_vulkan)]
@@ -2691,7 +2809,7 @@ impl CxOsDrawShader {
     }
 }
 
-fn get_gl_string(gl: &LibGl, key: gl_sys::GLenum) -> String {
+pub(crate) fn get_gl_string(gl: &LibGl, key: gl_sys::GLenum) -> String {
     unsafe {
         let string_ptr = (gl.glGetString)(key) as *const c_char;
         if string_ptr == ptr::null() {
