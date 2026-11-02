@@ -514,6 +514,16 @@ impl ViewRef {
         }
     }
 
+    /// See [`View::scroll_pos()`].
+    pub fn scroll_pos(&self) -> Vec2d {
+        self.borrow().map_or(Vec2d::default(), |inner| inner.scroll_pos())
+    }
+
+    /// See [`View::max_scroll_pos()`].
+    pub fn max_scroll_pos(&self) -> Vec2d {
+        self.borrow().map_or(Vec2d::default(), |inner| inner.max_scroll_pos())
+    }
+
     pub fn area(&self) -> Area {
         if let Some(inner) = self.borrow_mut() {
             inner.area
@@ -1362,6 +1372,19 @@ impl View {
         } else {
             self.layout.scroll = v;
         }
+    }
+
+    /// This view's scroll position, not counting any rubber-band stretch past either end of its content.
+    pub fn scroll_pos(&self) -> Vec2d {
+        match &self.scroll_bars_obj {
+            Some(scroll_bars) => scroll_bars.get_unstretched_scroll_pos(),
+            None => self.layout.scroll,
+        }
+    }
+
+    /// The furthest this view's scroll bars can scroll it, as of its last draw.
+    pub fn max_scroll_pos(&self) -> Vec2d {
+        self.scroll_bars_obj.as_ref().map_or(Vec2d::default(), |scroll_bars| scroll_bars.get_max_scroll_pos())
     }
 
     pub fn area(&self) -> Area {

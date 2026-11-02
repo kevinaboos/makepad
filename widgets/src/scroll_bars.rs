@@ -59,6 +59,21 @@ impl ScrollBars {
         self.scroll
     }
 
+    /// The scroll position without any rubber-band stretch past either end, like `set_scroll_pos` takes.
+    pub fn get_unstretched_scroll_pos(&self) -> Vec2d {
+        dvec2(self.scroll_bar_x.get_scroll_pos(), self.scroll_bar_y.get_scroll_pos())
+    }
+
+    /// The furthest that `set_scroll_pos` can scroll the view, as of its last draw.
+    pub fn get_max_scroll_pos(&self) -> Vec2d {
+        let max = |is_shown: bool, bar: &ScrollBar| if is_shown {
+            (bar.get_scroll_view_total() - bar.get_scroll_view_visible()).max(0.0)
+        } else {
+            0.0
+        };
+        dvec2(max(self.show_scroll_x, &self.scroll_bar_x), max(self.show_scroll_y, &self.scroll_bar_y))
+    }
+
     /// Whether a shown bar scrolls its view when a finger or the mouse drags the content.
     pub fn has_drag_scrolling(&self) -> bool {
         (self.show_scroll_x && self.scroll_bar_x.drag_scrolling())
