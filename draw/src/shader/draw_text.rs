@@ -638,7 +638,9 @@ script_mod! {
                 1.0,
             )
             let bias = (0.5 - luma) * self.sdf_luma_bias
-            a = clamp(a - bias, 0.0, 1.0)
+            if a > self.sdf_luma_bias * 0.5 {
+                a = clamp(a - bias, 0.0, 1.0)
+            }
             return a
         }
 
@@ -749,9 +751,6 @@ script_mod! {
         radius: uniform(float)
         cutoff: uniform(float)
         aa_pad_px: uniform(float(1.0))
-        slug_matrix_0: uniform(vec4(1.0, 0.0, 0.0, 0.0))
-        slug_matrix_1: uniform(vec4(0.0, 1.0, 0.0, 0.0))
-        slug_matrix_3: uniform(vec4(0.0, 0.0, 0.0, 1.0))
         slug_viewport_px: uniform(vec2(1.0, 1.0))
         total_chars: instance(1000000.0)
 
@@ -767,17 +766,16 @@ script_mod! {
 
         slug_dilate: fn(pos: vec2, tex: vec2, jac: vec4, normal: vec2) -> vec4 {
             let n = normalize(normal)
-            let s = dot(self.slug_matrix_3.xy, pos) + self.slug_matrix_3.w
-            let t = dot(self.slug_matrix_3.xy, n)
+            // Pass cameras are only set at paint time, so we can't bake this into a uniform while drawing.
+            let world_pos = self.draw_list.view_transform * vec4(pos.x, pos.y, 0.0, 1.0)
+            let world_n = self.draw_list.view_transform * vec4(n.x, n.y, 0.0, 0.0)
+            let hp = self.draw_pass.camera_projection * (self.draw_pass.camera_view * world_pos)
+            let hn = self.draw_pass.camera_projection * (self.draw_pass.camera_view * world_n)
+            let s = hp.w
+            let t = hn.w
 
-            let u = (
-                s * dot(self.slug_matrix_0.xy, n)
-                    - t * (dot(self.slug_matrix_0.xy, pos) + self.slug_matrix_0.w)
-            ) * self.slug_viewport_px.x
-            let v = (
-                s * dot(self.slug_matrix_1.xy, n)
-                    - t * (dot(self.slug_matrix_1.xy, pos) + self.slug_matrix_1.w)
-            ) * self.slug_viewport_px.y
+            let u = (s * hn.x - t * hp.x) * self.slug_viewport_px.x
+            let v = (s * hn.y - t * hp.y) * self.slug_viewport_px.y
 
             let s2 = s * s
             let st = s * t
@@ -863,7 +861,10 @@ script_mod! {
             // dark text on light backgrounds usually appears softer than the inverse,
             // so we bias coverage slightly by text luminance.
             let bias = (0.5 - luma) * self.sdf_luma_bias;
-            a = clamp(a - bias, 0.0, 1.0);
+            // Avoid lifting near-zero background alpha into visible gray quads on light text.
+            if a > self.sdf_luma_bias * 0.5 {
+                a = clamp(a - bias, 0.0, 1.0);
+            }
             return a
         }
 
@@ -884,41 +885,6 @@ script_mod! {
                 a = clamp(a - bias, 0.0, 1.0);
             }
             return a
-        }
-
-        fetch_curve_texel: fn(texel_idx: float) -> vec4 {
-            let tex_size = self.curve_texture.size()
-            let row = floor(texel_idx / tex_size.x)
-            let col = texel_idx - row * tex_size.x
-            let uv = vec2(
-                (col + 0.5) / tex_size.x,
-                (row + 0.5) / tex_size.y
-            )
-            return self.curve_texture.sample_nearest(uv)
-        }
-
-        fetch_band_texel: fn(texel_idx: float) -> vec4 {
-            let tex_size = self.band_texture.size()
-            let row = floor(texel_idx / tex_size.x)
-            let col = texel_idx - row * tex_size.x
-            let uv = vec2(
-                (col + 0.5) / tex_size.x,
-                (row + 0.5) / tex_size.y
-            )
-            return self.band_texture.sample_nearest(uv)
-        }
-
-        pick_channel: fn(v: vec4, channel: float) -> float {
-            if channel < 0.5 {
-                return v.x
-            }
-            if channel < 1.5 {
-                return v.y
-            }
-            if channel < 2.5 {
-                return v.z
-            }
-            return v.w
         }
 
         slug_curve_offset: fn() -> float {
@@ -988,140 +954,54 @@ script_mod! {
             )
         }
 
-        scan_horizontal_list: fn(list_offset: float, list_count: float, sample: vec2, px_size: float) -> vec2 {
-            let limit = floor(list_count + 0.5)
-            var coverage = 0.0
-            var weight = 0.0
-
-            var j = 0.0
-            loop {
-                if j >= limit { break }
-
-                let packed_idx = floor(j * 0.25)
-                let channel = j - packed_idx * 4.0
-                let idx_data = self.fetch_band_texel(list_offset + packed_idx)
-                let curve_idx = self.pick_channel(idx_data, channel)
-
-                let p12 = self.fetch_curve_texel(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
-                let p3 = self.fetch_curve_texel(curve_idx * 2.0 + 1.0).xy - sample
-                if max(max(p12.x, p12.z), p3.x) / px_size < -0.5 { break }
-
-                let code = self.calc_root_code(p12.y, p12.w, p3.y)
-                if code != u32(0) {
-                    let r = self.solve_horiz_poly(p12, p3) / px_size
-                    if (code & u32(1)) != u32(0) {
-                        coverage = coverage + self.saturate(r.x + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.x) * 2.0))
-                    }
-                    if code > u32(1) {
-                        coverage = coverage - self.saturate(r.y + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.y) * 2.0))
-                    }
-                }
-
-                j = j + 1.0
-            }
-
-            return vec2(coverage, weight)
+        // The run's first texel u, its row's v, and how far u moves per texel.
+        calc_texel_run_uv: fn(tex_size: vec2, first_texel: float) -> vec3 {
+            let row = floor((first_texel + 0.5) / tex_size.x)
+            let du = 1.0 / tex_size.x
+            return vec3((first_texel - row * tex_size.x + 0.5) * du, (row + 0.5) / tex_size.y, du)
         }
 
-        scan_vertical_list: fn(list_offset: float, list_count: float, sample: vec2, px_size: float) -> vec2 {
-            let limit = floor(list_count + 0.5)
-            var coverage = 0.0
-            var weight = 0.0
-
-            var j = 0.0
-            loop {
-                if j >= limit { break }
-
-                let packed_idx = floor(j * 0.25)
-                let channel = j - packed_idx * 4.0
-                let idx_data = self.fetch_band_texel(list_offset + packed_idx)
-                let curve_idx = self.pick_channel(idx_data, channel)
-
-                let p12 = self.fetch_curve_texel(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
-                let p3 = self.fetch_curve_texel(curve_idx * 2.0 + 1.0).xy - sample
-                if max(max(p12.y, p12.w), p3.y) / px_size < -0.5 { break }
-
-                let code = self.calc_root_code(p12.x, p12.z, p3.x)
-                if code != u32(0) {
-                    let r = self.solve_vert_poly(p12, p3) / px_size
-                    if (code & u32(1)) != u32(0) {
-                        coverage = coverage - self.saturate(r.x + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.x) * 2.0))
-                    }
-                    if code > u32(1) {
-                        coverage = coverage + self.saturate(r.y + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.y) * 2.0))
-                    }
+        scan_h_curve: fn(sums: vec2, entry: float, curves: vec3, sample_xyxy: vec4, px: float) -> vec3 {
+            let u = curves.x + entry * curves.z
+            let p12 = self.curve_texture.sample_nearest(vec2(u, curves.y), 0.0) - sample_xyxy
+            let p3 = self.curve_texture.sample_nearest(vec2(u + curves.z, curves.y), 0.0).xy - sample_xyxy.xy
+            var coverage = sums.x
+            var weight = sums.y
+            let code = self.calc_root_code(p12.y, p12.w, p3.y)
+            if code != u32(0) {
+                let r = self.solve_horiz_poly(p12, p3) / px
+                if (code & u32(1)) != u32(0) {
+                    coverage = coverage + self.saturate(r.x + 0.5)
+                    weight = max(weight, self.saturate(1.0 - abs(r.x) * 2.0))
                 }
-
-                j = j + 1.0
+                if code > u32(1) {
+                    coverage = coverage - self.saturate(r.y + 0.5)
+                    weight = max(weight, self.saturate(1.0 - abs(r.y) * 2.0))
+                }
             }
-
-            return vec2(coverage, weight)
+            // z is how far the curve reaches past the sample along the ray, in pixels.
+            return vec3(coverage, weight, max(max(p12.x, p12.z), p3.x) / px)
         }
 
-        scan_horizontal_all: fn(sample: vec2, px_size: float) -> vec2 {
-            let limit = floor(self.slug_curve_count() + 0.5)
-            var coverage = 0.0
-            var weight = 0.0
-
-            var i = 0.0
-            loop {
-                if i >= limit { break }
-
-                let curve_idx = self.slug_curve_offset() + i
-                let p12 = self.fetch_curve_texel(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
-                let p3 = self.fetch_curve_texel(curve_idx * 2.0 + 1.0).xy - sample
-                let code = self.calc_root_code(p12.y, p12.w, p3.y)
-                if code != u32(0) {
-                    let r = self.solve_horiz_poly(p12, p3) / px_size
-                    if (code & u32(1)) != u32(0) {
-                        coverage = coverage + self.saturate(r.x + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.x) * 2.0))
-                    }
-                    if code > u32(1) {
-                        coverage = coverage - self.saturate(r.y + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.y) * 2.0))
-                    }
+        scan_v_curve: fn(sums: vec2, entry: float, curves: vec3, sample_xyxy: vec4, px: float) -> vec3 {
+            let u = curves.x + entry * curves.z
+            let p12 = self.curve_texture.sample_nearest(vec2(u, curves.y), 0.0) - sample_xyxy
+            let p3 = self.curve_texture.sample_nearest(vec2(u + curves.z, curves.y), 0.0).xy - sample_xyxy.xy
+            var coverage = sums.x
+            var weight = sums.y
+            let code = self.calc_root_code(p12.x, p12.z, p3.x)
+            if code != u32(0) {
+                let r = self.solve_vert_poly(p12, p3) / px
+                if (code & u32(1)) != u32(0) {
+                    coverage = coverage - self.saturate(r.x + 0.5)
+                    weight = max(weight, self.saturate(1.0 - abs(r.x) * 2.0))
                 }
-
-                i = i + 1.0
-            }
-
-            return vec2(coverage, weight)
-        }
-
-        scan_vertical_all: fn(sample: vec2, px_size: float) -> vec2 {
-            let limit = floor(self.slug_curve_count() + 0.5)
-            var coverage = 0.0
-            var weight = 0.0
-
-            var i = 0.0
-            loop {
-                if i >= limit { break }
-
-                let curve_idx = self.slug_curve_offset() + i
-                let p12 = self.fetch_curve_texel(curve_idx * 2.0) - vec4(sample.x, sample.y, sample.x, sample.y)
-                let p3 = self.fetch_curve_texel(curve_idx * 2.0 + 1.0).xy - sample
-                let code = self.calc_root_code(p12.x, p12.z, p3.x)
-                if code != u32(0) {
-                    let r = self.solve_vert_poly(p12, p3) / px_size
-                    if (code & u32(1)) != u32(0) {
-                        coverage = coverage - self.saturate(r.x + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.x) * 2.0))
-                    }
-                    if code > u32(1) {
-                        coverage = coverage + self.saturate(r.y + 0.5)
-                        weight = max(weight, self.saturate(1.0 - abs(r.y) * 2.0))
-                    }
+                if code > u32(1) {
+                    coverage = coverage + self.saturate(r.y + 0.5)
+                    weight = max(weight, self.saturate(1.0 - abs(r.y) * 2.0))
                 }
-
-                i = i + 1.0
             }
-
-            return vec2(coverage, weight)
+            return vec3(coverage, weight, max(max(p12.y, p12.w), p3.y) / px)
         }
 
         calc_coverage: fn(xcov: float, ycov: float, xwgt: float, ywgt: float) -> float {
@@ -1136,48 +1016,49 @@ script_mod! {
         }
 
         alpha_at: fn(sample: vec2, px_x: float, px_y: float) -> float {
-            var coverage_x = 0.0
-            var coverage_y = 0.0
-            var weight_x = 0.0
-            var weight_y = 0.0
+            // A glyph's curves and its band block each sit in one texture row (see SlugAtlas).
+            let first_curve = floor(self.slug_curve_offset() + 0.5)
+            let curves = self.calc_texel_run_uv(self.curve_texture.size(), first_curve * 2.0)
+            let bands = self.calc_texel_run_uv(self.band_texture.size(), floor(self.slug_band_offset() + 0.5))
+            let band_count = floor(self.slug_band_count() + 0.5)
+            let h_band = clamp(floor(sample.y * band_count), 0.0, band_count - 1.0)
+            let v_band = clamp(floor(sample.x * band_count), 0.0, band_count - 1.0)
+            let h_list = self.band_texture.sample_nearest(vec2(bands.x + h_band * bands.z, bands.y), 0.0).xy
+            let v_list = self.band_texture.sample_nearest(vec2(bands.x + v_band * bands.z, bands.y), 0.0).zw
+            let sample_xyxy = vec4(sample.x, sample.y, sample.x, sample.y)
 
-            if self.slug_band_count() > 0.5 {
-                let num_bands = max(floor(self.slug_band_count() + 0.5), 1.0)
-                let h_band_idx = clamp(floor(sample.y * num_bands), 0.0, num_bands - 1.0)
-                let v_band_idx = clamp(floor(sample.x * num_bands), 0.0, num_bands - 1.0)
-
-                let h_band_info = self.fetch_band_texel(self.slug_band_offset() + h_band_idx)
-                let h_band = self.scan_horizontal_list(
-                    floor(h_band_info.x + 0.5),
-                    h_band_info.y,
-                    sample,
-                    px_x,
-                )
-                coverage_x = h_band.x
-                weight_x = h_band.y
-
-                let v_band_info = self.fetch_band_texel(
-                    self.slug_band_offset() + num_bands + v_band_idx
-                )
-                let v_band = self.scan_vertical_list(
-                    floor(v_band_info.x + 0.5),
-                    v_band_info.y,
-                    sample,
-                    px_y,
-                )
-                coverage_y = v_band.x
-                weight_y = v_band.y
-            } else {
-                let x_scan = self.scan_horizontal_all(sample, px_x)
-                coverage_x = x_scan.x
-                weight_x = x_scan.y
-
-                let y_scan = self.scan_vertical_all(sample, px_y)
-                coverage_y = y_scan.x
-                weight_y = y_scan.y
+            // Lists start with the curves that reach furthest along the ray, so once a group's
+            // last curve ends half a pixel behind the sample, no later one can cover it.
+            var h = vec2(0.0, 0.0)
+            var group = 0.0
+            let h_start = bands.x + h_list.x * bands.z
+            for i in 0..256 {
+                if group >= h_list.y { break }
+                let entries = self.band_texture.sample_nearest(vec2(h_start + group * bands.z, bands.y), 0.0)
+                h = self.scan_h_curve(h, entries.x, curves, sample_xyxy, px_x).xy
+                h = self.scan_h_curve(h, entries.y, curves, sample_xyxy, px_x).xy
+                h = self.scan_h_curve(h, entries.z, curves, sample_xyxy, px_x).xy
+                let last = self.scan_h_curve(h, entries.w, curves, sample_xyxy, px_x)
+                h = last.xy
+                if last.z < -0.5 { break }
+                group = group + 1.0
             }
 
-            return self.calc_coverage(coverage_x, coverage_y, weight_x, weight_y)
+            var v = vec2(0.0, 0.0)
+            group = 0.0
+            let v_start = bands.x + v_list.x * bands.z
+            for i in 0..256 {
+                if group >= v_list.y { break }
+                let entries = self.band_texture.sample_nearest(vec2(v_start + group * bands.z, bands.y), 0.0)
+                v = self.scan_v_curve(v, entries.x, curves, sample_xyxy, px_y).xy
+                v = self.scan_v_curve(v, entries.y, curves, sample_xyxy, px_y).xy
+                v = self.scan_v_curve(v, entries.z, curves, sample_xyxy, px_y).xy
+                let last = self.scan_v_curve(v, entries.w, curves, sample_xyxy, px_y)
+                v = last.xy
+                if last.z < -0.5 { break }
+                group = group + 1.0
+            }
+            return self.calc_coverage(h.x, v.x, h.y, v.y)
         }
 
         sample_slug_pixel: fn() {
@@ -1194,16 +1075,16 @@ script_mod! {
             let first_offset = sample_step * 0.5 - 0.5
             var alpha_sum = 0.0
             var row = 0.0
-            loop {
+            var col = 0.0
+            for i in 0..16 {
                 if row >= 1.0 { break }
-                var col = 0.0
-                loop {
-                    if col >= 1.0 { break }
-                    let offset = vec2(col + first_offset, row + first_offset) * vec2(px_x, px_y)
-                    alpha_sum = alpha_sum + self.alpha_at(sample + offset, px_x, px_y)
-                    col = col + sample_step
+                let offset = vec2(col + first_offset, row + first_offset) * vec2(px_x, px_y)
+                alpha_sum = alpha_sum + self.alpha_at(sample + offset, px_x, px_y)
+                col = col + sample_step
+                if col >= 1.0 {
+                    col = 0.0
+                    row = row + sample_step
                 }
-                row = row + sample_step
             }
             let alpha_base = clamp(alpha_sum * sample_step * sample_step, 0.0, 1.0)
             let darken = clamp(max(px_x, px_y) * self.stem_darken, 0.0, self.stem_darken_max)
@@ -1284,9 +1165,8 @@ pub struct DrawText {
     pending_slug_flush_generation: u64,
     #[rust]
     slug_flush_defer_depth: u64,
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     #[rust]
-    slug_uniforms: Option<SlugUniforms>,
+    char_index_redraw_id: u64,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[rust]
     slug_draw: Option<DrawTextSlug>,
@@ -1475,16 +1355,6 @@ struct DrawTextSlug {
     stem_darken: f32,
     #[live(0.125)]
     stem_darken_max: f32,
-}
-
-/// The slug matrix rows we last set, and where they and the viewport size go in our dyn uniforms.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-struct SlugUniforms {
-    /// The shader, pass and draw list state we computed them for.
-    key: (DrawShaderId, DrawPassId, u64, DrawListId, u64),
-    /// Each row's offset and length in our dyn uniforms, along with its values.
-    matrix_rows: [(usize, usize, [f32; 4]); 3],
-    viewport_px_range: (usize, usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3179,6 +3049,11 @@ impl DrawText {
     }
 
     pub(crate) fn update_draw_vars(&mut self, cx: &mut Cx2d) {
+        // We count glyphs from 0 again each frame, so text drawn again comes out the same.
+        if self.char_index_redraw_id != cx.redraw_id {
+            self.char_index_redraw_id = cx.redraw_id;
+            self.char_index = 0.0;
+        }
         self.draw_vars.append_group_id = cx.draw_call_group_content().0;
         let fonts = cx.fonts.borrow();
         let rasterizer = fonts.rasterizer().borrow();
@@ -3193,62 +3068,14 @@ impl DrawText {
             self.draw_vars.texture_slots[3] = Some(fonts.slug_curve_texture().clone());
             self.draw_vars.texture_slots[4] = Some(fonts.slug_band_texture().clone());
 
-            let Some(draw_shader_id) = self.draw_vars.draw_shader_id else {
-                return;
-            };
-            let pass_id = cx.pass_stack.last().unwrap().pass_id;
-            let draw_list_id = *cx.draw_list_stack.last().unwrap();
-            let key = (
-                draw_shader_id,
-                pass_id,
-                cx.passes[pass_id].pass_uniforms_gen,
-                draw_list_id,
-                cx.draw_lists[draw_list_id].uniforms_gen,
-            );
-            // The matrix only changes with the pass's camera and our draw list's transform,
-            // and both bump their generation when they change.
-            if self.slug_uniforms.as_ref().is_some_and(|slug_uniforms| slug_uniforms.key != key) {
-                self.slug_uniforms = None;
-            }
-            let slug_uniforms = self.slug_uniforms.get_or_insert_with(|| {
-                let pass_uniforms = &cx.passes[pass_id].pass_uniforms;
-                let view_transform = &cx.draw_lists[draw_list_id]
-                    .draw_list_uniforms
-                    .view_transform;
-                let model_view = Mat4f::mul(&pass_uniforms.camera_view, view_transform);
-                let slug_matrix = Mat4f::mul(&pass_uniforms.camera_projection, &model_view);
-                // Like set_uniform, we write nothing for a uniform the shader doesn't have.
-                let get_range = |uniform, len: usize| {
-                    self.draw_vars
-                        .uniform_range(cx.cx, uniform)
-                        .map_or((0, 0), |(offset, slots)| (offset, slots.min(len)))
-                };
-                let get_row = |uniform, row| {
-                    let (offset, len) = get_range(uniform, 4);
-                    (offset, len, mat4_row(&slug_matrix, row))
-                };
-                SlugUniforms {
-                    key,
-                    matrix_rows: [
-                        get_row(live_id!(slug_matrix_0), 0),
-                        get_row(live_id!(slug_matrix_1), 1),
-                        get_row(live_id!(slug_matrix_3), 3),
-                    ],
-                    viewport_px_range: get_range(live_id!(slug_viewport_px), 2),
-                }
-            });
             let viewport = cx.current_pass_size();
             let dpi_factor = cx.current_dpi_factor() as f32;
             let viewport_px = [
                 (viewport.x as f32 * dpi_factor).max(1.0),
                 (viewport.y as f32 * dpi_factor).max(1.0),
             ];
-
-            for (offset, len, row) in &slug_uniforms.matrix_rows {
-                self.draw_vars.dyn_uniforms[*offset..offset + len].copy_from_slice(&row[..*len]);
-            }
-            let (offset, len) = slug_uniforms.viewport_px_range;
-            self.draw_vars.dyn_uniforms[offset..offset + len].copy_from_slice(&viewport_px[..len]);
+            self.draw_vars
+                .set_uniform(cx.cx, live_id!(slug_viewport_px), &viewport_px);
         }
     }
 
@@ -3324,7 +3151,21 @@ impl DrawText {
         let glyph_prefers_raster_image = glyph
             .font
             .has_glyph_raster_image(glyph.id, font_size_in_dpxs);
-        if !glyph_prefers_raster_image && cx.fonts.borrow().should_use_slug_glyph(font_size_in_dpxs)
+        let mut is_waiting_on_sdf = false;
+        if !glyph_prefers_raster_image && cx.fonts.borrow().should_use_hybrid_glyph(font_size_in_dpxs) {
+            let sdf_glyph = cx
+                .fonts
+                .borrow()
+                .rasterizer()
+                .borrow_mut()
+                .get_or_queue_glyph_outline_sdf(&glyph.font, glyph.id, font_size_in_dpxs);
+            if sdf_glyph.is_some() {
+                return sdf_glyph.map(ResolvedGlyph::Raster);
+            }
+            is_waiting_on_sdf = true;
+        }
+        if !glyph_prefers_raster_image
+            && (is_waiting_on_sdf || cx.fonts.borrow().should_use_slug_glyph(font_size_in_dpxs))
         {
             let slug_lookup = {
                 let mut fonts = cx.fonts.borrow_mut();
@@ -3333,6 +3174,9 @@ impl DrawText {
 
             match slug_lookup {
                 SlugGlyphCacheResult::Ready(slug_glyph) => {
+                    if is_waiting_on_sdf {
+                        cx.fonts.borrow_mut().mark_draw_list_as_drawing_slug_fallbacks(cx);
+                    }
                     return Some(ResolvedGlyph::Slug(slug_glyph));
                 }
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -3351,6 +3195,9 @@ impl DrawText {
                 } => {
                     self.pending_slug_flush_generation =
                         self.pending_slug_flush_generation.max(generation);
+                    if is_waiting_on_sdf {
+                        cx.fonts.borrow_mut().mark_draw_list_as_drawing_slug_fallbacks(cx);
+                    }
                     return Some(ResolvedGlyph::Slug(slug_glyph));
                 }
                 SlugGlyphCacheResult::Deferred => {
@@ -3399,8 +3246,9 @@ impl DrawText {
                 rasterized_glyph,
                 output,
             ),
-            None => {}
+            None => return,
         }
+        cx.fonts.borrow_mut().counters.glyphs_drawn[(self.texture_index as usize).min(3)] += 1;
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -3618,6 +3466,7 @@ impl DrawText {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn mat4_row(mat: &Mat4f, row: usize) -> [f32; 4] {
     [mat.v[row], mat.v[row + 4], mat.v[row + 8], mat.v[row + 12]]
 }

@@ -81,7 +81,21 @@ pub type AChoreographerPostCallbackFn = unsafe extern "C" fn(
     *mut AChoreographer,
     Option<unsafe extern "C" fn(*mut AChoreographerFrameCallbackData, *mut std::ffi::c_void)>,
     *mut std::ffi::c_void,
-) -> i32;
+);
+
+/// `AChoreographer_postFrameCallback` (API 24), whose callback's `long` frame time is 32 bits on armv7.
+pub type AChoreographerPostFrameCallbackFn = unsafe extern "C" fn(
+    *mut AChoreographer,
+    Option<unsafe extern "C" fn(frameTimeNanos: std::ffi::c_long, data: *mut c_void)>,
+    *mut c_void,
+);
+
+/// `AChoreographer_postFrameCallback64` (API 29).
+pub type AChoreographerPostFrameCallback64Fn = unsafe extern "C" fn(
+    *mut AChoreographer,
+    Option<unsafe extern "C" fn(frameTimeNanos: i64, data: *mut c_void)>,
+    *mut c_void,
+);
 
 #[cfg(not(no_android_choreographer))]
 extern "C" {
@@ -99,8 +113,8 @@ extern "C" {
 // runtime-gated behind an `sdk_version >= 29` check — the relocation is still
 // emitted. Rust's `extern "C"` can't express weak linkage on stable, so these
 // are instead resolved at runtime with `dlsym(libandroid.so, ...)` in
-// android_jni.rs, typed via `AChoreographerPostCallbackFn`, only on devices
-// where they actually exist.
+// android_jni.rs, typed via `AChoreographerPostCallbackFn` and
+// `AChoreographerPostFrameCallback64Fn`, only on devices where they actually exist.
 
 #[repr(C)]
 pub struct ANativeActivity {

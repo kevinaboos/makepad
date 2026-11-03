@@ -657,8 +657,14 @@ fn rust_build(
 
         let target_arch_str = android_target.to_str();
         let cfg_flag = format!("--cfg android_target=\"{}\"", target_arch_str);
+        // Android's armeabi-v7a ABI includes NEON (CDD 3.3.1) and the NDK's clang turns it on,
+        // but Rust's armv7 target leaves it off. User RUSTFLAGS come after it, so they still win.
+        let mut existing_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+        if let AndroidTarget::armv7 = android_target {
+            existing_rustflags.insert_str(0, "-C target-feature=+neon ");
+        }
         let rustflags = compose_android_rustflags(
-            std::env::var("RUSTFLAGS").ok().as_deref(),
+            Some(&existing_rustflags),
             &cfg_flag,
             prefer_dynamic,
         );

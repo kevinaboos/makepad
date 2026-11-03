@@ -5,6 +5,7 @@ use {
         flat_list::WidgetItem,
         makepad_derive_widget::*,
         makepad_draw::*,
+        next_frame_gate::NextFrameGate,
         scroll_bar::{ScrollAxis, ScrollBar, ScrollBarAction},
         scroll_motion::{
             estimate_release_velocity, press_settles_finger_scroll, push_sample,
@@ -195,6 +196,14 @@ struct AlignItem {
     /// then where `end()` moved it to.
     shift: f64,
     index: usize,
+}
+
+/// An item that `keep_nearby_items` kept alive, but that wasn't drawn last time.
+struct ParkedItem {
+    item_id: usize,
+    /// Whether it still needs an `Event::ClearHover`, since it left the viewport without its hover-outs.
+    needs_clear_hover: bool,
+    frame_gate: NextFrameGate,
 }
 
 /// Where an item was in a list's last draw (see [`PortalList::drawn_slot()`]).
@@ -781,6 +790,10 @@ pub struct PortalList {
     capture_overload: bool,
     #[live(false)]
     keep_invisible: bool,
+    /// Whether items that scroll out of view stay alive while they're within a viewport's length
+    /// of it, so scrolling back to them doesn't rebuild them. `reuse_items` recycles them instead.
+    #[live(false)]
+    keep_nearby_items: bool,
     #[live(true)]
     skip_widget_tree_search: bool,
 
@@ -799,6 +812,11 @@ pub struct PortalList {
     /// Scratch list of the live item ids, for sending events to them in order.
     #[rust]
     event_item_ids: Vec<usize>,
+    /// The items that `keep_nearby_items` kept alive but that weren't drawn last time, by item id.
+    ///
+    /// They get every event except pointer events, and their animations wait until they're drawn again.
+    #[rust]
+    parked_items: Vec<ParkedItem>,
     #[rust]
     detect_tail_in_draw: bool,
 
@@ -957,6 +975,8 @@ impl PortalList {
         let vi = self.vec_index;
         let mut visible_items = 0;
         let mut last_visible_id: Option<usize> = None;
+        let mut nearby_ids = 0..0;
+        let mut tail_jumped = false;
 
         if let Some(ListDrawState::End { viewport }) = self.draw_state.get() {
             let list = &mut self.draw_align_list;
@@ -1163,6 +1183,18 @@ impl PortalList {
                     tree.update_default_height(new_avg);
                 }
 
+                // With `keep_nearby_items`, we keep the items within a viewport's length above
+                // or below the viewport, so a short scroll back and forth never rebuilds them.
+                if let Some(tree) = self.height_tree.as_ref().filter(|tree| self.keep_nearby_items && tree.size > 0) {
+                    let viewport_size = viewport.size.index(vi);
+                    let first_idx = self.first_id.saturating_sub(self.range_start);
+                    let height_before = if first_idx > 0 { tree.prefix_sum(first_idx - 1) } else { 0.0 };
+                    let viewport_start = height_before - self.first_scroll;
+                    let (first_nearby, _) = tree.find_position(viewport_start - viewport_size);
+                    let (last_nearby, _) = tree.find_position(viewport_start + 2.0 * viewport_size);
+                    nearby_ids = self.range_start + first_nearby..self.range_start + last_nearby + 1;
+                }
+
                 // An active scroll gesture/animation — a momentum fling, a pulldown bounce, or a
                 // finger drag — owns `first_scroll` directly. The tail auto-scroll below re-asserts
                 // position by subtracting `overflow` from `first_scroll` on every draw; during such
@@ -1216,7 +1248,7 @@ impl PortalList {
                         // Instant jump: adjust first_scroll to scroll down
                         self.first_scroll -= self.tail_adjustment_needed;
                         self.tail_adjustment_needed = 0.0;
-                        self.area.redraw(cx);
+                        tail_jumped = true;
                     }
                 }
             }
@@ -1279,21 +1311,54 @@ impl PortalList {
         // so their selection state persists when scrolled back into view.
         if !self.keep_invisible && !self.is_selecting {
             let selection_range = self.get_selection_range();
+            // Skipped items never stay around, even near the viewport.
+            let skipped = &self.skipped;
+            let is_nearby = |item_id: &usize| {
+                nearby_ids.contains(item_id) && skipped.range_containing(*item_id).is_none()
+            };
             if self.reuse_items {
                 let reusable_items = &mut self.reusable_items;
                 self.items.retain_visible_with(|v: WidgetItem| {
                     reusable_items.entry(v.template).or_default().push(v);
                 });
             } else if let Some((start, end)) = selection_range {
-                self.items
-                    .retain_visible_and(|item_id, _| *item_id >= start.0 && *item_id <= end.0);
+                self.items.retain_visible_and(|item_id, _| {
+                    (*item_id >= start.0 && *item_id <= end.0) || is_nearby(item_id)
+                });
             } else {
-                self.items.retain_visible();
+                self.items.retain_visible_and(|item_id, _| is_nearby(item_id));
             }
             cx.widget_tree_mark_dirty(self.uid);
         }
+        let mut was_parked = std::mem::take(&mut self.parked_items);
+        if self.keep_nearby_items {
+            let drawn = &self.draw_align_list;
+            self.parked_items.extend(
+                self.items.keys()
+                    .filter(|item_id| !drawn.iter().any(|row| row.index == **item_id))
+                    .map(|&item_id| ParkedItem {
+                        item_id,
+                        needs_clear_hover: true,
+                        frame_gate: NextFrameGate::default(),
+                    })
+            );
+            self.parked_items.sort_unstable_by_key(|parked| parked.item_id);
+        }
+        for old in &mut was_parked {
+            match self.parked_items.binary_search_by_key(&old.item_id, |parked| parked.item_id) {
+                // An item that stays parked keeps its gate and any ClearHover it still needs.
+                Ok(index) => std::mem::swap(&mut self.parked_items[index], old),
+                // A parked item that we just drew again gets a frame for any it skipped.
+                Err(_) if self.items.contains_key(&old.item_id) => old.frame_gate.mark_drawn(cx),
+                Err(_) => {}
+            }
+        }
 
         cx.end_turtle_with_area(&mut self.area);
+        // A tail jump only shows in the next draw, and a plain redraw does nothing mid-draw.
+        if tail_jumped {
+            cx.redraw_area_in_draw(self.area);
+        }
         self.visible_items = visible_items;
         self.last_visible_id = last_visible_id;
     
@@ -2796,16 +2861,22 @@ impl PortalList {
 
     /// Check if a point hits any interactive widget (link, button, etc.) in any of the visible items.
     fn point_hits_interactive_item(&self, cx: &Cx, abs: DVec2) -> bool {
-        for item in self.items.values() {
-            if item
-                .widget
-                .find_interactive_widget_from_point(cx, abs)
-                .is_some()
+        for (item_id, item) in self.items.iter() {
+            if !self.is_parked(*item_id)
+                && item
+                    .widget
+                    .find_interactive_widget_from_point(cx, abs)
+                    .is_some()
             {
                 return true;
             }
         }
         false
+    }
+
+    /// Returns whether `keep_nearby_items` kept this item alive without drawing it last time.
+    fn is_parked(&self, item_id: usize) -> bool {
+        self.parked_items.binary_search_by_key(&item_id, |parked| parked.item_id).is_ok()
     }
 }
 
@@ -2849,8 +2920,10 @@ impl WidgetNode for PortalList {
     }
 
     fn find_widgets_from_point(&self, cx: &Cx, point: DVec2, found: &mut dyn FnMut(&WidgetRef)) {
-        for item in self.items.values() {
-            item.widget.find_widgets_from_point(cx, point, found);
+        for (item_id, item) in self.items.iter() {
+            if !self.is_parked(*item_id) {
+                item.widget.find_widgets_from_point(cx, point, found);
+            }
         }
     }
 }
@@ -3062,6 +3135,18 @@ impl Widget for PortalList {
             Vec2Index::X => [is_scroll_container, is_scroll_container && self.use_vertical_finger_scroll],
             Vec2Index::Y => [false, is_scroll_container],
         };
+        // Parked items left the viewport without seeing their hover-outs or finger-ups,
+        // so we clear their hovers the same way closing an overlay does.
+        for parked in self.parked_items.iter_mut().filter(|parked| parked.needs_clear_hover) {
+            parked.needs_clear_hover = false;
+            let Some(item) = self.items.get_mut(&parked.item_id) else { continue };
+            let item_uid = item.widget.widget_uid();
+            parked.frame_gate.deliver_event(cx, &Event::ClearHover, false, |cx| {
+                cx.group_widget_actions(uid, item_uid, |cx| {
+                    item.widget.handle_event(cx, &Event::ClearHover, scope);
+                });
+            });
+        }
         cx.begin_scroll_container(container_axes);
         if pass_through_to_children {
             // Iterate in visual order (by item_id) for deterministic event handling.
@@ -3071,12 +3156,29 @@ impl Widget for PortalList {
             item_ids.clear();
             item_ids.extend(self.items.keys().copied());
             item_ids.sort_unstable();
+            // Hidden views still get finger-ups, long presses and drops, but parked items can't,
+            // since a texture-cached subtree's areas stay valid at their old spot.
+            let is_pointer_event = event.requires_visibility()
+                || matches!(event, Event::MouseUp(_) | Event::LongPress(_) | Event::Drag(_) | Event::Drop(_));
+            let is_next_frame = matches!(event, Event::NextFrame(_));
             for &item_id in &item_ids {
-                if let Some(item) = self.items.get_mut(&item_id) {
-                    let item_uid = item.widget.widget_uid();
-                    cx.group_widget_actions(uid, item_uid, |cx| {
-                        item.widget.handle_event(cx, event, scope);
-                    });
+                let Some(item) = self.items.get_mut(&item_id) else { continue };
+                let item_uid = item.widget.widget_uid();
+                let mut deliver = |cx: &mut Cx| cx.group_widget_actions(uid, item_uid, |cx| {
+                    item.widget.handle_event(cx, event, scope);
+                });
+                match self.parked_items.binary_search_by_key(&item_id, |parked| parked.item_id) {
+                    Ok(_) if is_pointer_event => {}
+                    Ok(index) => {
+                        let frame_gate = &mut self.parked_items[index].frame_gate;
+                        frame_gate.deliver_event(cx, event, false, deliver);
+                        // Off screen, an animation would just redraw the whole list every frame,
+                        // so it waits until the item is drawn again, which gets it a catch-up frame.
+                        if is_next_frame {
+                            frame_gate.withhold_frames();
+                        }
+                    }
+                    Err(_) => deliver(cx),
                 }
             }
             self.event_item_ids = item_ids;

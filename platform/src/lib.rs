@@ -44,6 +44,7 @@ pub mod video_decode;
 pub mod video_encode;
 pub mod video_file;
 
+mod draw_damage;
 mod draw_list;
 pub mod retained_instances;
 pub mod recording_buffer;

@@ -609,6 +609,15 @@ impl Cx {
                         continue;
                     }
                 };
+                // A draw call that misses every rect we're repainting only takes its step of the depth counter.
+                let repaint_mask = self.draw_damage.get_repaint_mask(draw_pass_id, draw_list_id, draw_item_id);
+                if repaint_mask == Some(0) {
+                    if draw_call.resolve_zbias(*zbias, sploded, uniforms_gen) {
+                        draw_call.uniforms_dirty = true;
+                    }
+                    *zbias += zbias_step;
+                    continue;
+                }
                 let gl = self.os.gl();
                 let trace_draw = crate::makepad_error_log::trace_enabled("gl.draw");
 
@@ -1143,13 +1152,18 @@ impl Cx {
                         );
                     }
 
-                    (gl.glDrawElementsInstanced)(
-                        gl_sys::TRIANGLES,
-                        indices as i32,
-                        index_gl_type,
-                        ptr::null(),
-                        instances as i32,
-                    );
+                    for scissor in self.draw_damage.get_scissors(repaint_mask) {
+                        if let Some([x, y, width, height]) = scissor {
+                            (gl.glScissor)(x, y, width, height);
+                        }
+                        (gl.glDrawElementsInstanced)(
+                            gl_sys::TRIANGLES,
+                            indices as i32,
+                            index_gl_type,
+                            ptr::null(),
+                            instances as i32,
+                        );
+                    }
                     draw_item.consumed_instance_id = draw_item.retained_instance_id;
                     draw_item.consumed_schema = draw_item.resident_schema;
                     draw_item.consumed_serial = self
@@ -1179,6 +1193,10 @@ impl Cx {
                     }
                 }
             }
+        }
+        // A handler can change what this pass draws after we worked out its damage.
+        if !to_dispatch.is_empty() {
+            self.draw_damage.invalidate_pass(draw_pass_id);
         }
         for event in to_dispatch.iter() {
             // Video-handle callbacks can call release/poll reentrantly. Give
@@ -2970,18 +2988,10 @@ pub struct CxOsTexture {
     /// True when Makepad owns the GL texture object and must delete it.
     pub gl_texture_owned: bool,
     pub gl_renderbuffer: Option<u32>,
-    /// Allocated GL storage `(width, height, internal_format)` of `gl_texture` for the append-only
-    /// SLUG glyph atlas (`VecRGBAf32`). The atlas is allocated with spare height capacity so that a
-    /// later height-growth append reuses the same texture via `glTexSubImage2D` instead of
-    /// recreating the (up to ~16 MB) texture with `glTexImage2D` on every change — the same win the
-    /// D3D11 backend gets from `UpdateSubresource`. `gl_cap_width == 0` means "not allocated".
-    gl_cap_width: usize,
-    gl_cap_height: usize,
-    gl_cap_internal_format: i32,
-    /// Number of rows already uploaded into `gl_texture`. In-place sub-rect reuse is only allowed
-    /// for pure appends (rows at/after this frontier), never overwriting rows an in-flight frame may
-    /// still be sampling — overwriting the SDF atlas mid-frame can tear the per-glyph curve data.
-    gl_uploaded_height: usize,
+    /// The GL copies of an append-only texture like the Slug glyph atlas (see
+    /// `APPEND_ATLAS_COPIES`), and `gl_texture` is the one at `gl_atlas_index`.
+    gl_atlas_copies: Vec<GlAtlasCopy>,
+    gl_atlas_index: usize,
     /// Latest SurfaceTexture `getTransformMatrix` for this OES texture (Android only).
     /// Written after each successful `updateTexImage` drain; Video applies it via
     /// `oes_st_c0..c3` before `sample_video`. Identity when not OES / not drained.
@@ -2997,14 +3007,26 @@ impl Default for CxOsTexture {
             rendered_top_left: false,
             gl_texture_owned: true,
             gl_renderbuffer: None,
-            gl_cap_width: 0,
-            gl_cap_height: 0,
-            gl_cap_internal_format: 0,
-            gl_uploaded_height: 0,
+            gl_atlas_copies: Vec::new(),
+            gl_atlas_index: 0,
             #[cfg(target_os = "android")]
             oes_st_matrix: OES_ST_IDENTITY,
         }
     }
+}
+
+/// Android keeps three copies of an append-only texture and writes a different one each time,
+/// so we never write a copy that a frame still in flight is drawing with, since the driver
+/// would then copy the whole texture first.
+const APPEND_ATLAS_COPIES: usize = if cfg!(target_os = "android") { 3 } else { 1 };
+
+#[derive(Clone)]
+struct GlAtlasCopy {
+    gl_texture: u32,
+    cap_width: usize,
+    cap_height: usize,
+    /// What this copy is still missing, since each upload only writes one copy.
+    pending: TextureUpdated,
 }
 
 impl CxTexture {
@@ -3145,6 +3167,41 @@ impl CxTexture {
             return;
         }
 
+        // Partial texture uploads are critical for append-only SLUG float atlases on
+        // Linux desktop. OHOS simulators/emulators still need the conservative full
+        // upload path.
+        const DO_PARTIAL_TEXTURE_UPDATES: bool = cfg!(not(ohos_sim));
+        // An append-only texture like the Slug glyph atlas keeps spare rows, so an append only
+        // uploads the new rows. OHOS still re-uploads the whole texture every time.
+        const ATLAS_INPLACE_UPDATES: bool = cfg!(not(target_env = "ohos"));
+        let is_append_atlas = self.is_append_only;
+        let allow_partial_texture_updates =
+            DO_PARTIAL_TEXTURE_UPDATES && (!is_append_atlas || ATLAS_INPLACE_UPDATES);
+        if is_append_atlas && allow_partial_texture_updates {
+            if self.os.gl_atlas_copies.len() < APPEND_ATLAS_COPIES {
+                let gl_texture = if self.os.gl_atlas_copies.is_empty() {
+                    self.os.gl_texture.unwrap()
+                } else {
+                    let mut gl_texture = std::mem::MaybeUninit::uninit();
+                    unsafe {
+                        (gl.glGenTextures)(1, gl_texture.as_mut_ptr());
+                        gl_texture.assume_init()
+                    }
+                };
+                self.os.gl_atlas_copies.push(GlAtlasCopy {
+                    gl_texture,
+                    cap_width: 0,
+                    cap_height: 0,
+                    pending: TextureUpdated::Full,
+                });
+                self.os.gl_atlas_index = self.os.gl_atlas_copies.len() - 1;
+            } else {
+                self.os.gl_atlas_index =
+                    (self.os.gl_atlas_index + 1) % self.os.gl_atlas_copies.len();
+            }
+            self.os.gl_texture = Some(self.os.gl_atlas_copies[self.os.gl_atlas_index].gl_texture);
+        }
+
         unsafe {
             (gl.glBindTexture)(gl_sys::TEXTURE_2D, self.os.gl_texture.unwrap());
             let wrap = match self.format.wrap() {
@@ -3280,109 +3337,72 @@ impl CxTexture {
                 _ => panic!("Unsupported texture format"),
             };
 
-            // Partial texture uploads are critical for append-only SLUG float atlases on
-            // Linux desktop. OHOS simulators/emulators still need the conservative full
-            // upload path.
-            const DO_PARTIAL_TEXTURE_UPDATES: bool = cfg!(not(ohos_sim));
-            // The append-only SLUG glyph atlas (`VecRGBAf32`). Unlike the bitmap atlases and images
-            // (sampled by normalized UV, so they must be exact-sized), this one is addressed by
-            // absolute texel index and only ever grows by appending rows, so on desktop Linux GL we
-            // keep spare height capacity and reuse the texture across growth — mirroring the D3D11
-            // `UpdateSubresource` path. `gl.glTexSubImage2D` updates the existing texture in place
-            // instead of recreating and re-uploading the whole (up to ~16 MB) atlas on every change,
-            // which was a per-change scroll hitch.
-            //
-            // This is gated to desktop Linux (X11/Wayland/direct): on Android/OHOS GLES the
-            // float-atlas `glTexSubImage2D` path is unreliable (see the note above about emoji
-            // rendering as black boxes), so those keep the conservative full `glTexImage2D` upload by
-            // excluding the atlas from partial updates entirely.
-            const ATLAS_INPLACE_UPDATES: bool =
-                cfg!(not(any(target_env = "ohos", target_os = "android")));
-            let is_append_atlas = matches!(self.format, TextureFormat::VecRGBAf32 { .. });
-            let allow_partial_texture_updates =
-                DO_PARTIAL_TEXTURE_UPDATES && (!is_append_atlas || ATLAS_INPLACE_UPDATES);
             let unpack_alignment = gl_unpack_alignment(bytes_per_pixel);
 
             match updated {
-                TextureUpdated::Partial(rect)
+                TextureUpdated::Partial(_) | TextureUpdated::Full
                     if allow_partial_texture_updates && is_append_atlas =>
                 {
-                    // ~3x height headroom with a floor, rounded up to a 128-row boundary, so a long
-                    // flick-scroll's worth of glyph-atlas growth reuses this storage instead of
-                    // recreating it (mirrors D3D11's `cap_height`). Rows `height..cap_height` stay
-                    // undefined — the glyph shader addresses by absolute texel index and never
-                    // samples them.
-                    let cap_height = {
-                        let want = (height * 3).max(512);
-                        ((want + 127) / 128) * 128
+                    let dirty_rect = match updated {
+                        TextureUpdated::Partial(rect) => Some(rect),
+                        _ => None,
                     };
-                    // Only a pure append (the dirty rect's top row is at/after the upload frontier)
-                    // is safe to write in place: overwriting rows an in-flight frame may still be
-                    // sampling can tear the per-glyph curve data and hang the GPU. `slug_atlas` only
-                    // ever reports growth as appended rows, so this holds; the check is defensive.
-                    let safe_append = rect.origin.y + 1 >= self.os.gl_uploaded_height;
-                    // (Re)allocate GL storage only when the texture is new, the width/format changed,
-                    // or the needed height exceeds capacity — NOT merely because the logical alloc
-                    // size grew (that fires on every height append).
-                    let need_storage = self.os.gl_cap_width != width
-                        || self.os.gl_cap_internal_format != internal_format as i32
-                        || self.os.gl_cap_height < height;
-                    if need_storage || !safe_append {
-                        // Allocate (orphaning any old storage) at `cap_height` and upload the full
-                        // logical region `0..height`; the dirty rect alone is insufficient after a
-                        // realloc since the rest of the texture is undefined. The full atlas data is
-                        // retained in `data`, so this is a complete, correct re-upload.
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);
-                        (gl.glTexImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32,
-                            cap_height as i32,
-                            0,
-                            format,
-                            data_type,
-                            0 as *const _,
-                        );
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
-                        (gl.glTexSubImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            0,
-                            0,
-                            width as i32,
-                            height as i32,
-                            format,
-                            data_type,
-                            data,
-                        );
-                        self.os.gl_cap_width = width;
-                        self.os.gl_cap_height = cap_height;
-                        self.os.gl_cap_internal_format = internal_format as i32;
-                        self.os.gl_uploaded_height = height;
-                    } else {
-                        // In-place sub-rect append into the existing (capacity-sufficient) storage —
-                        // the common case while scrolling brings new glyphs into the atlas.
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, rect.origin.x as i32);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, rect.origin.y as i32);
-                        (gl.glTexSubImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            rect.origin.x as i32,
-                            rect.origin.y as i32,
-                            rect.size.width as i32,
-                            rect.size.height as i32,
-                            format,
-                            data_type,
-                            data,
-                        );
-                        self.os.gl_uploaded_height =
-                            (rect.origin.y + rect.size.height).max(self.os.gl_uploaded_height);
+                    for copy in &mut self.os.gl_atlas_copies {
+                        copy.pending = copy.pending.update(dirty_rect);
+                    }
+                    let copy = &mut self.os.gl_atlas_copies[self.os.gl_atlas_index];
+                    match std::mem::replace(&mut copy.pending, TextureUpdated::Empty) {
+                        TextureUpdated::Partial(rect)
+                            if copy.cap_width == width && copy.cap_height >= height =>
+                        {
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, rect.origin.x as i32);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, rect.origin.y as i32);
+                            (gl.glTexSubImage2D)(
+                                gl_sys::TEXTURE_2D,
+                                0,
+                                rect.origin.x as i32,
+                                rect.origin.y as i32,
+                                rect.size.width as i32,
+                                rect.size.height as i32,
+                                format,
+                                data_type,
+                                data,
+                            );
+                        }
+                        _ => {
+                            // New storage holds nothing yet, so the whole atlas goes up.
+                            copy.cap_width = width;
+                            copy.cap_height = Self::get_append_only_capacity(height);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);
+                            (gl.glTexImage2D)(
+                                gl_sys::TEXTURE_2D,
+                                0,
+                                internal_format as i32,
+                                width as i32,
+                                copy.cap_height as i32,
+                                0,
+                                format,
+                                data_type,
+                                0 as *const _,
+                            );
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
+                            (gl.glTexSubImage2D)(
+                                gl_sys::TEXTURE_2D,
+                                0,
+                                0,
+                                0,
+                                width as i32,
+                                height as i32,
+                                format,
+                                data_type,
+                                data,
+                            );
+                        }
                     }
                 }
                 TextureUpdated::Partial(rect) if allow_partial_texture_updates => {
@@ -3428,62 +3448,21 @@ impl CxTexture {
                 // A `Full` update (and any `Partial` when partial updates are disabled, e.g.
                 // ohos_sim) recreates the texture at its exact logical size.
                 TextureUpdated::Partial(_) | TextureUpdated::Full => {
-                    if is_append_atlas && allow_partial_texture_updates {
-                        // Keep the append-only atlas allocated with height headroom (and its
-                        // capacity tracking in sync) even when the triggering update is `Full`
-                        // (first upload / width change / reset), so the following appends reuse it.
-                        let cap_height = {
-                            let want = (height * 3).max(512);
-                            ((want + 127) / 128) * 128
-                        };
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);
-                        (gl.glTexImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32,
-                            cap_height as i32,
-                            0,
-                            format,
-                            data_type,
-                            0 as *const _,
-                        );
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
-                        (gl.glTexSubImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            0,
-                            0,
-                            width as i32,
-                            height as i32,
-                            format,
-                            data_type,
-                            data,
-                        );
-                        self.os.gl_cap_width = width;
-                        self.os.gl_cap_height = cap_height;
-                        self.os.gl_cap_internal_format = internal_format as i32;
-                        self.os.gl_uploaded_height = height;
-                    } else {
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
-                        (gl.glTexImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32,
-                            height as i32,
-                            0,
-                            format,
-                            data_type,
-                            data,
-                        );
-                    }
+                    (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
+                    (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
+                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
+                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
+                    (gl.glTexImage2D)(
+                        gl_sys::TEXTURE_2D,
+                        0,
+                        internal_format as i32,
+                        width as i32,
+                        height as i32,
+                        0,
+                        format,
+                        data_type,
+                        data,
+                    );
                 }
                 TextureUpdated::Empty => panic!("already asserted that updated is not empty"),
             };
@@ -4632,7 +4611,17 @@ impl CxOsTexture {
             >(get_integer);
             let mut total = 0u64;
             let mut allocated = false;
-            if let Some(texture) = self.gl_texture.filter(|_| self.gl_texture_owned) {
+            let other_atlas_copies = self
+                .gl_atlas_copies
+                .iter()
+                .map(|copy| copy.gl_texture)
+                .filter(|&texture| Some(texture) != self.gl_texture);
+            for texture in self
+                .gl_texture
+                .into_iter()
+                .chain(other_atlas_copies)
+                .filter(|_| self.gl_texture_owned)
+            {
                 let cube = self.allocation_target == gl_sys::TEXTURE_CUBE_MAP;
                 let mut previous = 0;
                 get_integer(if cube { 0x8514 } else { 0x8069 }, &mut previous);
@@ -4708,6 +4697,15 @@ impl CxOsTexture {
     }
     fn destroy_released(&mut self, gl: &LibGl) {
         if self.gl_texture_owned {
+            for copy in self
+                .gl_atlas_copies
+                .drain(..)
+                .filter(|copy| Some(copy.gl_texture) != self.gl_texture)
+            {
+                unsafe {
+                    (gl.glDeleteTextures)(1, &copy.gl_texture);
+                }
+            }
             if let Some(texture) = self.gl_texture.take() {
                 unsafe {
                     (gl.glDeleteTextures)(1, &texture);

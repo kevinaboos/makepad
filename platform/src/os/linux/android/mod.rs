@@ -6,11 +6,14 @@ pub mod android_audio;
 pub mod android_camera;
 pub mod android_camera_player;
 pub mod android_file_dialog;
+pub mod android_frame_timing;
 pub mod android_jni;
 pub mod android_keycodes;
 pub mod android_media;
 pub mod android_midi;
 pub mod android_network;
+#[cfg(not(use_vulkan))]
+pub mod android_partial_repaint;
 pub mod android_performance_hint;
 #[cfg(not(use_vulkan))]
 pub mod android_shader_worker;

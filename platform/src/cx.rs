@@ -7,6 +7,7 @@ use {
         cx_api::CxOsOp,
         debug::Debug,
         display_context::DisplayContext,
+        draw_damage::CxDrawDamage,
         draw_list::CxDrawListPool,
         draw_matrix::CxDrawMatrixPool,
         draw_pass::CxDrawPassPool,
@@ -106,6 +107,7 @@ pub struct Cx {
     pub windows: CxWindowPool,
     pub passes: CxDrawPassPool,
     pub draw_lists: CxDrawListPool,
+    pub(crate) draw_damage: CxDrawDamage,
     pub draw_matrices: CxDrawMatrixPool,
     pub textures: CxTexturePool,
     /// Shared-instance publications (cleanup DL-1 freeze): the registry that
@@ -167,6 +169,8 @@ pub struct Cx {
 
     pub(crate) self_ref: Option<Rc<RefCell<Cx>>>,
     pub(crate) in_draw_event: bool,
+    /// Whether a `CxDraw` is walking the widgets, which ends before the actions it emitted get handled.
+    pub is_in_draw_walk: bool,
 
     /// Display context for the main window, used by AdaptiveView
     pub display_context: DisplayContext,
@@ -949,6 +953,7 @@ impl Cx {
             in_makepad_studio: false,
             game_input_remote: Vec::new(),
             in_draw_event: false,
+            is_in_draw_walk: false,
             os_type: OsType::Unknown,
             gpu_info: Default::default(),
             xr_capabilities: Default::default(),
@@ -956,6 +961,7 @@ impl Cx {
             windows: Default::default(),
             passes: Default::default(),
             draw_lists: Default::default(),
+            draw_damage: Default::default(),
             draw_matrices: Default::default(),
             geometries: Default::default(),
             textures,

@@ -347,6 +347,7 @@ impl Geometry {
         cxgeom.vertex_layout_signature = None;
         cxgeom.index_width = 4;
         cxgeom.dirty = true;
+        cxgeom.data_generation += 1;
         cxgeom.dirty_vertices = true;
         cxgeom.dirty_indices = true;
         geometry
@@ -362,6 +363,7 @@ impl Geometry {
         cxgeom.vertex_layout_signature = None;
         cxgeom.index_width = 4;
         cxgeom.dirty = true;
+        cxgeom.data_generation += 1;
         cxgeom.dirty_vertices = true;
         cxgeom.dirty_indices = true;
     }
@@ -395,6 +397,7 @@ impl Geometry {
         indices.clear();
         vertices.clear();
         cxgeom.dirty = true;
+        cxgeom.data_generation += 1;
         cxgeom.dirty_vertices = true;
         cxgeom.dirty_indices = true;
     }
@@ -418,6 +421,7 @@ impl Geometry {
         cxgeom.index_count = cxgeom.indices.len();
         cxgeom.vertex_count = vertex_count;
         cxgeom.dirty = true;
+        cxgeom.data_generation += 1;
         cxgeom.dirty_vertices = true;
         cxgeom.dirty_indices = true;
     }
@@ -450,6 +454,7 @@ impl Geometry {
         cxgeom.index_count = cxgeom.indices.len();
         cxgeom.vertex_count = vertex_count;
         cxgeom.dirty = true;
+        cxgeom.data_generation += 1;
         cxgeom.dirty_vertices = true;
         cxgeom.dirty_indices = true;
     }
@@ -460,6 +465,7 @@ impl Geometry {
         cxgeom.index_count = cxgeom.indices.len();
         cxgeom.index_width = 4;
         cxgeom.dirty = true;
+        cxgeom.data_generation += 1;
         cxgeom.dirty_indices = true;
     }
 
@@ -660,6 +666,8 @@ pub struct CxGeometry {
     pub dirty: bool,
     pub dirty_vertices: bool,
     pub dirty_indices: bool,
+    /// Goes up whenever the vertex or index data changes.
+    pub data_generation: u64,
     pub logged_stride_mismatch: bool,
     pub logged_unsupported_typed: bool,
     #[allow(unused)]
@@ -679,6 +687,7 @@ impl Default for CxGeometry {
             dirty: false,
             dirty_vertices: false,
             dirty_indices: false,
+            data_generation: 0,
             logged_stride_mismatch: false,
             logged_unsupported_typed: false,
             os: CxOsGeometry::default(),

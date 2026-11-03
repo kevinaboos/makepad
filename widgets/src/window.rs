@@ -678,15 +678,10 @@ impl SplodedStack {
         self.scene_pass.set_size(cx, size);
         cx.make_child_pass(&self.scene_pass);
         cx.begin_pass(&self.scene_pass, Some(dpi));
-        // The explode camera goes on THIS pass and nowhere else. Setting it
-        // here — before any content is emitted — also means the CPU-side slug
-        // text matrix, which bakes `camera_view` at draw time, is correct on
-        // the very first exploded frame instead of one frame late.
+        // The explode camera goes on THIS pass and nowhere else.
         let pass_id = self.scene_pass.draw_pass_id();
         let params = cx.sploded_params(size);
         cx.passes[pass_id].sploded = params;
-        let uniforms_gen = cx.next_uniform_gen();
-        cx.passes[pass_id].set_ortho_matrix(dvec2(0.0, 0.0), size, uniforms_gen);
         self.scene_draw_list.begin_always(cx);
         let pass_size = cx.current_pass_size();
         cx.begin_root_turtle(pass_size, Layout::flow_overlay());
@@ -1712,6 +1707,7 @@ impl Widget for Window {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.handle_direct_mouse_cursor(cx, event);
         crate::desktop_style::handle_event(cx, event);
+        crate::makepad_draw::text::fonts::handle_event(cx, event);
         if let Event::Custom(json) = event {
             if let Some(keyboard) = makepad_platform::ime::HostedKeyboard::parse(json) {
                 if keyboard.dismiss { cx.text_ime_was_dismissed(); }

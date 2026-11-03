@@ -2137,6 +2137,12 @@ impl Cx {
         self.os.boost_frame_rate();
     }
 
+    /// Sets whether a frame repaints only the parts of the window that changed, which it does by default.
+    /// Only Android's OpenGL backend does that so far, and only when its EGL driver reports buffer ages.
+    pub fn set_partial_repainting(&mut self, is_enabled: bool) {
+        self.draw_damage.set_disabled(!is_enabled);
+    }
+
     /// Whether this session builds the shaders its cache is missing on a background thread, so a screen created
     /// early is ready by the time it opens. Only Android does that, and it reads false until the first frame shows.
     pub fn is_building_shaders_in_background(&self) -> bool {

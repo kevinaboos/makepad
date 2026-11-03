@@ -637,7 +637,7 @@ impl Image {
         else {
             return;
         };
-        if num_frames < 2 || !is_area_on_screen(cx, self.draw_bg.area()) {
+        if num_frames < 2 || !self.draw_bg.area().is_on_screen(cx) {
             return;
         }
         let frame = (self.animation_frame as usize + 1) % num_frames;
@@ -1199,15 +1199,6 @@ fn get_frame_delay(animation: &TextureAnimation, frame: usize) -> f64 {
         .copied()
         .filter(|&delay| delay > 0.0101)
         .unwrap_or(DEFAULT_FRAME_DELAY_SECS)
-}
-
-/// Returns whether the given area is on screen right now, unlike one in a hidden
-/// dock tab or one whose draw list has since been redrawn without it.
-fn is_area_on_screen(cx: &Cx, area: Area) -> bool {
-    area.is_valid(cx) && area.draw_list_id()
-        .and_then(|draw_list_id| cx.draw_lists[draw_list_id].draw_pass_id)
-        .is_some_and(|pass_id| !cx.pass_attachment_is_stale(pass_id)
-            && area.is_attached(cx, &cx.attached_draw_lists(pass_id)))
 }
 
 pub enum AsyncLoad {

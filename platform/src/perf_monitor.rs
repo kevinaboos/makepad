@@ -15,6 +15,7 @@
 //! Collection is off until something (normally the PerfGraph widget) calls
 //! `set_enabled(true)`; disabled adds are a single branch.
 
+use crate::makepad_micro_serde::*;
 use std::{cell::Cell, rc::Rc};
 
 pub const PERF_MONITOR_HISTORY: usize = 240;
@@ -56,6 +57,59 @@ pub struct PerfMonitorFrame {
     pub gap_ms: f32,
     /// Per-channel CPU time this frame, microseconds.
     pub channel_us: [u32; PERF_MONITOR_MAX_CHANNELS],
+    /// The CPU time the main thread used this frame, zero where the platform doesn't measure it.
+    pub thread_cpu_us: u32,
+}
+
+struct PerfPresent {
+    interval_ms: f32,
+    missed_vsyncs: u32,
+}
+
+/// The count, mean, median, 95th percentile and max of one series, in milliseconds.
+#[derive(Clone, Copy, Debug, Default, SerJson)]
+pub struct PerfStats {
+    pub count: u32,
+    pub avg: f32,
+    pub p50: f32,
+    pub p95: f32,
+    pub max: f32,
+}
+
+impl PerfStats {
+    fn from_samples(mut samples: Vec<f32>) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+        samples.sort_by(f32::total_cmp);
+        let round_to_us = |ms: f32| (ms * 1000.0).round() / 1000.0;
+        let percentile = |percent: usize| round_to_us(samples[(samples.len() - 1) * percent / 100]);
+        Self {
+            count: samples.len() as u32,
+            avg: round_to_us(samples.iter().sum::<f32>() / samples.len() as f32),
+            p50: percentile(50),
+            p95: percentile(95),
+            max: percentile(100),
+        }
+    }
+}
+
+/// Frame stats over the frames recorded since the last [`PerfMonitor::take_summary`] call.
+#[derive(Clone, Copy, Debug, Default, SerJson)]
+pub struct PerfSummary {
+    /// The time those frames span, which leaves out any idle time after the last one.
+    pub seconds: f32,
+    /// The time between frames, including any idle time between them.
+    pub frame_ms: PerfStats,
+    pub thread_cpu_ms: PerfStats,
+    pub event_ms: PerfStats,
+    pub draw_ms: PerfStats,
+    pub wait_ms: PerfStats,
+    pub gc_ms: PerfStats,
+    pub gpu_ms: PerfStats,
+    /// The time between frames reaching the display, for frames we drew back to back.
+    pub present_ms: PerfStats,
+    pub missed_vsyncs: u32,
 }
 
 #[derive(Clone)]
@@ -79,6 +133,8 @@ pub struct PerfMonitor {
     event_deduct: u32,
     /// Window repaints seen since enabling (see `frames_painted`).
     frames_painted: u64,
+    frames_since_summary: usize,
+    presents: Vec<PerfPresent>,
 }
 
 impl Default for PerfMonitor {
@@ -100,6 +156,8 @@ impl Default for PerfMonitor {
             event_depth: Rc::new(Cell::new(0)),
             event_deduct: 0,
             frames_painted: 0,
+            frames_since_summary: 0,
+            presents: Vec::new(),
         }
     }
 }
@@ -112,6 +170,8 @@ impl PerfMonitor {
             self.last_frame_time = None;
             self.cur = Default::default();
             self.event_deduct = 0;
+            self.frames_since_summary = 0;
+            self.presents.clear();
             GPU_ACCUM_US.store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -161,6 +221,24 @@ impl PerfMonitor {
         *slot = slot.saturating_add(us);
     }
 
+    pub fn add_thread_cpu_time(&mut self, us: u64) {
+        if self.enabled {
+            self.cur.thread_cpu_us = self.cur.thread_cpu_us.saturating_add(us as u32);
+        }
+    }
+
+    /// Records the time between two frames reaching the display, and how many
+    /// vsyncs went by without a new frame in between.
+    pub fn add_present(&mut self, interval_ms: f32, missed_vsyncs: u32) {
+        if !self.enabled {
+            return;
+        }
+        if self.presents.len() == PERF_MONITOR_HISTORY {
+            self.presents.remove(0);
+        }
+        self.presents.push(PerfPresent { interval_ms, missed_vsyncs });
+    }
+
     /// Close the frame being accumulated and start the next. Called by the
     /// platform at the start of every window repaint.
     pub fn frame_boundary(&mut self, time: f64) {
@@ -182,6 +260,7 @@ impl PerfMonitor {
             self.cur.gap_ms = ((time - last) * 1000.0) as f32;
             self.ring[self.at] = self.cur;
             self.at = (self.at + 1) % PERF_MONITOR_HISTORY;
+            self.frames_since_summary += 1;
         }
         self.last_frame_time = Some(time);
         self.cur = Default::default();
@@ -195,6 +274,35 @@ impl PerfMonitor {
         }
         for i in 0..PERF_MONITOR_HISTORY {
             out.push(self.ring[(self.at + i) % PERF_MONITOR_HISTORY]);
+        }
+    }
+
+    /// Returns stats for the frames recorded since the last call, so calling it once a second
+    /// gives a per-second summary. It only sees the newest `PERF_MONITOR_HISTORY` frames.
+    pub fn take_summary(&mut self) -> PerfSummary {
+        let count = std::mem::take(&mut self.frames_since_summary).min(self.ring.len());
+        let frames: Vec<PerfMonitorFrame> = (self.ring.len() - count..self.ring.len())
+            .map(|i| self.ring[(self.at + i) % PERF_MONITOR_HISTORY])
+            .collect();
+        let stats = |ms: fn(&PerfMonitorFrame) -> f32| {
+            PerfStats::from_samples(frames.iter().map(ms).collect())
+        };
+        // A zero here means the frame has no sample, like a GPU time that hasn't come back yet.
+        let nonzero_stats = |ms: fn(&PerfMonitorFrame) -> f32| {
+            PerfStats::from_samples(frames.iter().map(ms).filter(|ms| *ms > 0.0).collect())
+        };
+        let presents = std::mem::take(&mut self.presents);
+        PerfSummary {
+            seconds: frames.iter().map(|frame| frame.gap_ms).sum::<f32>() / 1000.0,
+            frame_ms: stats(|frame| frame.gap_ms),
+            thread_cpu_ms: nonzero_stats(|frame| frame.thread_cpu_us as f32 / 1000.0),
+            event_ms: stats(|frame| frame.channel_us[PERF_CHANNEL_EVENT.0] as f32 / 1000.0),
+            draw_ms: stats(|frame| frame.channel_us[PERF_CHANNEL_DRAW.0] as f32 / 1000.0),
+            wait_ms: stats(|frame| frame.channel_us[PERF_CHANNEL_DRAWABLE_WAIT.0] as f32 / 1000.0),
+            gc_ms: stats(|frame| frame.channel_us[PERF_CHANNEL_GC.0] as f32 / 1000.0),
+            gpu_ms: nonzero_stats(|frame| frame.channel_us[PERF_CHANNEL_GPU.0] as f32 / 1000.0),
+            present_ms: PerfStats::from_samples(presents.iter().map(|present| present.interval_ms).collect()),
+            missed_vsyncs: presents.iter().map(|present| present.missed_vsyncs).sum(),
         }
     }
 }

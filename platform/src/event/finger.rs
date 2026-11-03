@@ -1462,13 +1462,7 @@ impl Cx {
             return;
         }
         self.fingers.sweep_lock_validation_event = Some(event_id);
-        let attached = self.fingers.sweep_lock.is_some_and(|area| {
-            area.is_valid(self)
-                && area.draw_list_id()
-                    .and_then(|list| self.draw_lists[list].draw_pass_id)
-                    .is_some_and(|pass| !self.pass_attachment_is_stale(pass)
-                        && area.is_attached(self, &self.attached_draw_lists(pass)))
-        });
+        let attached = self.fingers.sweep_lock.is_some_and(|area| area.is_on_screen(self));
         if !attached {
             self.fingers.clear_sweep_lock();
         }

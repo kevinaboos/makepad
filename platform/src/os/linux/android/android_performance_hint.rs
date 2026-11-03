@@ -110,7 +110,7 @@ impl Drop for PerformanceHint {
 }
 
 /// This thread's CPU time, which leaves out any time it spent blocked, like waiting on a free buffer.
-fn thread_cpu_time() -> Duration {
+pub(crate) fn thread_cpu_time() -> Duration {
     #[repr(C)]
     struct Timespec {
         tv_sec: std::ffi::c_long,

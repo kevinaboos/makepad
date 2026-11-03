@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(use_vulkan)]
 use self::super::super::vulkan::CxVulkan;
 #[cfg(not(use_vulkan))]
+use self::super::android_partial_repaint::PartialRepaint;
+#[cfg(not(use_vulkan))]
 use self::super::android_shader_worker::ShaderWorkerState;
 use crate::event::LongPressEvent;
 #[allow(unused)]
@@ -21,6 +23,7 @@ use {
         super::libc_sys,
         android_camera_player::AndroidCameraPlayer,
         android_file_dialog,
+        android_frame_timing::FrameTiming,
         android_jni::{self, *},
         android_keycodes::android_to_makepad_key_code,
         android_media::CxAndroidMedia,
@@ -383,13 +386,14 @@ impl Cx {
                 || !self.os.camera_players.is_empty()
                 || !self.os.software_video_players.is_empty()
                 || next_timer_wait.is_some_and(|wait| wait <= 0.0);
-            if is_render_loop_wanted && !self.os.was_render_loop_wanted {
+            if android_jni::set_render_loop_wanted(is_render_loop_wanted) {
                 if let Some(hint) = &mut self.os.performance_hint {
                     hint.handle_vsync_restart();
                 }
+                if let Some(frame_timing) = &mut self.os.frame_timing {
+                    frame_timing.handle_vsync_restart();
+                }
             }
-            self.os.was_render_loop_wanted = is_render_loop_wanted;
-            android_jni::set_render_loop_wanted(is_render_loop_wanted);
 
             if self.os.in_xr_mode {
                 if self.openxr_render_loop(&from_java_rx) {
@@ -1617,6 +1621,7 @@ impl Cx {
     }
 
     pub(crate) fn handle_drawing(&mut self) {
+        self.start_perf_frame();
         if self.any_passes_dirty()
             || self.need_redrawing()
             || !self.new_next_frames.is_empty()
@@ -1636,17 +1641,25 @@ impl Cx {
                 self.redraw_all();
             }
 
+            self.start_perf_repaint();
             self.handle_repaint();
+            self.finish_perf_repaint();
 
             // Run script-VM garbage collection at a safe point after paint, matching
             // the macOS backend, so the script object heap doesn't grow without bound:
             // every `eval` / `script_apply_eval!` allocates script objects that are
             // only reclaimed by `gc()`. `needs_gc()` gates the actual sweep.
-            self.with_vm(|vm| {
-                if vm.heap().needs_gc() {
+            let gc_start = self.perf_monitor.enabled().then(Instant::now);
+            let did_gc = self.with_vm(|vm| {
+                let needs_gc = vm.heap().needs_gc();
+                if needs_gc {
                     vm.gc();
                 }
+                needs_gc
             });
+            if let Some(gc_start) = gc_start.filter(|_| did_gc) {
+                self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_GC, gc_start.elapsed().as_micros() as u64);
+            }
             if let Some(hint) = &mut self.os.performance_hint {
                 hint.mark_frame_drawn();
             }
@@ -1763,11 +1776,7 @@ impl Cx {
         unsafe {
             if let Some(display) = &mut self.os.display {
                 if display.is_surface_alive() {
-                    let swapped = (display.libegl.eglSwapBuffers.unwrap())(
-                        display.egl_display,
-                        display.surface,
-                    );
-                    if swapped != 0 {
+                    if display.swap_buffers() {
                         self.hide_android_surface_cover_after_first_present_if_needed();
                         self.request_android_surface_snapshot_refresh_after_present_if_needed();
                         self.start_shader_worker_after_first_present();
@@ -2307,6 +2316,8 @@ impl Cx {
             {
                 panic!("eglMakeCurrent failed: EGL error {:#x}", libegl.last_error());
             }
+            cx.gpu_info.vendor = super::super::opengl::get_gl_string(&libgl, gl_sys::VENDOR);
+            cx.gpu_info.renderer = super::super::opengl::get_gl_string(&libgl, gl_sys::RENDERER);
 
             //libgl.enable_debugging();
 
@@ -2320,6 +2331,8 @@ impl Cx {
                 egl_context,
                 surface,
                 window,
+                #[cfg(not(use_vulkan))]
+                partial_repaint: Default::default(),
             });
 
             #[cfg(use_vulkan)]
@@ -2487,6 +2500,8 @@ impl Cx {
         self.passes[draw_pass_id].paint_dirty = false;
         //let panning_offset = if self.os.keyboard_visible {self.os.keyboard_panning_offset} else {0};
 
+        #[cfg(not(use_vulkan))]
+        let repaint_rects = self.take_window_repaint_rects(draw_pass_id);
         let gl = self.os.gl();
         unsafe {
             (gl.glViewport)(
@@ -2510,6 +2525,11 @@ impl Cx {
             DrawPassClearDepth::ClearWith(depth) => depth,
         };
 
+        #[cfg(not(use_vulkan))]
+        if let Some(rects) = repaint_rects {
+            self.repaint_window_rects(draw_pass_id, draw_list_id, rects, clear_color, clear_depth);
+            return;
+        }
         if !self.passes[draw_pass_id].dont_clear {
             unsafe {
                 //(gl.glBindFramebuffer)(gl_sys::FRAMEBUFFER, 0);
@@ -2556,6 +2576,8 @@ impl Cx {
                 }
             }
         }
+        #[cfg(not(use_vulkan))]
+        self.plan_window_repaint(&passes_todo);
         for draw_pass_id in &passes_todo {
             let uniforms_gen = self.next_uniform_gen();
             let time = self.pass_time(self.os.timers.time_now());
@@ -2570,8 +2592,8 @@ impl Cx {
                     if self.windows[window_id].is_popup {
                         continue;
                     }
-                    let start = self.seconds_since_app_start();
-                    let metrics = self.collect_gpu_pass_metrics(*draw_pass_id);
+                    let gpu_sample_start = (Cx::has_studio_web_socket() || Cx::local_profile_capture_enabled())
+                        .then(|| (self.seconds_since_app_start(), self.collect_gpu_pass_metrics(*draw_pass_id)));
                     self.draw_pass_to_window_for_active_backend(*draw_pass_id);
 
                     // Draw popup window passes as overlays on the same surface: every open one,
@@ -2595,19 +2617,23 @@ impl Cx {
                         self.passes[popup_pass_id].dont_clear = saved;
                     }
 
-                    let end = self.seconds_since_app_start();
-                    Cx::send_studio_message(AppToStudio::GPUSample(GPUSample {
-                        start,
-                        end,
-                        draw_calls: metrics.draw_calls,
-                        instances: metrics.instances,
-                        vertices: metrics.vertices,
-                        instance_bytes: metrics.instance_bytes,
-                        uniform_bytes: metrics.uniform_bytes,
-                        vertex_buffer_bytes: metrics.vertex_buffer_bytes,
-                        texture_bytes: metrics.texture_bytes,
-                    }));
+                    if let Some((start, metrics)) = gpu_sample_start {
+                        let end = self.seconds_since_app_start();
+                        Cx::send_studio_message(AppToStudio::GPUSample(GPUSample {
+                            start,
+                            end,
+                            draw_calls: metrics.draw_calls,
+                            instances: metrics.instances,
+                            vertices: metrics.vertices,
+                            instance_bytes: metrics.instance_bytes,
+                            uniform_bytes: metrics.uniform_bytes,
+                            vertex_buffer_bytes: metrics.vertex_buffer_bytes,
+                            texture_bytes: metrics.texture_bytes,
+                        }));
+                    }
+                    self.start_perf_swap();
                     self.present_window_for_active_backend();
+                    self.finish_perf_swap();
                 }
                 CxDrawPassParent::DrawPass(_) => {
                     //let dpi_factor = self.get_delegated_dpi_factor(parent_pass_id);
@@ -3621,7 +3647,6 @@ impl Default for CxOs {
             pending_ime_hide: false,
             frame_rate_boost: false,
             frame_rate_boost_time: 0.0,
-            was_render_loop_wanted: true,
             media: CxAndroidMedia::default(),
             display: None,
             #[cfg(not(use_vulkan))]
@@ -3644,6 +3669,7 @@ impl Default for CxOs {
             activity_thread_id: None,
             render_thread_id: None,
             performance_hint: None,
+            frame_timing: None,
             ignore_destroy: false,
             in_xr_mode: false,
             xr_buffer_scale_active: ANDROID_XR_BUFFER_SCALE_DEFAULT,
@@ -3672,8 +3698,10 @@ pub struct CxAndroidDisplay {
     pub egl_display: egl_sys::EGLDisplay,
     pub egl_config: egl_sys::EGLConfig,
     pub egl_context: egl_sys::EGLContext,
-    surface: egl_sys::EGLSurface,
+    pub(crate) surface: egl_sys::EGLSurface,
     window: *mut ndk_sys::ANativeWindow,
+    #[cfg(not(use_vulkan))]
+    pub(crate) partial_repaint: PartialRepaint,
     //event_handler: Box<dyn EventHandler>,
 }
 
@@ -3775,7 +3803,6 @@ pub struct CxOs {
     /// Whether we've asked for the display's fastest mode, see `boost_frame_rate`.
     pub frame_rate_boost: bool,
     pub frame_rate_boost_time: f64,
-    pub(crate) was_render_loop_wanted: bool,
     pub frame_time: i64,
     pub quit: bool,
     pub fullscreen: bool,
@@ -3810,6 +3837,7 @@ pub struct CxOs {
     pub(crate) activity_thread_id: Option<u64>,
     pub(crate) render_thread_id: Option<u64>,
     pub(crate) performance_hint: Option<PerformanceHint>,
+    pub(crate) frame_timing: Option<FrameTiming>,
     pub(crate) ignore_destroy: bool,
     pub(crate) in_xr_mode: bool,
     pub(crate) xr_buffer_scale_active: f32,
@@ -3981,6 +4009,7 @@ impl CxAndroidDisplay {
             (self.libegl.eglDestroySurface.unwrap())(self.egl_display, self.surface);
         }
         self.surface = std::ptr::null_mut();
+        self.partial_repaint.clear_frames();
     }
 
     #[cfg(not(use_vulkan))]

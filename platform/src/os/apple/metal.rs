@@ -5483,7 +5483,16 @@ impl CxTexture {
     /// touches the texture from the CPU: that is what raced the in-flight
     /// readers. Returns the bytes uploaded.
     fn update_vec_texture(&mut self, metal_cx: &MetalCx, enc: &mut VecUploadEncoder) -> u64 {
-        if self.alloc_vec() {
+        // An append-only texture keeps its storage while it still has room for the new size.
+        let needs_new_texture = self.alloc_vec()
+            && !(self.is_append_only
+                && self.os.texture.as_ref().is_some_and(|texture| {
+                    let alloc = self.alloc.as_ref().unwrap();
+                    let width: u64 = unsafe { msg_send![texture.as_id(), width] };
+                    let height: u64 = unsafe { msg_send![texture.as_id(), height] };
+                    width == alloc.width as u64 && height >= alloc.height as u64
+                }));
+        if needs_new_texture {
             let alloc = self.alloc.as_ref().unwrap();
 
             let descriptor = RcObjcId::from_owned(
@@ -5501,8 +5510,13 @@ impl CxTexture {
                 unsafe { msg_send![descriptor.as_id(), setStorageMode: MTLStorageMode::Private] };
             let _: () =
                 unsafe { msg_send![descriptor.as_id(), setUsage: MTLTextureUsage::ShaderRead] };
+            let height = if self.is_append_only {
+                Self::get_append_only_capacity(alloc.height)
+            } else {
+                alloc.height
+            };
             let _: () = unsafe { msg_send![descriptor.as_id(), setWidth: alloc.width as u64] };
-            let _: () = unsafe { msg_send![descriptor.as_id(), setHeight: alloc.height as u64] };
+            let _: () = unsafe { msg_send![descriptor.as_id(), setHeight: height as u64] };
             let mip_level_count = match &self.format {
                 TextureFormat::VecMipBGRAu8_32 { max_level, .. }
                 | TextureFormat::VecMipRGBAf32 { max_level, .. } => {
