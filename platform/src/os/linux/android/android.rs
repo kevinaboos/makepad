@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(use_vulkan)]
 use self::super::super::vulkan::CxVulkan;
+#[cfg(not(use_vulkan))]
+use self::super::android_shader_worker::ShaderWorkerState;
 use crate::event::LongPressEvent;
 #[allow(unused)]
 use makepad_jni_sys as jni_sys;
@@ -142,17 +144,60 @@ fn install_android_panic_hook() {
         let summary = android_panic_summary(info);
         android_debug_log(6, &summary);
         crate::error!("{summary}");
+        PANIC_HEADLINE.with(|headline| {
+            headline.replace(summary.lines().next().map(str::to_string));
+        });
         previous_hook(info);
     }));
 }
 
+thread_local! {
+    /// This thread's latest panic, kept so an abort can put it in the crash report.
+    static PANIC_HEADLINE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// A dead render thread would leave the app looking frozen, so we abort when it panics.
+struct AbortOnRenderThreadPanic;
+
+impl Drop for AbortOnRenderThreadPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Crash reports show the tombstone's abort message, so we hand it the panic.
+            let headline = PANIC_HEADLINE.with(|headline| headline.take());
+            if let Some(headline) = headline.and_then(|headline| std::ffi::CString::new(headline).ok()) {
+                unsafe extern "C" {
+                    fn android_set_abort_message(msg: *const std::ffi::c_char);
+                }
+                unsafe { android_set_abort_message(headline.as_ptr()) };
+            }
+            std::process::abort();
+        }
+    }
+}
+
+pub(crate) fn load_libgl(libegl: &LibEgl) -> Result<LibGl, String> {
+    LibGl::try_load(|s| {
+        for s in s {
+            let s = CString::new(*s).unwrap();
+            let p = unsafe { libegl.eglGetProcAddress.unwrap()(s.as_ptr()) };
+            if !p.is_null() {
+                return p;
+            }
+        }
+        0 as _
+    })
+}
+
 pub fn set_current_thread_priority(priority: crate::CxThreadPriority) {
+    set_thread_priority(unsafe { libc_sys::syscall(libc_sys::SYS_GETTID) } as i32, priority);
+}
+
+pub(crate) fn set_thread_priority(tid: i32, priority: crate::CxThreadPriority) {
     use core::ffi::{c_int, c_uint};
 
     const PRIO_PROCESS: c_int = 0;
 
     unsafe extern "C" {
-        fn gettid() -> c_int;
         fn setpriority(which: c_int, who: c_uint, prio: c_int) -> c_int;
     }
 
@@ -164,9 +209,8 @@ pub fn set_current_thread_priority(priority: crate::CxThreadPriority) {
         crate::CxThreadPriority::Idle => 15,
     };
 
-    unsafe {
-        let tid = gettid();
-        if tid > 0 {
+    if tid > 0 {
+        unsafe {
             let _ = setpriority(PRIO_PROCESS, tid as c_uint, nice);
         }
     }
@@ -491,6 +535,10 @@ impl Cx {
                 .openxr
                 .destroy_instance(&self.os.display.as_ref().unwrap().libgl)
                 .ok();
+            // We don't wait for it, since a compile can't be interrupted.
+            if let ShaderWorkerState::Running(worker) = &self.os.shader_worker {
+                worker.stop();
+            }
         }
         from_java_messages_clear()
     }
@@ -1722,6 +1770,7 @@ impl Cx {
                     if swapped != 0 {
                         self.hide_android_surface_cover_after_first_present_if_needed();
                         self.request_android_surface_snapshot_refresh_after_present_if_needed();
+                        self.start_shader_worker_after_first_present();
                     }
                 }
             }
@@ -1790,6 +1839,18 @@ impl Cx {
 
         // Platform operations
         self.handle_platform_ops();
+
+        // Background shader builds
+        #[cfg(not(use_vulkan))]
+        {
+            self.handle_shader_worker_replies();
+            // Widgets made outside a draw, like a page built ahead of time, reach the worker right away.
+            if matches!(self.os.shader_worker, ShaderWorkerState::Running(_))
+                && !self.draw_shaders.compile_set.is_empty()
+            {
+                self.opengl_compile_shaders();
+            }
+        }
     }
 
     fn get_video_updates(&mut self) -> Vec<LiveId> {
@@ -2103,6 +2164,7 @@ impl Cx {
 
         // lets start a thread
         std::thread::spawn(move || {
+            let _abort_on_panic = AbortOnRenderThreadPanic;
             // SAFETY: This attaches the current thread to the JVM. It's safe as long as we're in the correct thread.
             unsafe { attach_jni_env() };
             let mut cx = startup();
@@ -2201,17 +2263,7 @@ impl Cx {
             };
 
             // SAFETY: This is loading OpenGL function pointers. It's safe as long as we have a valid EGL context.
-            let libgl = LibGl::try_load(|s| {
-                for s in s {
-                    let s = CString::new(*s).unwrap();
-                    let p = unsafe { libegl.eglGetProcAddress.unwrap()(s.as_ptr()) };
-                    if !p.is_null() {
-                        return p;
-                    }
-                }
-                0 as _
-            })
-            .expect("Cant load openGL functions");
+            let libgl = load_libgl(&libegl).expect("Cant load openGL functions");
 
             // SAFETY: Create an EGL surface to keep GL APIs available on Android.
             // In Vulkan mode this must not bind the native window, or Vulkan surface creation will fail.
@@ -2240,12 +2292,20 @@ impl Cx {
                     pbuffer_attribs.as_ptr(),
                 )
             };
+            // Vulkan only uses this context for GL calls, so without its pbuffer it can still go on surfaceless.
+            #[cfg(not(use_vulkan))]
+            if surface.is_null() {
+                panic!(
+                    "Creating the EGL surface failed: EGL error {:#x}",
+                    libegl.last_error()
+                );
+            }
 
             if unsafe {
                 (libegl.eglMakeCurrent.unwrap())(egl_display, surface, surface, egl_context)
             } == 0
             {
-                panic!();
+                panic!("eglMakeCurrent failed: EGL error {:#x}", libegl.last_error());
             }
 
             //libgl.enable_debugging();
@@ -2477,6 +2537,25 @@ impl Cx {
         self.compute_pass_repaint_order(&mut passes_todo);
         self.queue_popup_parents(&mut passes_todo);
         self.repaint_id += 1;
+        // Java shows our clear color in place of the surface whenever it hasn't drawn yet, like at startup
+        // or while resuming. We send it before drawing any pass, since that can bring up the compile screen.
+        for draw_pass_id in &passes_todo {
+            let CxDrawPassParent::Window(window_id) = self.passes[*draw_pass_id].parent else {
+                continue;
+            };
+            if self.windows[window_id].is_popup {
+                continue;
+            }
+            let color = self.passes[*draw_pass_id].clear_color;
+            let [r, g, b] = [color.x, color.y, color.z].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u32);
+            let argb = 0xFF00_0000 | (r << 16) | (g << 8) | b;
+            if self.os.last_app_background_argb != Some(argb) {
+                self.os.last_app_background_argb = Some(argb);
+                unsafe {
+                    android_jni::to_java_set_app_background_color(attach_jni_env(), argb);
+                }
+            }
+        }
         for draw_pass_id in &passes_todo {
             let uniforms_gen = self.next_uniform_gen();
             let time = self.pass_time(self.os.timers.time_now());
@@ -2490,17 +2569,6 @@ impl Cx {
                     // after their parent window pass below.
                     if self.windows[window_id].is_popup {
                         continue;
-                    }
-                    // Java shows our clear color in place of the surface whenever it hasn't drawn yet,
-                    // like at startup or while resuming.
-                    let color = self.passes[*draw_pass_id].clear_color;
-                    let [r, g, b] = [color.x, color.y, color.z].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u32);
-                    let argb = 0xFF00_0000 | (r << 16) | (g << 8) | b;
-                    if self.os.last_app_background_argb != Some(argb) {
-                        self.os.last_app_background_argb = Some(argb);
-                        unsafe {
-                            android_jni::to_java_set_app_background_color(attach_jni_env(), argb);
-                        }
                     }
                     let start = self.seconds_since_app_start();
                     let metrics = self.collect_gpu_pass_metrics(*draw_pass_id);
@@ -3556,6 +3624,8 @@ impl Default for CxOs {
             was_render_loop_wanted: true,
             media: CxAndroidMedia::default(),
             display: None,
+            #[cfg(not(use_vulkan))]
+            shader_worker: ShaderWorkerState::BeforeFirstPresent,
             surface_alive: false,
             #[cfg(use_vulkan)]
             vulkan: None,
@@ -3713,6 +3783,8 @@ pub struct CxOs {
     pub(crate) start_time: Instant,
     pub(crate) timers: PollTimers,
     pub display: Option<CxAndroidDisplay>,
+    #[cfg(not(use_vulkan))]
+    pub(crate) shader_worker: ShaderWorkerState,
     /// Tracks whether the active rendering surface (EGL window surface in OpenGL
     /// mode, or `ANativeWindow`-backed Vulkan surface in Vulkan mode) is currently
     /// valid for drawing.
@@ -3928,6 +4000,10 @@ impl CxAndroidDisplay {
             std::ptr::null_mut(),
         );
         if self.surface.is_null() {
+            crate::error!(
+                "Creating the EGL surface failed: EGL error {:#x}",
+                self.libegl.last_error()
+            );
             return;
         }
 
@@ -3938,6 +4014,10 @@ impl CxAndroidDisplay {
             self.egl_context,
         );
 
-        assert!(res != 0);
+        assert!(
+            res != 0,
+            "eglMakeCurrent failed: EGL error {:#x}",
+            self.libegl.last_error()
+        );
     }
 }

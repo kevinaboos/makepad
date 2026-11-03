@@ -1385,6 +1385,10 @@ impl Cx {
             .os_shader_id
             .is_some()
     }
+
+    pub fn can_draw_shader_window_become_ready(&self, _shader_id: DrawShaderId) -> bool {
+        true
+    }
 }
 
 fn texture_pixel_to_dx11_pixel(pix: &TexturePixel) -> DXGI_FORMAT {

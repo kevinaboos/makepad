@@ -310,8 +310,12 @@ pub struct Window {
     demo_next_frame: NextFrame,
     #[live]
     cursor_draw_list: DrawList2d,
+    /// Only `LinuxDirect` draws a cursor, so we build it from this template on its first draw
+    /// rather than compiling its shader on every platform.
     #[live]
-    draw_cursor: DrawQuad,
+    draw_cursor: ScriptObjectRef,
+    #[rust]
+    cursor_quad: Option<DrawQuad>,
     //#[live] debug_view: DebugView,
     //#[live] performance_view: PerformanceView,
     #[live]
@@ -433,6 +437,8 @@ impl ScriptHook for Window {
         _value: ScriptValue,
     ) {
         self.caption_has_content = None;
+        // The template may have changed (theme, live edit), so the cursor is rebuilt on its next draw.
+        self.cursor_quad = None;
         if !self.create_on_start && !self.initial_create_policy_applied {
             apply_initial_create_policy(vm.cx_mut(), &self.window.handle, false);
             self.initial_create_policy_applied = true;
@@ -1296,10 +1302,9 @@ impl Window {
                 pos: ev.abs - crate::cursor::hotspot(cx.mouse_cursor(), self.mouse_cursor_size),
                 size: self.mouse_cursor_size,
             };
-            if self.draw_cursor.draw_vars.area.is_valid(cx) {
-                self.draw_cursor.update_abs(cx, rect);
-            } else {
-                self.main_draw_list.redraw(cx);
+            match &mut self.cursor_quad {
+                Some(cursor_quad) if cursor_quad.draw_vars.area.is_valid(cx) => cursor_quad.update_abs(cx, rect),
+                _ => self.main_draw_list.redraw(cx),
             }
             trace!("input.cursor", "direct cursor position=({}, {}) shape={:?}", ev.abs.x, ev.abs.y, cx.mouse_cursor());
         }
@@ -1314,9 +1319,13 @@ impl Window {
         // Only the direct display owner draws a cursor, above every child.
         if let OsType::LinuxDirect = cx.os_type() {
             let shape = cx.mouse_cursor();
-            self.draw_cursor.draw_vars.set_dyn_instance(cx, id!(shape), &[crate::cursor::shape_value(shape)]);
+            let template: ScriptValue = self.draw_cursor.as_object().into();
+            let cursor_quad = self.cursor_quad.get_or_insert_with(|| {
+                cx.with_vm(|vm| DrawQuad::script_from_value(vm, template))
+            });
+            cursor_quad.draw_vars.set_dyn_instance(cx, id!(shape), &[crate::cursor::shape_value(shape)]);
             self.cursor_draw_list.begin_overlay_last(cx);
-            self.draw_cursor.draw_abs(cx, Rect {
+            cursor_quad.draw_abs(cx, Rect {
                 pos: self.last_mouse_pos - crate::cursor::hotspot(shape, self.mouse_cursor_size),
                 size: self.mouse_cursor_size,
             });

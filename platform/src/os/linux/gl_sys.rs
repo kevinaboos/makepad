@@ -123,6 +123,7 @@ pub const TEXTURE_WRAP_R: GLenum = 0x8072;
 pub const CLAMP_TO_EDGE: GLenum = 0x812F;
 pub const CLAMP_TO_BORDER: GLenum = 0x812D;
 pub const PROGRAM_BINARY_LENGTH: GLenum = 0x8741;
+pub const PROGRAM_BINARY_RETRIEVABLE_HINT: GLenum = 0x8257;
 pub const MAX_SHADER_COMPILER_THREADS_KHR: GLenum = 0x91B0;
 pub const COMPLETION_STATUS_KHR: GLenum = 0x91B1;
 pub const NO_ERROR: GLenum = 0x0;
@@ -322,6 +323,8 @@ pub type TglProgramBinary = unsafe extern "C" fn(
     binary: *const raw::c_void,
     length: GLsizei,
 ) -> ();
+pub type TglProgramParameteri =
+    unsafe extern "C" fn(program: GLuint, pname: GLenum, value: GLint) -> ();
 pub type TglDeleteRenderbuffers =
     unsafe extern "C" fn(n: GLsizei, renderbuffers: *const GLuint) -> ();
 pub type TglDeleteBuffers = unsafe extern "C" fn(n: GLsizei, buffers: *const GLuint) -> ();
@@ -482,6 +485,7 @@ pub struct LibGl {
     pub glIsTexture: Option<TglIsTexture>,
     pub glGetProgramBinary: TglGetProgramBinary,
     pub glProgramBinary: TglProgramBinary,
+    pub glProgramParameteri: Option<TglProgramParameteri>,
     pub glDeleteTextures: TglDeleteTextures,
     pub glDeleteRenderbuffers: TglDeleteRenderbuffers,
     pub glDeleteBuffers: TglDeleteBuffers,
@@ -783,6 +787,7 @@ impl LibGl {
                 "glProgramBinary",
                 "glProgramBinaryOES"
             )?,
+            glProgramParameteri: load!(loadfn, TglProgramParameteri, "glProgramParameteri").ok(),
             glDeleteRenderbuffers: load!(
                 loadfn,
                 TglDeleteRenderbuffers,

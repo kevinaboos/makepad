@@ -701,7 +701,10 @@ pub fn set_render_loop_wanted(is_wanted: bool) {
 fn init_simple_render_loop(device_refresh_rate: f32) {
     std::thread::spawn(move || {
         let mut last_frame_time = std::time::Instant::now();
-        let target_frame_time = std::time::Duration::from_secs_f32(1.0 / device_refresh_rate);
+        let target_frame_time = std::time::Duration::try_from_secs_f32(1.0 / device_refresh_rate)
+            .ok()
+            .filter(|frame_time| !frame_time.is_zero())
+            .unwrap_or(std::time::Duration::from_secs_f32(1.0 / 60.0));
         loop {
             // Exit the thread once the app has shut down and the Java->native
             // message channel has been torn down by `from_java_messages_clear()`
@@ -1616,6 +1619,11 @@ pub unsafe fn to_java_set_surface_cover_visible(visible: bool) {
 pub unsafe fn to_java_request_surface_snapshot_refresh() {
     let env = attach_jni_env();
     ndk_utils::call_void_method!(env, get_activity(), "requestSurfaceSnapshotRefresh", "()V");
+}
+
+pub unsafe fn to_java_show_shader_compile_screen() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "showShaderCompileScreen", "()V");
 }
 
 pub unsafe fn to_java_switch_activity(env: *mut jni_sys::JNIEnv) {

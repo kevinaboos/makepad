@@ -1188,43 +1188,24 @@ script_mod! {
             let sample = self.pos
             let px_x = max(abs(dFdx(sample.x)) + abs(dFdy(sample.x)), 0.00001)
             let px_y = max(abs(dFdx(sample.y)) + abs(dFdy(sample.y)), 0.00001)
-            let alpha_base = if self.aa_4x4 > 0.5 {
-                let x0 = px_x * 0.125
-                let x1 = px_x * 0.375
-                let y0 = px_y * 0.125
-                let y1 = px_y * 0.375
-                let a0 = self.alpha_at(sample + vec2(-x1, -y1), px_x, px_y)
-                let a1 = self.alpha_at(sample + vec2(-x0, -y1), px_x, px_y)
-                let a2 = self.alpha_at(sample + vec2( x0, -y1), px_x, px_y)
-                let a3 = self.alpha_at(sample + vec2( x1, -y1), px_x, px_y)
-                let a4 = self.alpha_at(sample + vec2(-x1, -y0), px_x, px_y)
-                let a5 = self.alpha_at(sample + vec2(-x0, -y0), px_x, px_y)
-                let a6 = self.alpha_at(sample + vec2( x0, -y0), px_x, px_y)
-                let a7 = self.alpha_at(sample + vec2( x1, -y0), px_x, px_y)
-                let a8 = self.alpha_at(sample + vec2(-x1,  y0), px_x, px_y)
-                let a9 = self.alpha_at(sample + vec2(-x0,  y0), px_x, px_y)
-                let a10 = self.alpha_at(sample + vec2( x0,  y0), px_x, px_y)
-                let a11 = self.alpha_at(sample + vec2( x1,  y0), px_x, px_y)
-                let a12 = self.alpha_at(sample + vec2(-x1,  y1), px_x, px_y)
-                let a13 = self.alpha_at(sample + vec2(-x0,  y1), px_x, px_y)
-                let a14 = self.alpha_at(sample + vec2( x0,  y1), px_x, px_y)
-                let a15 = self.alpha_at(sample + vec2( x1,  y1), px_x, px_y)
-                clamp(
-                    (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15)
-                        * 0.0625,
-                    0.0,
-                    1.0
-                )
-            } else if self.aa_2x2 > 0.5 {
-                let offset = vec2(px_x * 0.25, px_y * 0.25)
-                let a0 = self.alpha_at(sample + vec2(-offset.x, -offset.y), px_x, px_y)
-                let a1 = self.alpha_at(sample + vec2(offset.x, -offset.y), px_x, px_y)
-                let a2 = self.alpha_at(sample + vec2(-offset.x, offset.y), px_x, px_y)
-                let a3 = self.alpha_at(sample + vec2(offset.x, offset.y), px_x, px_y)
-                clamp((a0 + a1 + a2 + a3) * 0.25, 0.0, 1.0)
-            } else {
-                self.alpha_at(sample, px_x, px_y)
+            // Some drivers (like Mali's) inline every call to alpha_at,
+            // so we keep it to a single call inside this loop.
+            let sample_step = if self.aa_4x4 > 0.5 { 0.25 } else if self.aa_2x2 > 0.5 { 0.5 } else { 1.0 }
+            let first_offset = sample_step * 0.5 - 0.5
+            var alpha_sum = 0.0
+            var row = 0.0
+            loop {
+                if row >= 1.0 { break }
+                var col = 0.0
+                loop {
+                    if col >= 1.0 { break }
+                    let offset = vec2(col + first_offset, row + first_offset) * vec2(px_x, px_y)
+                    alpha_sum = alpha_sum + self.alpha_at(sample + offset, px_x, px_y)
+                    col = col + sample_step
+                }
+                row = row + sample_step
             }
+            let alpha_base = clamp(alpha_sum * sample_step * sample_step, 0.0, 1.0)
             let darken = clamp(max(px_x, px_y) * self.stem_darken, 0.0, self.stem_darken_max)
             let edge_weight = clamp(1.0 - abs(alpha_base * 2.0 - 1.0), 0.0, 1.0)
             let alpha = clamp(alpha_base + darken * edge_weight, 0.0, 1.0)
@@ -1811,7 +1792,14 @@ impl DrawText {
 
         if !self.ensure_slug_draw(cx) {
             self.slug_promotion.saw_unready_this_redraw = true;
-            cx.redraw_all();
+            // A helper that can never become ready, like one the driver rejected or any under Vulkan,
+            // keeps us on raster glyphs without redrawing.
+            let helper_can_become_ready = self.slug_draw.as_ref()
+                .and_then(|slug_draw| slug_draw.draw_vars.draw_shader_id)
+                .is_none_or(|shader_id| cx.cx.can_draw_shader_window_become_ready(shader_id));
+            if helper_can_become_ready {
+                cx.redraw_all();
+            }
             return false;
         }
 

@@ -2137,6 +2137,15 @@ impl Cx {
         self.os.boost_frame_rate();
     }
 
+    /// Whether this session builds the shaders its cache is missing on a background thread, so a screen created
+    /// early is ready by the time it opens. Only Android does that, and it reads false until the first frame shows.
+    pub fn is_building_shaders_in_background(&self) -> bool {
+        #[cfg(all(target_os = "android", not(use_vulkan)))]
+        return self.os.is_building_shaders_in_background();
+        #[cfg(not(all(target_os = "android", not(use_vulkan))))]
+        false
+    }
+
     pub fn send_trigger(&mut self, area: Area, trigger: Trigger) {
         if let Some(triggers) = self.triggers.get_mut(&area) {
             triggers.push(trigger);
