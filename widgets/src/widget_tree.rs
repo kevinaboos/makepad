@@ -2998,8 +2998,8 @@ struct UiRoot {
     active_path: RefCell<Vec<WidgetWeakRef>>,
 }
 
-fn cancel_scope_resolver(cx: &Cx, candidate: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
-    cx.get_global_ref::<UiRoot>()?.widget.upgrade()?.resolve_cancel_scope(candidate)
+fn cancel_scope_resolver(cx: &Cx, swipe_window: Option<WindowId>, candidate: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
+    cx.get_global_ref::<UiRoot>()?.widget.upgrade()?.resolve_cancel_scope(swipe_window, candidate)
 }
 
 pub fn set_ui_root(cx: &mut Cx, ui: &WidgetRef) {
