@@ -17,7 +17,7 @@ use {
         widget_async::CxSplashVmExt,
         widget_tree::CxWidgetExt,
     },
-    std::{collections::HashMap, ops::Range},
+    std::ops::Range,
 };
 
 script_mod! {
@@ -824,11 +824,11 @@ pub struct PortalList {
 
     // Templates stored as rooted ScriptObjectRef - populated in on_after_apply
     #[rust]
-    templates: HashMap<LiveId, ScriptObjectRef>,
+    templates: FastHashMap<LiveId, ScriptObjectRef>,
     #[rust]
     items: ComponentMap<usize, WidgetItem>,
     #[rust]
-    reusable_items: HashMap<LiveId, Vec<WidgetItem>>,
+    reusable_items: FastHashMap<LiveId, Vec<WidgetItem>>,
 
     #[rust(ScrollState::Stopped)]
     scroll_state: ScrollState,
