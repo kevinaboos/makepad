@@ -30,6 +30,7 @@ pub enum MacosEvent {
     LinkFire {
         window: crate::os::apple::apple_sys::ObjcId,
         time: f64,
+        period: f64,
         primary: bool,
         drawable: Option<crate::os::apple::apple_sys::ObjcId>,
         target_presentation_time: f64,

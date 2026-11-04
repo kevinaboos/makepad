@@ -749,8 +749,8 @@ impl Cx {
                 // shader) keep an OpenGL window presenting forever at rest.
                 if sh.mapping.uses_time {
                     crate::trace!("gl.repaint", "shader uses time");
-                    self.demo_time_repaint = true;
-                    self.passes[draw_pass_id].repaint_next = true;
+                    self.demo_time_repaint |= self.passes[draw_pass_id]
+                        .request_time_repaint(draw_call.options.time_fps, &mut self.time_fps_clock);
                 }
 
                 if sh.mapping.flags.debug_draw {

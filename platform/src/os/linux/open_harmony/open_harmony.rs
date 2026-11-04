@@ -6,7 +6,7 @@ use {
     crate::{
         cx::{Cx, OpenHarmonyParams, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
-        draw_pass::{CxDrawPassParent, DrawPassClearColor, DrawPassClearDepth, DrawPassId},
+        draw_pass::{CxDrawPassParent, DrawPassClearColor, DrawPassClearDepth, DrawPassId, TickClock},
         egl_sys::{self, LibEgl, EGL_NONE},
         event::{Event, KeyCode, KeyEvent, TouchUpdateEvent, VirtualKeyboardEvent, WindowGeom},
         gpu_info::GpuPerformance,
@@ -73,7 +73,8 @@ impl Cx {
 
         while !self.os.quit {
             match from_ohos_rx.recv() {
-                Ok(FromOhosMessage::VSync) => {
+                Ok(FromOhosMessage::VSync(vsync_time)) => {
+                    self.os.record_vsync(vsync_time);
                     self.handle_all_pending_messages(&from_ohos_rx);
                     self.handle_other_events();
                     self.handle_drawing();
@@ -135,8 +136,19 @@ impl Cx {
     }
 
     fn handle_drawing(&mut self) {
-        if self.any_passes_dirty() || self.need_redrawing() || !self.new_next_frames.is_empty() {
-            let time_now = self.os.timers.time_now();
+        // A shader that reads `draw_pass.time` only starts a repaint on a real vsync, with a surface to paint on.
+        let has_surface = self.os.display.as_ref().is_some_and(|display| !display.surface.is_null());
+        let is_vsync = std::mem::take(&mut self.os.has_new_vsync) && has_surface;
+        let time_now = self.os.timers.time_now();
+        // A vsync's repaint goes by the vsync itself, not by however long its handlers took.
+        let frame_time = if is_vsync { self.os.vsync_ticks.last } else { time_now };
+        // Any repaint swaps on the next vsync anyway, so all of them go by its interval.
+        let frame_interval = self.os.vsync_ticks.interval;
+        if self.any_passes_dirty()
+            || self.need_redrawing()
+            || !self.new_next_frames.is_empty()
+            || (is_vsync && (self.demo_time_repaint || self.is_time_repaint_due(frame_time, frame_interval)))
+        {
             if !self.new_next_frames.is_empty() {
                 self.call_next_frame_event(time_now);
             }
@@ -150,7 +162,7 @@ impl Cx {
                 self.redraw_all();
             }
 
-            self.handle_repaint();
+            self.handle_repaint(frame_time, frame_interval);
         }
     }
 
@@ -273,6 +285,7 @@ impl Cx {
                     ))
                 }
             }
+            FromOhosMessage::VSync(vsync_time) => self.os.record_vsync(vsync_time),
             _ => {}
         }
     }
@@ -499,9 +512,9 @@ impl Cx {
         //}
     }
 
-    pub(crate) fn handle_repaint(&mut self) {
+    pub(crate) fn handle_repaint(&mut self, frame_time: f64, frame_interval: f64) {
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        self.compute_pass_repaint_order(&mut passes_todo, frame_time, frame_interval);
         self.repaint_id += 1;
         for draw_pass_id in &passes_todo {
             let uniforms_gen = self.next_uniform_gen();
@@ -652,11 +665,21 @@ pub struct CxOs {
     pub arkts_obj: Option<ArkTsObjRef>,
     pub(crate) start_time: Instant,
     pub(crate) display: Option<CxOhosDisplay>,
+    pub(crate) has_new_vsync: bool,
+    pub(crate) vsync_ticks: TickClock,
 }
 
 impl CxOs {
     pub(crate) fn gl(&self) -> &LibGl {
         &self.display.as_ref().unwrap().libgl
+    }
+
+    /// Only a real vsync starts a repaint for a time-driven shader, and when its callback ran tells how far apart they come.
+    fn record_vsync(&mut self, vsync_time: Option<Instant>) {
+        if let Some(vsync_time) = vsync_time {
+            self.has_new_vsync = true;
+            self.vsync_ticks.tick(self.timers.time_now() - vsync_time.elapsed().as_secs_f64());
+        }
     }
 }
 
@@ -673,6 +696,8 @@ impl Default for CxOs {
             arkts_obj: None,
             start_time: Instant::now(),
             display: None,
+            has_new_vsync: false,
+            vsync_ticks: TickClock::default(),
         }
     }
 }

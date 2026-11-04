@@ -40,6 +40,9 @@ pub struct CxDrawShaderOptions {
     /// `alpha_blend: false` must output alpha 1.0 or intend a raw write.
     pub alpha_blend: bool,
     pub backface_culling: bool,
+    /// How many times a second a shader that animates from `draw_pass.time` needs its pass repainted,
+    /// or 0 to repaint it every frame. A small or slow animation looks the same at far fewer frames.
+    pub time_fps: f64,
 }
 
 impl Default for CxDrawShaderOptions {
@@ -50,6 +53,7 @@ impl Default for CxDrawShaderOptions {
             depth_write: true,
             alpha_blend: true,
             backface_culling: false,
+            time_fps: 0.0,
         }
     }
 }

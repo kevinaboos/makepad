@@ -654,8 +654,14 @@ impl WaylandCx {
             || !cx.new_next_frames.is_empty()
             || !cx.screenshot_requests.is_empty()
             || cx.demo_time_repaint;
-        let can_present = cx.any_passes_dirty() && !state.all_windows_frame_callback_pending();
-        let limit = cx.ui_wait_limit();
+        let windows_held = state.all_windows_frame_callback_pending();
+        let can_present = cx.any_passes_dirty() && !windows_held;
+        // A `time_fps` frame can't present while every window waits on its callback, which wakes us instead.
+        let time_fps_wait = cx
+            .time_repaint_at()
+            .filter(|_| !windows_held)
+            .map(|at| at - state.time_now());
+        let limit = cx.ui_wait_limit(time_fps_wait);
         wayland_app.ui_wait_limit = if matches!(event_flow, EventFlow::Wait)
             && (clocks_waiting || can_present || state.has_pending_clipboard_read())
         {
@@ -1351,10 +1357,11 @@ impl WaylandCx {
 
     pub(crate) fn handle_repaint(&self, state: &mut WaylandState) {
         let mut cx = self.cx.borrow_mut();
+        let frame_time = state.time_now();
         // Skip the eglMakeCurrent + full pass-list scan when there is nothing to draw.
         // Time-animated passes don't turn dirty until compute_pass_repaint_order,
-        // so demo_time_repaint must keep us rendering.
-        if !cx.any_passes_dirty() && !cx.demo_time_repaint {
+        // so demo_time_repaint, or a `time_fps` frame coming due, must keep us rendering.
+        if !cx.any_passes_dirty() && !cx.demo_time_repaint && !cx.is_time_repaint_due(frame_time, 0.0) {
             // This still binds our context while retirement work is pending.
             cx.maintain_instance_retirements();
             return;
@@ -1363,7 +1370,7 @@ impl WaylandCx {
             opengl_cx.make_current();
         }
         let mut passes_todo = Vec::new();
-        cx.compute_pass_repaint_order(&mut passes_todo);
+        cx.compute_pass_repaint_order(&mut passes_todo, frame_time, 0.0);
         cx.repaint_id += 1;
         for draw_pass_id in &passes_todo {
             let now = state.time_now();

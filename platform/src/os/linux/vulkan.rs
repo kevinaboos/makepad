@@ -6582,8 +6582,8 @@ impl CxVulkan {
                 };
 
                 if sh.mapping.uses_time {
-                    cx.demo_time_repaint = true;
-                    cx.passes[draw_pass_id].repaint_next = true;
+                    cx.demo_time_repaint |= cx.passes[draw_pass_id]
+                        .request_time_repaint(draw_call.options.time_fps, &mut cx.time_fps_clock);
                 }
 
                 draw_call.resolve_zbias(*zbias, sploded, uniforms_gen);

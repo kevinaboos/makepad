@@ -375,8 +375,8 @@ impl Cx {
                     continue;
                 }
                 if sh.mapping.uses_time {
-                    self.demo_time_repaint = true;
-                    self.passes[pass_id].repaint_next = true;
+                    self.demo_time_repaint |= self.passes[pass_id]
+                        .request_time_repaint(draw_call.options.time_fps, &mut self.time_fps_clock);
                 }
 
                 if sh.mapping.flags.debug_draw {

@@ -151,7 +151,17 @@ impl Cx {
 
         'event_loop: while event_flow != EventFlow::Exit {
             if event_flow == EventFlow::Wait {
-                direct_app.timers.select_fds(direct_app.raw_input.fds());
+                // Wake for the next `time_fps` frame only while a display can show it, since
+                // nothing paints it otherwise and its stale due would spin the select.
+                #[cfg(use_vulkan)]
+                let can_present = cx.direct_wait_reason() == crate::os::linux::vulkan::DirectWait::Ready;
+                #[cfg(not(use_vulkan))]
+                let can_present = true;
+                let time_fps_wait = cx
+                    .time_repaint_at()
+                    .filter(|_| can_present)
+                    .map(|at| at - direct_app.timers.time_now());
+                direct_app.timers.select_fds_capped(direct_app.raw_input.fds(), time_fps_wait);
             } else {
                 // A source whose image or frame fence is still in flight is
                 // retried on a short deadline that input and the wake pipe
@@ -473,7 +483,7 @@ impl Cx {
         if self.os.vulkan.as_ref().is_some_and(|gpu| gpu.gpu_transition_pending()) { return; }
         //opengl_cx.make_current();
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        self.compute_pass_repaint_order(&mut passes_todo, direct_app.timers.time_now(), 0.0);
         self.repaint_id += 1;
         for draw_pass_id in &passes_todo {
             let uniforms_gen = self.next_uniform_gen();

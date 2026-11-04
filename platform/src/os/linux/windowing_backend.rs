@@ -337,10 +337,10 @@ impl Cx {
         self.run_live_edit_if_needed(backend);
     }
 
-    /// Returns how long the event loop may sleep before the next tick is due, in seconds.
+    /// Returns how long the event loop may sleep before the next tick or `frame_wait` is due, in seconds.
     ///
     /// `None` means nothing needs polling, so only an event or a wakeup can bring work.
-    pub(crate) fn ui_wait_limit(&self) -> Option<f64> {
+    pub(crate) fn ui_wait_limit(&self, frame_wait: Option<f64>) -> Option<f64> {
         // None of these wake the loop by themselves: video players and GPU fences
         // get polled, `--remote` has deadlines and frame waiters, and queued ops
         // only get applied at the start of the next pass.
@@ -352,10 +352,11 @@ impl Cx {
             || self.pending_script_reapply
             || self.pending_live_edit_request
             || (!self.os.vulkan_active() && self.has_pending_gl_resource_retirements());
-        needs_tick.then(|| {
+        let tick_wait = needs_tick.then(|| {
             self.os.next_ui_tick.map_or(0.0, |due| {
                 due.saturating_duration_since(Instant::now()).as_secs_f64()
             })
-        })
+        });
+        tick_wait.into_iter().chain(frame_wait).reduce(f64::min)
     }
 }

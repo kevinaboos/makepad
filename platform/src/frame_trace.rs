@@ -25,7 +25,7 @@ pub enum TickSource {
     Timeout,
     /// An input message arrived while in `Wait` flow and a paint followed it.
     Message,
-    /// A Win32 timer (resize / drag-drop heartbeat).
+    /// A timer: the Win32 resize / drag-drop heartbeat, or the one a `time_fps` frame waits on.
     Timer,
     /// No beat source to wait on: the drain-then-paint fallback.
     Drain,

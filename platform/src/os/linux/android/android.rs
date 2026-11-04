@@ -34,7 +34,7 @@ use {
     crate::{
         cx::{AndroidParams, Cx, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace, XrFrameCpuBreakdown},
-        draw_pass::CxDrawPassParent,
+        draw_pass::{CxDrawPassParent, TickClock},
         draw_pass::{DrawPassClearColor, DrawPassClearDepth, DrawPassId},
         event::{
             drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
@@ -387,12 +387,7 @@ impl Cx {
                 || !self.os.software_video_players.is_empty()
                 || next_timer_wait.is_some_and(|wait| wait <= 0.0);
             if android_jni::set_render_loop_wanted(is_render_loop_wanted) {
-                if let Some(hint) = &mut self.os.performance_hint {
-                    hint.handle_vsync_restart();
-                }
-                if let Some(frame_timing) = &mut self.os.frame_timing {
-                    frame_timing.handle_vsync_restart();
-                }
+                self.os.handle_vsync_restart();
             }
 
             if self.os.in_xr_mode {
@@ -401,12 +396,27 @@ impl Cx {
                 };
             }
 
-            // Wait for the next message, or while ticks are paused, for the next due timer or boost release.
+            // While ticks are paused, a `time_fps` frame waits for the tick before its own and then posts
+            // one tick, which won't post another since ticks still aren't wanted.
+            let vsync_ticks = self.os.vsync_ticks;
+            let time_fps_wait = self
+                .os
+                .has_drawable_surface()
+                .then(|| self.time_repaint_tick_wake(vsync_ticks.last, vsync_ticks.interval))
+                .flatten()
+                .map(|wake| wake - self.os.timers.time_now());
+            let wants_time_fps_tick = !is_render_loop_wanted && time_fps_wait.is_some_and(|wait| wait <= 0.0);
+            #[cfg(not(no_android_choreographer))]
+            if wants_time_fps_tick && unsafe { android_jni::post_vsync_callback() } {
+                self.os.handle_vsync_restart();
+            }
+
+            // Wait for the next message, or while ticks are paused, for the next due timer, boost release or `time_fps` tick.
             // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
             let boost_wait = self.os.frame_rate_boost
                 .then(|| (self.os.frame_rate_boost_time + 1.0 - self.os.timers.time_now()).max(0.0));
-            let message = match next_timer_wait.into_iter().chain(boost_wait).reduce(f64::min) {
-                Some(wait) if !is_render_loop_wanted => from_java_rx.recv_timeout(
+            let message = match next_timer_wait.into_iter().chain(boost_wait).chain(time_fps_wait).reduce(f64::min) {
+                Some(wait) if !is_render_loop_wanted && !wants_time_fps_tick => from_java_rx.recv_timeout(
                     Duration::try_from_secs_f64(wait).unwrap_or(Duration::MAX)
                 ),
                 _ => from_java_rx.recv().map_err(RecvTimeoutError::from),
@@ -416,6 +426,7 @@ impl Cx {
                     if let Some(hint) = &mut self.os.performance_hint {
                         hint.start_cycle(vsync_time);
                     }
+                    self.os.record_vsync(vsync_time);
                     // Drain all pending messages, coalescing consecutive touch-move
                     // events to avoid redundant event dispatch before painting.
                     // Start/Stop events are never dropped — only pure-Move events
@@ -427,6 +438,7 @@ impl Cx {
                             if let Some(hint) = &mut self.os.performance_hint {
                                 hint.record_vsync(vsync_time);
                             }
+                            self.os.record_vsync(vsync_time);
                         }
                         if let FromJavaMessage::Touch(ref touches) = msg {
                             if touches
@@ -1622,11 +1634,12 @@ impl Cx {
 
     pub(crate) fn handle_drawing(&mut self) {
         self.start_perf_frame();
-        if self.any_passes_dirty()
+        let is_draw_requested = self.any_passes_dirty()
             || self.need_redrawing()
             || !self.new_next_frames.is_empty()
-            || self.demo_time_repaint
-        {
+            || self.demo_time_repaint;
+        let vsync_ticks = self.os.vsync_ticks;
+        if is_draw_requested || self.is_time_repaint_due(vsync_ticks.last, vsync_ticks.interval) {
             let time_now = self.os.timers.time_now();
             if !self.new_next_frames.is_empty() {
                 self.call_next_frame_event(time_now);
@@ -1642,7 +1655,7 @@ impl Cx {
             }
 
             self.start_perf_repaint();
-            self.handle_repaint();
+            let is_painted = self.handle_repaint();
             self.finish_perf_repaint();
 
             // Run script-VM garbage collection at a safe point after paint, matching
@@ -1660,8 +1673,11 @@ impl Cx {
             if let Some(gc_start) = gc_start.filter(|_| did_gc) {
                 self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_GC, gc_start.elapsed().as_micros() as u64);
             }
-            if let Some(hint) = &mut self.os.performance_hint {
-                hint.mark_frame_drawn();
+            // A tick that only came for a `time_fps` frame whose pass went away drew nothing.
+            if is_draw_requested || is_painted {
+                if let Some(hint) = &mut self.os.performance_hint {
+                    hint.mark_frame_drawn();
+                }
             }
         } else {
             #[cfg(not(use_vulkan))]
@@ -2551,10 +2567,12 @@ impl Cx {
         //}
     }
 
-    pub(crate) fn handle_repaint(&mut self) {
+    /// Returns whether there was any pass to paint.
+    pub(crate) fn handle_repaint(&mut self) -> bool {
         //opengl_cx.make_current();
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        let vsync_ticks = self.os.vsync_ticks;
+        self.compute_pass_repaint_order(&mut passes_todo, vsync_ticks.last, vsync_ticks.interval);
         self.queue_popup_parents(&mut passes_todo);
         self.repaint_id += 1;
         // Java shows our clear color in place of the surface whenever it hasn't drawn yet, like at startup
@@ -2664,6 +2682,7 @@ impl Cx {
                 }
             }
         }
+        !passes_todo.is_empty()
     }
 
     fn handle_platform_ops(&mut self) -> EventFlow {
@@ -3670,6 +3689,7 @@ impl Default for CxOs {
             render_thread_id: None,
             performance_hint: None,
             frame_timing: None,
+            vsync_ticks: TickClock::default(),
             ignore_destroy: false,
             in_xr_mode: false,
             xr_buffer_scale_active: ANDROID_XR_BUFFER_SCALE_DEFAULT,
@@ -3838,6 +3858,7 @@ pub struct CxOs {
     pub(crate) render_thread_id: Option<u64>,
     pub(crate) performance_hint: Option<PerformanceHint>,
     pub(crate) frame_timing: Option<FrameTiming>,
+    pub(crate) vsync_ticks: TickClock,
     pub(crate) ignore_destroy: bool,
     pub(crate) in_xr_mode: bool,
     pub(crate) xr_buffer_scale_active: f32,
@@ -3874,6 +3895,22 @@ impl CxOs {
             self.frame_rate_boost = true;
             unsafe { android_jni::to_java_set_frame_rate_boost(true); }
         }
+    }
+
+    /// Called when vsync ticks start again after a pause, which isn't a vsync period or part of a frame's work.
+    pub(crate) fn handle_vsync_restart(&mut self) {
+        if let Some(hint) = &mut self.performance_hint {
+            hint.handle_vsync_restart();
+        }
+        if let Some(frame_timing) = &mut self.frame_timing {
+            frame_timing.handle_vsync_restart();
+        }
+        self.vsync_ticks.pause();
+    }
+
+    /// Notes a vsync tick by when its callback ran, in the timers' clock that `time_fps` frames run on.
+    pub(crate) fn record_vsync(&mut self, vsync_time: Instant) {
+        self.vsync_ticks.tick(self.timers.time_now() - vsync_time.elapsed().as_secs_f64());
     }
 
     /// True while the Vulkan renderer exists. A Vulkan build whose

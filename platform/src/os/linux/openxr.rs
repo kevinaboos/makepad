@@ -171,6 +171,7 @@ impl Cx {
     pub(crate) fn openxr_handle_repaint(
         &mut self,
         frame: &CxOpenXrFrame,
+        frame_time: f64,
         #[cfg_attr(not(use_vulkan), allow(unused_variables))]
         xr_cpu: &mut XrFrameCpuBreakdown,
     ) {
@@ -180,7 +181,8 @@ impl Cx {
         let mut xr_render_cpu_ms = 0.0f64;
         #[cfg(use_vulkan)]
         let mut saw_xr_vulkan_pass = false;
-        self.compute_pass_repaint_order(&mut passes_todo);
+        let frame_interval = frame.frame_state.predicted_display_period.as_nanos() as f64 * 1e-9;
+        self.compute_pass_repaint_order(&mut passes_todo, frame_time, frame_interval);
         self.repaint_id += 1;
         #[cfg(use_vulkan)]
         let use_vulkan_xr = self
@@ -265,6 +267,8 @@ impl Cx {
             )
         };
         if let Ok((frame, mut xr_cpu)) = frame {
+            // The frame's beat is xrWaitFrame, so `time_fps` frames go by it, not by the handlers after it.
+            let frame_time = self.os.timers.time_now();
             let update_prepare_started = Instant::now();
             let (event, last_state, active_refresh_rate_hz, effective_frame_time_ms) = {
                 let openxr = &mut self.os.openxr;
@@ -328,7 +332,7 @@ impl Cx {
             }
 
             let repaint_started = Instant::now();
-            self.openxr_handle_repaint(&frame, &mut xr_cpu);
+            self.openxr_handle_repaint(&frame, frame_time, &mut xr_cpu);
             xr_cpu.repaint_ms = repaint_started.elapsed().as_secs_f64() * 1000.0;
 
             #[cfg(use_vulkan)]

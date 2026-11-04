@@ -1549,12 +1549,14 @@ impl MacosApp {
         .flatten() else {
             return;
         };
-        let (target, media_now): (f64, f64) =
-            unsafe { (msg_send![link, targetTimestamp], CACurrentMediaTime()) };
+        let (target, timestamp, media_now): (f64, f64, f64) = unsafe {
+            (msg_send![link, targetTimestamp], msg_send![link, timestamp], CACurrentMediaTime())
+        };
         let time = app_now + (target - media_now).clamp(0.0, 0.1);
         MacosApp::do_callback(MacosEvent::LinkFire {
             window,
             time,
+            period: target - timestamp,
             primary,
             drawable: None,
             target_presentation_time: target,

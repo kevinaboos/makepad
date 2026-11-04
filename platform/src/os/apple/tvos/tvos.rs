@@ -2,7 +2,7 @@ use {
     crate::{
         cx::{Cx, IosParams, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
-        draw_pass::CxDrawPassParent,
+        draw_pass::{CxDrawPassParent, TickClock},
         event::Event,
         //makepad_live_id::*,
         os::{
@@ -104,9 +104,12 @@ impl Cx {
 
     pub(crate) fn handle_repaint(&mut self, metal_cx: &mut MetalCx) {
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        self.compute_pass_repaint_order(&mut passes_todo, self.os.draw_ticks.last, self.os.draw_ticks.interval);
         self.repaint_id += 1;
+        let pass_time = self.pass_time(self.os.draw_ticks.last);
         for draw_pass_id in &passes_todo {
+            let uniforms_gen = self.next_uniform_gen();
+            self.passes[*draw_pass_id].set_time(pass_time, uniforms_gen);
             match self.passes[*draw_pass_id].parent.clone() {
                 CxDrawPassParent::Xr => {}
                 CxDrawPassParent::Window(_window_id) => {
@@ -182,6 +185,7 @@ impl Cx {
             }
             TvosEvent::Paint => {
                 let time_now = get_tvos_app_global().time_now();
+                self.os.draw_ticks.tick(time_now);
                 if self.new_next_frames.len() != 0 {
                     self.call_next_frame_event(time_now);
                 }
@@ -200,13 +204,20 @@ impl Cx {
             }
         }
 
+        // Timer 0 unpauses the view in time for the draw the next `time_fps` frame lands on.
+        let is_time_fps_draw_next = self
+            .time_repaint_tick_wake(self.os.draw_ticks.last, self.os.draw_ticks.interval)
+            .is_some_and(|wake| wake <= get_tvos_app_global().time_now());
         if self.any_passes_dirty()
             || self.need_redrawing()
             || self.new_next_frames.len() != 0
             || paint_dirty
+            || self.demo_time_repaint
+            || is_time_fps_draw_next
         {
             EventFlow::Poll
         } else {
+            self.os.draw_ticks.pause();
             EventFlow::Wait
         }
     }
@@ -333,4 +344,6 @@ pub struct CxOs {
     pub(crate) vertex_buffer_bytes_uploaded: u64,
     pub(crate) texture_bytes_uploaded: u64,
     pub(crate) apple_game_input: Option<crate::os::apple::apple_game_input::AppleGameInput>,
+    /// The view's draws, which `time_fps` frames land on.
+    pub(crate) draw_ticks: TickClock,
 }

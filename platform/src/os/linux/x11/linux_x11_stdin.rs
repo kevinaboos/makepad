@@ -461,10 +461,11 @@ impl Cx {
             opengl_cx.make_current();
         }
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        let time_now = self.os.stdin_timers.time_now();
+        self.compute_pass_repaint_order(&mut passes_todo, time_now, 0.0);
         self.repaint_id += 1;
 
-        let time = self.pass_time(self.os.stdin_timers.time_now());
+        let time = self.pass_time(time_now);
         for &draw_pass_id in &passes_todo {
             let uniforms_gen = self.next_uniform_gen();
             self.passes[draw_pass_id].set_time(time, uniforms_gen);

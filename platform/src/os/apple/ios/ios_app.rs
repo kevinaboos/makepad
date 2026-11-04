@@ -74,6 +74,8 @@ pub const UI_USER_INTERFACE_STYLE_DARK: i64 = 2;
 pub(crate) const IOS_TEXT_INPUT_CARET_HEIGHT: f64 = 20.0;
 pub(crate) const IOS_TEXT_INPUT_TARGET_HEIGHT: f64 = 32.0;
 pub const IOS_TEXT_EVENT_DRAIN_TIMER_ID: u64 = u64::MAX - 1;
+/// A one-shot that unpauses the view for the draw the next `time_fps` frame lands on.
+pub const IOS_TIME_FPS_TIMER_ID: u64 = u64::MAX - 2;
 
 // this value will be fetched from multiple threads (post signal uses it)
 pub static mut IOS_CLASSES: *const IosClasses = 0 as *const _;

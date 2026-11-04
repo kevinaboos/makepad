@@ -670,8 +670,10 @@ unsafe extern "C" fn vsync_callback(
     _data: *mut ndk_sys::AChoreographerFrameCallbackData,
     _user_data: *mut std::ffi::c_void,
 ) {
-    send_from_java_message(FromJavaMessage::RenderLoop(std::time::Instant::now()));
+    // Cleared before the tick goes out, so a post the render thread makes after handling it never
+    // fails on this callback, which won't post another while ticks aren't wanted.
     IS_VSYNC_CALLBACK_POSTED.store(false, Ordering::SeqCst);
+    send_from_java_message(FromJavaMessage::RenderLoop(std::time::Instant::now()));
     if IS_RENDER_LOOP_WANTED.load(Ordering::SeqCst) {
         post_vsync_callback();
     }

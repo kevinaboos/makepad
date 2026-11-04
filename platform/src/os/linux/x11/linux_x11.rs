@@ -351,7 +351,8 @@ impl X11Cx {
         }
 
         let cx = self.cx.borrow();
-        xlib_app.ui_wait_limit = cx.ui_wait_limit();
+        let time_fps_wait = cx.time_repaint_at().map(|at| at - xlib_app.time_now());
+        xlib_app.ui_wait_limit = cx.ui_wait_limit(time_fps_wait);
         if cx.any_passes_dirty()
             || cx.need_redrawing()
             || cx.new_next_frames.len() != 0
@@ -365,13 +366,14 @@ impl X11Cx {
     }
 
     pub(crate) fn handle_repaint(&mut self, opengl_windows: &mut Vec<OpenglWindow>) {
+        let frame_time = get_xlib_app_global().time_now();
         {
             // Paint follows every wake, so most have nothing to draw. If no pass is dirty,
             // skip the eglMakeCurrent + full pass-list scan below.
             // Time-animated passes don't turn dirty until compute_pass_repaint_order,
-            // so demo_time_repaint must keep us rendering.
+            // so demo_time_repaint, or a `time_fps` frame coming due, must keep us rendering.
             let mut cx = self.cx.borrow_mut();
-            if !cx.any_passes_dirty() && !cx.demo_time_repaint {
+            if !cx.any_passes_dirty() && !cx.demo_time_repaint && !cx.is_time_repaint_due(frame_time, 0.0) {
                 // This still binds our context while retirement work is pending.
                 cx.maintain_instance_retirements();
                 return;
@@ -381,7 +383,7 @@ impl X11Cx {
         {
             let mut cx = self.cx.borrow_mut();
             cx.os.opengl_cx.as_ref().unwrap().make_current();
-            cx.compute_pass_repaint_order(&mut passes_todo);
+            cx.compute_pass_repaint_order(&mut passes_todo, frame_time, 0.0);
             cx.repaint_id += 1;
         }
         for draw_pass_id in &passes_todo {
