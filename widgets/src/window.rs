@@ -1704,6 +1704,11 @@ impl Widget for Window {
         (self.has_focus || !self.focus_known) && self.cancel_children_impl(visit)
     }
 
+    // A swipe belongs to the window it starts in, even one without focus, just like a scroll.
+    fn visit_cancel_for_swipe(&self, window_id: WindowId, visit: &mut dyn FnMut(LiveId, WidgetRef)) -> bool {
+        window_id == self.window.window_id() && self.cancel_children_impl(visit)
+    }
+
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.handle_direct_mouse_cursor(cx, event);
         crate::desktop_style::handle_event(cx, event);
