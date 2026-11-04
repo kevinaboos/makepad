@@ -116,6 +116,15 @@ struct PassRecord {
     /// Whether the draw call records match what the last frame showed.
     is_valid: bool,
     draw_list_slots: Vec<usize>,
+    unbounded_call: Option<UnboundedCall>,
+}
+
+/// The draw call we couldn't bound that made the last walk repaint everything, and what it drew.
+struct UnboundedCall {
+    list_id: DrawListId,
+    item_id: usize,
+    shader_index: usize,
+    instances: Vec<u32>,
 }
 
 /// What each pass showed last frame, so we can tell which of its pixels the next frame changes.
@@ -155,6 +164,7 @@ struct DamageWalk<'a, F> {
     is_full: bool,
     /// The backend couldn't tell whether it'll draw a shader, so we can't trust this walk's records.
     is_uncertain: bool,
+    unbounded_call: Option<UnboundedCall>,
     paint_index: u64,
     key: Vec<u64>,
     draw_list_slots: Vec<usize>,
@@ -288,6 +298,38 @@ impl CxDrawDamage {
         shader_draws: &F,
     ) -> Option<Vec<DamageRect>> {
         self.walk_id += 1;
+        if let Some(record) = self.passes.get_mut(pass_id.0) {
+            let unbounded_call = record.unbounded_call.take().filter(|call| !cx.draw_lists.is_id_freed(call.list_id));
+            record.unbounded_call = unbounded_call.and_then(|mut call| {
+                let items = &cx.draw_lists[call.list_id].draw_items;
+                // A row scrolling away shifts every item id after it, so we follow the shader to its new item.
+                let item_id = std::iter::once(call.item_id).chain(0..items.len()).find(|id| {
+                    *id < items.len()
+                        && items[*id].kind.draw_call().is_some_and(|other| other.draw_shader_id.index == call.shader_index)
+                })?;
+                let instances = items[item_id].instances.as_deref().unwrap_or(&[]);
+                if call.instances.iter().copied().eq(instances.iter().map(|v| v.to_bits())) {
+                    return None;
+                }
+                call.item_id = item_id;
+                call.instances.clear();
+                call.instances.extend(instances.iter().map(|v| v.to_bits()));
+                Some(call)
+            });
+            // A scroll changes the same unbounded draw call every frame, so we stop walking until it's done.
+            // Our records go stale in the meantime, so we forget them and the next walk repaints everything.
+            if record.unbounded_call.is_some() {
+                record.is_valid = false;
+                for slot in std::mem::take(&mut record.draw_list_slots) {
+                    let list = &mut self.draw_lists[slot];
+                    if list.pass_id == Some(pass_id) {
+                        list.draw_calls.clear();
+                        list.pass_id = None;
+                    }
+                }
+                return None;
+            }
+        }
         let pass = &cx.passes[pass_id];
         let (Some(main_list_id), Some(dpi_factor)) = (pass.main_draw_list_id, pass.dpi_factor) else {
             self.invalidate_pass(pass_id);
@@ -369,6 +411,7 @@ impl CxDrawDamage {
             rects: Vec::new(),
             is_full,
             is_uncertain: false,
+            unbounded_call: None,
             paint_index: 0,
             key: Vec::new(),
             draw_list_slots: Vec::new(),
@@ -392,6 +435,7 @@ impl CxDrawDamage {
         let record = &mut self.passes[pass_id.0];
         record.draw_list_slots = std::mem::take(&mut walk.draw_list_slots);
         record.is_valid = !walk.is_uncertain;
+        record.unbounded_call = walk.unbounded_call.take();
         (!walk.is_full && !walk.is_uncertain).then_some(walk.rects)
     }
 
@@ -484,7 +528,7 @@ impl CxDrawDamage {
                     }
                 }
                 CxDrawKind::DrawCall(call) => {
-                    self.walk_draw_call(walk, slot, item_id, item, call, &space, is_list_changed, zbias, zbias_step);
+                    self.walk_draw_call(walk, list_id, item_id, item, call, &space, is_list_changed, zbias, zbias_step);
                 }
                 CxDrawKind::Empty => {}
             }
@@ -504,7 +548,7 @@ impl CxDrawDamage {
     fn walk_draw_call<F: Fn(&Cx, usize) -> Option<bool>>(
         &mut self,
         walk: &mut DamageWalk<F>,
-        slot: usize,
+        list_id: DrawListId,
         item_id: usize,
         item: &CxDrawItem,
         call: &CxDrawCall,
@@ -599,7 +643,7 @@ impl CxDrawDamage {
             &[]
         };
 
-        let calls = &mut self.draw_lists[slot].draw_calls;
+        let calls = &mut self.draw_lists[list_id.index()].draw_calls;
         if calls.len() <= item_id {
             calls.resize_with(item_id + 1, Default::default);
         }
@@ -652,6 +696,14 @@ impl CxDrawDamage {
                     bound = walk.pixels.framebuffer;
                 }
                 walk.add(walk.pixels.framebuffer);
+                if was_drawn && record.instances[..] != instances[..] {
+                    walk.unbounded_call.get_or_insert_with(|| UnboundedCall {
+                        list_id,
+                        item_id,
+                        shader_index,
+                        instances: item.instances.as_deref().unwrap_or(&[]).iter().map(|v| v.to_bits()).collect(),
+                    });
+                }
             }
             record.shader_index = Some(shader_index);
             record.key.clone_from(&walk.key);
