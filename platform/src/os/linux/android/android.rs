@@ -2551,7 +2551,8 @@ impl Cx {
                 //(gl.glBindFramebuffer)(gl_sys::FRAMEBUFFER, 0);
                 (gl.glClearDepthf)(clear_depth as f32);
                 (gl.glClearColor)(clear_color.x, clear_color.y, clear_color.z, clear_color.w);
-                (gl.glClear)(gl_sys::COLOR_BUFFER_BIT | gl_sys::DEPTH_BUFFER_BIT);
+                // We never use stencil, but a tiling GPU only skips loading the depth buffer when its stencil gets cleared too.
+                (gl.glClear)(gl_sys::COLOR_BUFFER_BIT | gl_sys::DEPTH_BUFFER_BIT | gl_sys::STENCIL_BUFFER_BIT);
             }
         }
         Self::set_default_depth_and_blend_mode(gl);

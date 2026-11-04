@@ -252,7 +252,7 @@ impl Cx {
             for rect in &rects {
                 let [x, y, width, height] = rect.to_bottom_left(framebuffer_height);
                 (gl.glScissor)(x, y, width, height);
-                (gl.glClear)(gl_sys::COLOR_BUFFER_BIT | gl_sys::DEPTH_BUFFER_BIT);
+                (gl.glClear)(gl_sys::COLOR_BUFFER_BIT | gl_sys::DEPTH_BUFFER_BIT | gl_sys::STENCIL_BUFFER_BIT);
             }
         }
         Self::set_default_depth_and_blend_mode(gl);

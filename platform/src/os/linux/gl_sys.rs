@@ -76,6 +76,7 @@ pub const BLEND: GLenum = 0x0BE2;
 pub const FRAMEBUFFER: GLenum = 0x8D40;
 pub const COLOR_BUFFER_BIT: GLenum = 0x00004000;
 pub const DEPTH_BUFFER_BIT: GLenum = 0x00000100;
+pub const STENCIL_BUFFER_BIT: GLenum = 0x00000400;
 pub const RENDERBUFFER: GLenum = 0x8D41;
 pub const DEPTH_COMPONENT16: GLenum = 0x81A5;
 pub const DEPTH_COMPONENT24: GLenum = 0x81A6;
