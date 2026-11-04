@@ -104,11 +104,11 @@ struct GpuTimer {
     get_query_object_u64: GetQueryObjectui64v,
     get_integer: GetIntegerv,
     queries: [GLuint; GPU_QUERY_COUNT],
-    /// The queries still waiting on their result, oldest first, each with whether we'll skip it,
-    /// since a disjoint event spoiled it or its repaint didn't present anything.
-    pending: VecDeque<(GLuint, bool)>,
+    /// The queries still waiting on their result, oldest first, each with whether we'll skip it
+    /// (since a disjoint event spoiled it or its repaint didn't present anything) and when it began.
+    pending: VecDeque<(GLuint, bool, Instant)>,
     next_query: usize,
-    is_open: bool,
+    open_since: Option<Instant>,
 }
 
 impl GpuTimer {
@@ -117,6 +117,12 @@ impl GpuTimer {
             .split_whitespace()
             .any(|extension| extension == "GL_EXT_disjoint_timer_query");
         if !has_extension {
+            crate::log!("The GPU timer is off, since there's no GL_EXT_disjoint_timer_query");
+            return None;
+        }
+        // A Mali-G71 (driver r19p0) flagged most frames disjoint and timed the rest at 1-2 us, far below their real GPU time.
+        if get_gl_string(&display.libgl, gl_sys::VENDOR) == "ARM" {
+            crate::log!("The GPU timer is off, since Mali's timer queries don't time whole frames");
             return None;
         }
         unsafe {
@@ -132,7 +138,7 @@ impl GpuTimer {
                 queries: [0; GPU_QUERY_COUNT],
                 pending: VecDeque::new(),
                 next_query: 0,
-                is_open: false,
+                open_since: None,
             };
             // Some drivers list the extension without a timer behind it.
             let mut counter_bits = 0;
@@ -149,27 +155,24 @@ impl GpuTimer {
     }
 
     fn begin(&mut self) {
-        if self.is_open || self.pending.len() == GPU_QUERY_COUNT {
+        if self.open_since.is_some() || self.pending.len() == GPU_QUERY_COUNT {
             return;
         }
         unsafe { (self.begin_query)(TIME_ELAPSED_EXT, self.queries[self.next_query]) };
-        self.is_open = true;
+        self.open_since = Some(Instant::now());
     }
 
     fn end(&mut self, is_presented: bool) {
-        if !self.is_open {
-            return;
-        }
+        let Some(began_at) = self.open_since.take() else { return };
         unsafe { (self.end_query)(TIME_ELAPSED_EXT) };
-        self.pending.push_back((self.queries[self.next_query], !is_presented));
+        self.pending.push_back((self.queries[self.next_query], !is_presented, began_at));
         self.next_query = (self.next_query + 1) % GPU_QUERY_COUNT;
-        self.is_open = false;
     }
 
     /// Reports the GPU time of the oldest frame that's done, so each perf monitor frame gets one sample.
     /// Without `is_reporting`, it only frees the queries of finished frames that never presented.
     fn collect(&mut self, is_reporting: bool) {
-        while let Some(&(query, is_skipped)) = self.pending.front() {
+        while let Some(&(query, is_skipped, _)) = self.pending.front() {
             if !is_skipped && !is_reporting {
                 return;
             }
@@ -182,14 +185,17 @@ impl GpuTimer {
             let mut is_disjoint = 0;
             unsafe { (self.get_integer)(GPU_DISJOINT_EXT, &mut is_disjoint) };
             if is_disjoint != 0 {
-                self.pending.iter_mut().for_each(|(_, is_skipped)| *is_skipped = true);
+                self.pending.iter_mut().for_each(|(_, is_skipped, _)| *is_skipped = true);
             }
-            let Some((_, is_skipped)) = self.pending.pop_front() else { return };
+            let Some((_, is_skipped, began_at)) = self.pending.pop_front() else { return };
             if !is_skipped {
                 let mut nanos = 0;
                 unsafe { (self.get_query_object_u64)(query, QUERY_RESULT_EXT, &mut nanos) };
-                perf_gpu_frame_completed(nanos as f64 / 1e9);
-                return;
+                // Mali can report a result that's empty or longer than the time since the query began, so we skip those.
+                if nanos > 0 && u128::from(nanos) <= began_at.elapsed().as_nanos() {
+                    perf_gpu_frame_completed(nanos as f64 / 1e9);
+                    return;
+                }
             }
         }
     }
