@@ -262,6 +262,9 @@ pub struct TabBar {
     active_tab_id: Option<LiveId>,
     #[rust]
     prev_active_tab_id: Option<LiveId>,
+    /// The content-relative x position and width of the active tab when we last scrolled it into view.
+    #[rust]
+    revealed_tab_rect: Option<(f64, f64)>,
     #[rust]
     next_active_tab_id: Option<LiveId>,
 
@@ -560,40 +563,48 @@ impl TabBar {
         self.scroll_bars.end(cx);
 
         // After scroll_bars.end() so that view_visible/view_total are up to date.
-        if self.active_tab_id != self.prev_active_tab_id {
-            self.prev_active_tab_id = self.active_tab_id;
-            if let Some(tab_id) = self.active_tab_id {
-                if let Some((tab, _)) = self.tabs.get(&tab_id) {
-                    // Convert the tab's absolute rect to content-relative coordinates.
-                    let abs_rect = tab.area().rect(cx);
-                    let container_pos = self.scroll_bars.area().rect(cx).pos;
-                    let scroll_pos = self.scroll_bars.get_scroll_pos();
-                    let content_x = abs_rect.pos.x - container_pos.x + scroll_pos.x;
-                    let view_visible = self.scroll_bars.get_scroll_view_visible().x;
-
-                    // Calculate the minimal target scroll position.
-                    let target = if content_x < scroll_pos.x {
-                        // Tab is off the left edge — scroll left.
-                        content_x
-                    } else if content_x + abs_rect.size.x > scroll_pos.x + view_visible {
-                        // Tab is off the right edge — scroll right.
-                        (content_x + abs_rect.size.x) - view_visible
-                    } else {
-                        // Already fully visible.
-                        return;
-                    };
-
-                    // Clamp to valid range.
-                    let view_total = self.scroll_bars.get_scroll_view_total().x;
-                    let target = target.max(0.0).min((view_total - view_visible).max(0.0));
-
-                    self.scroll_into_view_anim = Some(ScrollIntoViewAnim {
-                        target_scroll_x: target,
-                        next_frame: cx.new_next_frame(),
-                    });
-                }
-            }
+        let Some(tab_id) = self.active_tab_id else {
+            self.prev_active_tab_id = None;
+            return;
+        };
+        let Some((tab, _)) = self.tabs.get(&tab_id) else { return };
+        // Convert the tab's absolute rect to content-relative coordinates.
+        let abs_rect = tab.area().rect(cx);
+        let container_pos = self.scroll_bars.area().rect(cx).pos;
+        let scroll_pos = self.scroll_bars.get_scroll_pos();
+        let content_x = abs_rect.pos.x - container_pos.x + scroll_pos.x;
+        // A newly active tab gets scrolled into view, and so does the active tab if it moved or resized
+        // since then (e.g., the app sized it after its first draw). Scrolling doesn't move it in content.
+        let has_moved = self.revealed_tab_rect.is_none_or(|(x, width)| {
+            (x - content_x).abs() > 0.5 || (width - abs_rect.size.x).abs() > 0.5
+        });
+        if self.prev_active_tab_id == Some(tab_id) && !has_moved {
+            return;
         }
+        self.prev_active_tab_id = Some(tab_id);
+        self.revealed_tab_rect = Some((content_x, abs_rect.size.x));
+        let view_visible = self.scroll_bars.get_scroll_view_visible().x;
+
+        // Calculate the minimal target scroll position.
+        let target = if content_x < scroll_pos.x {
+            // Tab is off the left edge — scroll left.
+            content_x
+        } else if content_x + abs_rect.size.x > scroll_pos.x + view_visible {
+            // Tab is off the right edge — scroll right.
+            (content_x + abs_rect.size.x) - view_visible
+        } else {
+            // Already fully visible.
+            return;
+        };
+
+        // Clamp to valid range.
+        let view_total = self.scroll_bars.get_scroll_view_total().x;
+        let target = target.max(0.0).min((view_total - view_visible).max(0.0));
+
+        self.scroll_into_view_anim = Some(ScrollIntoViewAnim {
+            target_scroll_x: target,
+            next_frame: cx.new_next_frame(),
+        });
     }
 
     pub fn draw_tab(&mut self, cx: &mut Cx2d, tab_id: LiveId, name: &str, template: LiveId) {
