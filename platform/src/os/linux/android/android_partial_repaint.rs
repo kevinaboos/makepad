@@ -23,8 +23,9 @@ use crate::{
 
 const EGL_BUFFER_AGE_KHR: EGLint = 0x313D;
 
-/// Android keeps 2 to 4 back buffers, so we remember the damage of that many frames.
-const DAMAGE_HISTORY_LEN: usize = 4;
+/// Some phones hand out back buffers 6 frames old, so we remember as many frames as Android's BufferQueue has slots.
+/// Each repaint only reads as far back as its buffer's age.
+const DAMAGE_HISTORY_LEN: usize = 64;
 
 type SetDamageRegionFn = unsafe extern "C" fn(EGLDisplay, EGLSurface, *mut EGLint, EGLint) -> EGLBoolean;
 type SwapBuffersWithDamageFn = unsafe extern "C" fn(EGLDisplay, EGLSurface, *const EGLint, EGLint) -> EGLBoolean;
