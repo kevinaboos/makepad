@@ -262,9 +262,11 @@ pub struct TabBar {
     active_tab_id: Option<LiveId>,
     #[rust]
     prev_active_tab_id: Option<LiveId>,
-    /// The content-relative x position and width of the active tab when we last scrolled it into view.
+    /// The active tab's x position within the bar's content and its width, as of the last draw.
     #[rust]
-    revealed_tab_rect: Option<(f64, f64)>,
+    active_tab_x_and_width: Option<(f64, f64)>,
+    #[rust]
+    was_active_tab_in_view: bool,
     #[rust]
     next_active_tab_id: Option<LiveId>,
 
@@ -560,6 +562,9 @@ impl TabBar {
         self.draw_fill
             .draw_walk(cx, Walk::new(Size::fill(), Size::fill()));
 
+        // The tabs were drawn at this scroll offset, which scroll_bars.end() can change
+        // by clamping it or dropping a rubber-band stretch.
+        let drawn_scroll_x = cx.turtle().scroll().x;
         self.scroll_bars.end(cx);
 
         // After scroll_bars.end() so that view_visible/view_total are up to date.
@@ -571,19 +576,23 @@ impl TabBar {
         // Convert the tab's absolute rect to content-relative coordinates.
         let abs_rect = tab.area().rect(cx);
         let container_pos = self.scroll_bars.area().rect(cx).pos;
+        let content_x = abs_rect.pos.x - container_pos.x + drawn_scroll_x;
         let scroll_pos = self.scroll_bars.get_scroll_pos();
-        let content_x = abs_rect.pos.x - container_pos.x + scroll_pos.x;
-        // A newly active tab gets scrolled into view, and so does the active tab if it moved or resized
-        // since then (e.g., the app sized it after its first draw). Scrolling doesn't move it in content.
-        let has_moved = self.revealed_tab_rect.is_none_or(|(x, width)| {
+        let view_visible = self.scroll_bars.get_scroll_view_visible().x;
+        // A newly active tab gets scrolled into view. If it then moves or resizes (e.g., the app sized it after
+        // its first draw), we only scroll to it again if it was in view, so we don't undo the user's scrolling.
+        let has_moved = self.active_tab_x_and_width.is_none_or(|(x, width)| {
             (x - content_x).abs() > 0.5 || (width - abs_rect.size.x).abs() > 0.5
         });
-        if self.prev_active_tab_id == Some(tab_id) && !has_moved {
+        let should_scroll_into_view = self.prev_active_tab_id != Some(tab_id)
+            || (has_moved && (self.was_active_tab_in_view || self.scroll_into_view_anim.is_some()));
+        self.prev_active_tab_id = Some(tab_id);
+        self.active_tab_x_and_width = Some((content_x, abs_rect.size.x));
+        self.was_active_tab_in_view = content_x >= scroll_pos.x - 0.5
+            && content_x + abs_rect.size.x <= scroll_pos.x + view_visible + 0.5;
+        if !should_scroll_into_view {
             return;
         }
-        self.prev_active_tab_id = Some(tab_id);
-        self.revealed_tab_rect = Some((content_x, abs_rect.size.x));
-        let view_visible = self.scroll_bars.get_scroll_view_visible().x;
 
         // Calculate the minimal target scroll position.
         let target = if content_x < scroll_pos.x {
