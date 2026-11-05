@@ -86,6 +86,10 @@ script_mod! {
             color_hover: uniform(theme.color_inset_hover)
             color_down: uniform(theme.color_inset_down)
             color_active: uniform(theme.color_inset_active)
+            /** a checked box's color while hovered */
+            color_active_hover: uniform(theme.color_inset_hover)
+            /** a checked box's color while pressed */
+            color_active_down: uniform(theme.color_inset_down)
             color_focus: uniform(theme.color_inset_focus)
             color_disabled: uniform(theme.color_inset_disabled)
 
@@ -128,8 +132,8 @@ script_mod! {
                         let color_fill = self.color
                             .mix(self.color_focus, self.focus)
                             .mix(self.color_active, self.active)
-                            .mix(self.color_hover, self.hover)
-                            .mix(self.color_down, self.down)
+                            .mix(self.color_hover.mix(self.color_active_hover, self.active), self.hover)
+                            .mix(self.color_down.mix(self.color_active_down, self.active), self.down)
                             .mix(self.color_disabled, self.disabled)
 
                         let color_stroke = self.border_color
