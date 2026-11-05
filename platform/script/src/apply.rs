@@ -243,11 +243,10 @@ impl Apply {
     }
 
     /// True for the walks that follow a `script_mod` re-run (`Reload`,
-    /// `Rebake`). The re-run builds a fresh object heap, so any script object
-    /// reference a widget cached during an earlier walk is now dangling —
-    /// `Animator`'s cached state objects are the canonical example. Code
-    /// holding such references must re-resolve them from the incoming value
-    /// rather than reuse what it stored.
+    /// `Rebake`). The re-run builds fresh template objects, so the next GC can
+    /// free the old ones under any bare `ScriptObject` a widget cached during
+    /// an earlier walk. Code holding such references must re-resolve them from
+    /// the incoming value rather than reuse what it stored.
     ///
     /// `ScriptReapply` is excluded: it re-walks the same cached `app_value`,
     /// so cached references stay alive.

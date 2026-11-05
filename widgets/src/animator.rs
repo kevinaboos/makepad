@@ -419,6 +419,9 @@ pub struct Animator {
     /// the VM is free.
     #[rust]
     deferred: Vec<DeferredImmediate>,
+    /// The step of `script_apply_default` that we're on, while one is underway.
+    #[rust]
+    default_step: Option<usize>,
 }
 
 impl ScriptHook for Animator {
@@ -436,11 +439,12 @@ impl ScriptHook for Animator {
         // track is animating against. The track's refs keep those objects
         // alive, so walking them is safe, but they now describe the previous
         // template — and a `Play::Loop` track would pin them for good. Drop
-        // the tracks instead. `current_states` is kept: the logical state is
-        // still meaningful, and the next `cut`/`play` re-resolves its objects
-        // from the new heap.
+        // the tracks instead, counting them as finished so we still end up in
+        // the state they were heading to.
         if apply.follows_script_rerun() {
-            self.tracks.clear();
+            for track in self.tracks.drain(..) {
+                self.current_states.insert(track.group_id, track.state_id);
+            }
         }
         let obj_ref = vm.bx.heap.new_object_ref(obj);
         // Minted from the VM we are running in, so this always resolves; the
@@ -474,6 +478,9 @@ impl ScriptHook for Animator {
 
         // Only mark as defined if we actually have animator groups
         self.is_defined = !self.groups.is_empty();
+        if apply.preserves_runtime_state() {
+            self.refresh_state_object(vm);
+        }
         true
     }
 }
@@ -486,30 +493,27 @@ impl ScriptApplyDefault for Animator {
         _scope: &mut Scope,
         _value: ScriptValue,
     ) -> Option<ScriptValue> {
-        // `follows_script_rerun` rather than `is_live_edit_reload`: what makes
-        // injecting the current state unsafe is not that the DSL changed, it
-        // is that `script_mod` re-ran and freed the objects `state_object` and
-        // `groups` point at. Both `Reload` and `Rebake` re-run it.
-        if apply.follows_script_rerun() || apply.is_animate() || apply.is_eval() {
+        // A `Reload` means the template wins, which is also how lists reset a recycled item.
+        if apply.is_live_edit_reload() || apply.is_animate() || apply.is_eval() {
             return None;
         }
-
-        if let Some(state_obj_ref) = self.state_object.as_ref() {
-            if apply.as_default().is_none() {
-                return Some(state_obj_ref.as_object().into());
-            }
-            return None;
-        }
-
-        let index = apply.as_default().map_or(0, |x| x + 1);
-        let (group_id, group) = self.groups.iter().nth(index)?;
-        let state_id = self
-            .current_states
-            .get(group_id)
-            .copied()
-            .unwrap_or(group.default);
-        let state = group.states.get(&state_id)?;
-        Some(state.apply.as_ref()?.as_object().into())
+        let step = match (apply.as_default(), self.default_step) {
+            (None, _) => 0,
+            (Some(_), Some(step)) => step + 1,
+            // A widget that derefs a `View` has two animators, so this is the outer one's values going through us.
+            (Some(_), None) => return None,
+        };
+        // We put back `state_object`, then the groups it knows nothing about since they've stayed in their default state.
+        let state_object = self.state_object.as_ref().map(|obj| obj.as_object());
+        let next = state_object.filter(|_| step == 0).or_else(|| {
+            self.groups.iter()
+                .filter(|(group_id, _)| !self.current_states.contains_key(group_id) && !self.is_track_animating(**group_id))
+                .filter_map(|(_, group)| group.states.get(&group.default)?.apply.as_ref())
+                .nth(step - usize::from(state_object.is_some()))
+                .map(|apply| apply.as_object())
+        });
+        self.default_step = next.is_some().then_some(step);
+        next.map(Into::into)
     }
 }
 
@@ -1091,6 +1095,25 @@ impl Animator {
         );
     }
 
+    /// Re-reads the values of the states we've entered, since a reload can change them, like a new theme's colors.
+    fn refresh_state_object(&mut self, vm: &mut ScriptVm) {
+        for (group_id, state_id) in self.current_states.iter() {
+            // A running track keeps writing its own values, and we let it finish.
+            if self.tracks.iter().any(|track| track.group_id == *group_id) {
+                continue;
+            }
+            let Some(apply) = self.groups.get(group_id)
+                .and_then(|group| group.states.get(state_id))
+                .and_then(|state| state.apply.as_ref())
+            else { continue };
+            let state_obj = self.state_object.get_or_insert_with(|| {
+                let new_obj = vm.bx.heap.new_object();
+                vm.bx.heap.new_object_ref(new_obj)
+            });
+            Self::merge_object(vm, state_obj.as_object(), apply.as_object());
+        }
+    }
+
     /// Merge source object's values into target object (used for snap/cut operations)
     /// IMPORTANT: This deep-copies objects from source to avoid mutating templates
     /// Uses proto_map_iter_mut_with to include inherited properties from prototypes
@@ -1099,7 +1122,8 @@ impl Animator {
             source,
             &mut |vm: &mut ScriptVm, source_map: &mut ScriptObjectMap| {
                 for (key, source_value) in source_map.iter() {
-                    let source_val = source_value.value;
+                    // A copied `snap()` would lose its transform, so we keep the value it stands for.
+                    let source_val = vm.call_apply_transform(source_value.value).unwrap_or(source_value.value);
 
                     // Get existing value at this key in target's OWN map only
                     let existing = vm.map_mut_with(target, |_vm, target_map| {
@@ -1117,7 +1141,7 @@ impl Animator {
                         } else {
                             // Target doesn't have this in own map yet - create a COPY, don't reference
                             let new_obj = vm.bx.heap.new_object();
-                            Self::deep_copy_object(vm, new_obj, source_obj);
+                            Self::merge_object(vm, new_obj, source_obj);
                             vm.bx.heap.set_value_def(target, *key, new_obj.into());
                         }
                     } else {
