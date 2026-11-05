@@ -36,6 +36,10 @@ pub struct Rasterizer {
     /// The fonts and sizes whose printable ASCII we queue after this frame's own glyphs.
     queued_sdf_prewarms: Vec<(Rc<Font>, f32)>,
     atlas_epoch: u64,
+    /// 0 means every glyph fit this frame.
+    pub(super) atlas_overflow_hash: u64,
+    /// Only `Fonts` raises this, so a worker's atlas never grows.
+    pub(super) max_atlas_height: usize,
 }
 
 impl Rasterizer {
@@ -80,7 +84,6 @@ impl Rasterizer {
             }
         }
         Some(RasterizedGlyph {
-            atlas_size: self.atlas.size(),
             atlas_image_bounds: slot.rect,
             atlas_plane: slot.plane.index(),
             ..published.glyph
@@ -109,6 +112,8 @@ impl Rasterizer {
             prewarm_sdf_sizes: FxHashSet::default(),
             queued_sdf_prewarms: Vec::new(),
             atlas_epoch: 0,
+            atlas_overflow_hash: 0,
+            max_atlas_height: atlas_size.height,
         }
     }
 
@@ -243,14 +248,32 @@ impl Rasterizer {
         self.cached_slots.get(key).copied()
     }
 
+    fn allocate_or_grow<T>(
+        &mut self,
+        key: &GlyphImageKey,
+        allocate: impl Fn(&mut MultiPlaneAllocator, Size<usize>) -> Option<T>,
+    ) -> Option<T> {
+        if let Some(slot) = allocate(&mut self.allocator, key.size) {
+            return Some(slot);
+        }
+        // Straight to the full height, since every step re-uploads all of it.
+        let height = self.max_atlas_height;
+        if height > self.atlas.size().height {
+            self.atlas.grow(height);
+            self.allocator.size.height = height;
+            if let Some(slot) = allocate(&mut self.allocator, key.size) {
+                return Some(slot);
+            }
+        }
+        self.atlas_overflow_hash = self.atlas_overflow_hash.wrapping_add(fxhash::hash64(key));
+        None
+    }
+
     fn allocate_sdf_slot(&mut self, key: GlyphImageKey) -> Option<(AtlasSlot, bool)> {
         if let Some(slot) = self.get_cached_slot(&key) {
             return Some((slot, false));
         }
-        let Some(slot) = self.allocator.allocate_sdf_slot(key.size) else {
-            self.atlas.request_reset();
-            return None;
-        };
+        let slot = self.allocate_or_grow(&key, MultiPlaneAllocator::allocate_sdf_slot)?;
         self.cached_slots.insert(key, slot);
         Some((slot, true))
     }
@@ -259,10 +282,7 @@ impl Rasterizer {
         if let Some(slot) = self.get_cached_slot(&key) {
             return Some((slot, false));
         }
-        let Some(rect) = self.allocator.allocate_shared_slot(key.size) else {
-            self.atlas.request_reset();
-            return None;
-        };
+        let rect = self.allocate_or_grow(&key, MultiPlaneAllocator::allocate_shared_slot)?;
         let slot = AtlasSlot {
             rect,
             plane: AtlasPlane::R,
@@ -465,7 +485,6 @@ impl Rasterizer {
     ) -> RasterizedGlyph {
         RasterizedGlyph {
             atlas_kind: AtlasKind::Grayscale,
-            atlas_size: self.atlas.size(),
             atlas_image_bounds: slot.rect,
             atlas_image_padding: self.sdfer.settings().padding,
             atlas_plane: slot.plane.index(),
@@ -507,7 +526,6 @@ impl Rasterizer {
             if let Some(slot) = self.get_cached_slot(&key) {
                 return Some(RasterizedGlyph {
                     atlas_kind: AtlasKind::Msdf,
-                    atlas_size: self.atlas.size(),
                     atlas_image_bounds: slot.rect,
                     atlas_image_padding,
                     atlas_plane: AtlasPlane::R.index(),
@@ -639,7 +657,6 @@ impl Rasterizer {
             };
             Some(RasterizedGlyph {
                 atlas_kind: AtlasKind::Color,
-                atlas_size: self.atlas.size(),
                 atlas_image_bounds,
                 atlas_image_padding: PADDING,
                 atlas_plane: AtlasPlane::R.index(),
@@ -905,7 +922,6 @@ pub struct MsdfComplexitySettings {
 #[derive(Clone, Copy, Debug)]
 pub struct RasterizedGlyph {
     pub atlas_kind: AtlasKind,
-    pub atlas_size: Size<usize>,
     pub atlas_image_bounds: Rect<usize>,
     pub atlas_image_padding: usize,
     pub atlas_plane: u8,

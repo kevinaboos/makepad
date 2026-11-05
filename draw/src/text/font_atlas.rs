@@ -1,6 +1,7 @@
 use {
     super::{
         font::{FontId, GlyphId},
+        fonts::u32_vec_into_bgra,
         geom::{Rect, Size},
         image::{Bgra, Image, Subimage, SubimageMut},
         num::Zero,
@@ -9,7 +10,6 @@ use {
 
 #[derive(Clone, Debug)]
 pub struct FontAtlas<T> {
-    needs_reset: bool,
     image: Image<T>,
     dirty_rect: Rect<usize>,
 }
@@ -20,18 +20,9 @@ impl<T> FontAtlas<T> {
         T: Clone + Default,
     {
         Self {
-            needs_reset: false,
             image: Image::new(size),
             dirty_rect: Rect::ZERO,
         }
-    }
-
-    pub fn needs_reset(&self) -> bool {
-        self.needs_reset
-    }
-
-    pub fn request_reset(&mut self) {
-        self.needs_reset = true;
     }
 
     pub fn size(&self) -> Size<usize> {
@@ -72,14 +63,16 @@ impl<T> FontAtlas<T> {
             self.dirty_rect = self.dirty_rect.union(rect);
         }
     }
+}
 
-    pub fn reset_if_needed(&mut self) -> bool {
-        if !self.needs_reset() {
-            return false;
-        }
-        self.needs_reset = false;
-        self.dirty_rect = Rect::ZERO;
-        true
+impl FontAtlas<Bgra> {
+    /// Adds empty rows at the bottom. They come zeroed from the allocator, so they're free until they're used.
+    pub fn grow(&mut self, height: usize) {
+        let size = Size::new(self.size().width, height);
+        let mut pixels = u32_vec_into_bgra(vec![0; size.width * size.height]);
+        let old_pixels = self.image.as_pixels();
+        pixels[..old_pixels.len()].copy_from_slice(old_pixels);
+        self.image = Image::from_size_and_pixels(size, pixels);
     }
 }
 

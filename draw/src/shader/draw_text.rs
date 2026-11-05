@@ -674,24 +674,18 @@ script_mod! {
             let dyt = length(dFdy(self.t))
             if self.texture_index < 0.5 {
                 let c = self.get_color()
-                let scale = (dxt + dyt) * self.grayscale_texture.size().x * 0.5
-                let tex_size = self.grayscale_texture.size()
-                let half_texel = vec2(0.5 / tex_size.x, 0.5 / tex_size.y)
-                let p = clamp(self.t.xy, self.t_min + half_texel, self.t_max - half_texel)
+                let scale = (dxt + dyt) * 0.5
+                let p = clamp(self.t.xy, self.t_min + vec2(0.5, 0.5), self.t_max - vec2(0.5, 0.5)) / self.grayscale_texture.size()
                 let s = self.sdf(scale, p, c)
                 return s * vec4(c.rgb * c.a, c.a)
             } else if self.texture_index < 1.5 {
-                let tex_size = self.color_texture.size()
-                let half_texel = vec2(0.5 / tex_size.x, 0.5 / tex_size.y)
-                let p = clamp(self.t.xy, self.t_min + half_texel, self.t_max - half_texel)
+                let p = clamp(self.t.xy, self.t_min + vec2(0.5, 0.5), self.t_max - vec2(0.5, 0.5)) / self.color_texture.size()
                 let c = self.color_texture.sample_as_bgra(p)
                 return vec4(c.rgb * c.a, c.a)
             } else {
                 let c = self.get_color()
-                let scale = (dxt + dyt) * self.msdf_texture.size().x * 0.5
-                let tex_size = self.msdf_texture.size()
-                let half_texel = vec2(0.5 / tex_size.x, 0.5 / tex_size.y)
-                let p = clamp(self.t.xy, self.t_min + half_texel, self.t_max - half_texel)
+                let scale = (dxt + dyt) * 0.5
+                let p = clamp(self.t.xy, self.t_min + vec2(0.5, 0.5), self.t_max - vec2(0.5, 0.5)) / self.msdf_texture.size()
                 let s = self.msdf(scale, p, c)
                 return s * vec4(c.rgb * c.a, c.a)
             }
@@ -1107,26 +1101,20 @@ script_mod! {
                 let dxt = length(dFdx(self.t))
                 let dyt = length(dFdy(self.t))
                 let c = self.get_color()
-                let scale = (dxt + dyt) * self.grayscale_texture.size().x * 0.5
-                let tex_size = self.grayscale_texture.size()
-                let half_texel = vec2(0.5 / tex_size.x, 0.5 / tex_size.y)
-                let p = clamp(self.t.xy, self.t_min + half_texel, self.t_max - half_texel)
+                let scale = (dxt + dyt) * 0.5
+                let p = clamp(self.t.xy, self.t_min + vec2(0.5, 0.5), self.t_max - vec2(0.5, 0.5)) / self.grayscale_texture.size()
                 let s = self.sdf(scale, p, c)
                 return s * vec4(c.rgb * c.a, c.a)
             } else if self.texture_index < 1.5 {
-                let tex_size = self.color_texture.size()
-                let half_texel = vec2(0.5 / tex_size.x, 0.5 / tex_size.y)
-                let p = clamp(self.t.xy, self.t_min + half_texel, self.t_max - half_texel)
+                let p = clamp(self.t.xy, self.t_min + vec2(0.5, 0.5), self.t_max - vec2(0.5, 0.5)) / self.color_texture.size()
                 let c = self.color_texture.sample_as_bgra(p)
                 return vec4(c.rgb * c.a, c.a)
             } else if self.texture_index < 2.5 {
                 let dxt = length(dFdx(self.t))
                 let dyt = length(dFdy(self.t))
                 let c = self.get_color()
-                let scale = (dxt + dyt) * self.msdf_texture.size().x * 0.5
-                let tex_size = self.msdf_texture.size()
-                let half_texel = vec2(0.5 / tex_size.x, 0.5 / tex_size.y)
-                let p = clamp(self.t.xy, self.t_min + half_texel, self.t_max - half_texel)
+                let scale = (dxt + dyt) * 0.5
+                let p = clamp(self.t.xy, self.t_min + vec2(0.5, 0.5), self.t_max - vec2(0.5, 0.5)) / self.msdf_texture.size()
                 let s = self.msdf(scale, p, c)
                 return s * vec4(c.rgb * c.a, c.a)
             } else {
@@ -3350,13 +3338,6 @@ impl DrawText {
         glyph: RasterizedGlyph,
         output: &mut RecordingBuffer,
     ) {
-        fn tex_coord(point: Point<usize>, size: Size<usize>) -> Point<f32> {
-            Point::new(
-                point.x as f32 / size.width as f32,
-                point.y as f32 / size.height as f32,
-            )
-        }
-
         let texture_index = match glyph.atlas_kind {
             AtlasKind::Grayscale => 0.0,
             AtlasKind::Color => 1.0,
@@ -3364,9 +3345,8 @@ impl DrawText {
         };
 
         let atlas_image_bounds = glyph.atlas_image_bounds;
-        let atlas_size = glyph.atlas_size;
-        let t_min = tex_coord(glyph.atlas_image_bounds.min(), atlas_size);
-        let t_max = tex_coord(glyph.atlas_image_bounds.max(), atlas_size);
+        let t_min = atlas_image_bounds.min();
+        let t_max = atlas_image_bounds.max();
 
         let atlas_image_padding = glyph.atlas_image_padding;
         let atlas_image_size = atlas_image_bounds.size;
@@ -3399,8 +3379,9 @@ impl DrawText {
         }
         self.texture_index = texture_index;
         self.atlas_plane = glyph.atlas_plane as f32;
-        self.t_min = vec2(t_min.x, t_min.y);
-        self.t_max = vec2(t_max.x, t_max.y);
+        // These are texels, not UVs, so what's already recorded stays right when the atlas grows.
+        self.t_min = vec2(t_min.x as f32, t_min.y as f32);
+        self.t_max = vec2(t_max.x as f32, t_max.y as f32);
         let slice = self.draw_vars.as_slice();
 
         output.extend_from_slice(slice);

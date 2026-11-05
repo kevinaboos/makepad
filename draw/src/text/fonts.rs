@@ -1,8 +1,9 @@
 use {
     super::{
         font::{Font, FontId, GlyphId},
-        font_atlas::GlyphImageKind,
+        font_atlas::{ColorAtlas, GlyphImageKind},
         font_family::{FontFamily, FontFamilyId},
+        geom::Size,
         image::{Bgra, Image},
         layouter::{self, LaidoutText, LayoutParams, Layouter},
         loader::{FontDefinition, FontFamilyDefinition},
@@ -60,15 +61,34 @@ pub fn set_glyph_rendering(cx: &mut Cx, glyph_rendering: GlyphRendering) {
 /// Redraws the text that drew Slug in place of SDFs the worker has since built.
 ///
 /// Window calls this for every event, so an idle screen still swaps over to those SDFs.
+/// It also shrinks the atlas once it's been idle or when the app goes to the background.
 pub fn handle_event(cx: &mut Cx, event: &Event) {
-    if !matches!(event, Event::Signal) || !cx.has_global::<Rc<RefCell<Fonts>>>() {
+    if !matches!(event, Event::Signal | Event::Timer(_) | Event::Background)
+        || !cx.has_global::<Rc<RefCell<Fonts>>>()
+    {
         return;
     }
     let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
     let mut fonts = fonts.borrow_mut();
-    fonts.receive_completed_sdf_jobs();
-    fonts.redraw_slug_fallbacks_if_sdfs_are_done(cx);
+    match event {
+        Event::Signal => {
+            fonts.receive_completed_sdf_jobs();
+            fonts.redraw_slug_fallbacks_if_sdfs_are_done(cx);
+        }
+        Event::Background => fonts.shrink_atlas(cx),
+        Event::Timer(timer) if fonts.atlas_shrink_timer.is_timer(timer).is_some() => {
+            fonts.shrink_atlas(cx);
+            cx.redraw_all();
+        }
+        _ => {}
+    }
 }
+
+/// The most one copy of the atlas can take up, as much as a 4096x4096 BGRA texture.
+const MAX_ATLAS_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long a grown atlas waits for new glyphs before it goes back to its base size.
+const ATLAS_IDLE_SECS: f64 = 300.0;
 
 #[derive(Default)]
 struct LazyFontRequests {
@@ -121,6 +141,12 @@ pub struct Fonts {
     /// The counts we keep here, which `text_counters` joins with the atlas and rasterizer ones.
     pub(crate) counters: TextCounters,
     atlas_texture: Texture,
+    atlas_base_size: Size<usize>,
+    atlas_shrink_timer: Timer,
+    /// The `redraw_id` of the frame that fills an atlas we just emptied.
+    atlas_refill_redraw_id: u64,
+    /// Cleared once a refill fits.
+    seen_atlas_overflow_hashes: FxHashSet<u64>,
     slug_atlas: SlugAtlas,
     slug_min_dpxs_per_em: f32,
     slug_new_glyphs_per_redraw: usize,
@@ -237,6 +263,10 @@ impl Fonts {
                     updated: TextureUpdated::Empty,
                 },
             ),
+            atlas_base_size: atlas_size,
+            atlas_shrink_timer: Timer::empty(),
+            atlas_refill_redraw_id: 0,
+            seen_atlas_overflow_hashes: FxHashSet::default(),
             slug_atlas: SlugAtlas::new(cx),
             slug_min_dpxs_per_em,
             slug_new_glyphs_per_redraw: default_slug_new_glyphs_per_redraw(cx),
@@ -500,8 +530,16 @@ impl Fonts {
         assert!(!self.needs_prepare_atlases);
         // Frame boundary for the layout cache's working-set protection.
         self.layouter.advance_cache_generation();
-        let needs_reset = self.layouter.rasterizer().borrow().color_atlas().needs_reset()
-            || self.slug_atlas.needs_reset();
+        let overflow = std::mem::take(&mut self.layouter.rasterizer().borrow_mut().atlas_overflow_hash);
+        let is_refill = cx.redraw_id == self.atlas_refill_redraw_id;
+        if is_refill && overflow == 0 {
+            self.seen_atlas_overflow_hashes.clear();
+        }
+        // A refill already holds all it can of this frame's glyphs, so a reset wouldn't help it,
+        // and it wouldn't help any later frame that misses the same glyphs either.
+        let is_new_overflow = overflow != 0 && self.seen_atlas_overflow_hashes.insert(overflow);
+        let needs_atlas_reset = is_new_overflow && !is_refill;
+        let needs_reset = needs_atlas_reset || self.slug_atlas.needs_reset();
         if !needs_reset {
             self.receive_completed_sdf_jobs();
             self.dispatch_outline_jobs();
@@ -516,9 +554,9 @@ impl Fonts {
         self.prepare_atlas_texture(cx);
         self.needs_prepare_atlases = true;
         if needs_reset {
-            let mut rasterizer = self.layouter.rasterizer().borrow_mut();
-            if rasterizer.color_atlas_mut().reset_if_needed() {
-                rasterizer.on_atlas_reset();
+            if needs_atlas_reset {
+                self.layouter.rasterizer().borrow_mut().on_atlas_reset();
+                self.atlas_refill_redraw_id = cx.redraw_id + 1;
             }
             self.slug_atlas.reset_if_needed();
         }
@@ -528,7 +566,12 @@ impl Fonts {
     fn prepare_atlas_texture(&mut self, cx: &mut Cx) {
         let mut rasterizer = self.layouter.rasterizer().borrow_mut();
         let dirty_rect = rasterizer.color_atlas_mut().take_dirty_image().bounds();
+        let size = rasterizer.color_atlas().size();
         let pixels = bgra_vec_into_u32(rasterizer.color_atlas_mut().take_pixels());
+        // A backend that reallocates for this sends the whole image, see `TextureUpdated`.
+        if let TextureFormat::VecBGRAu8_32 { height, .. } = self.atlas_texture.get_format(cx) {
+            *height = size.height;
+        }
         self.atlas_texture.put_back_vec_u32(
             cx,
             pixels,
@@ -538,6 +581,32 @@ impl Fonts {
             )),
         );
         self.atlas_texture.set_content_epoch(cx, rasterizer.epoch());
+        // A refill doesn't start the countdown, or a screen that needs the extra rows would
+        // shrink and grow back forever. The next frame starts it instead.
+        if size != self.atlas_base_size
+            && cx.redraw_id != self.atlas_refill_redraw_id
+            && (!dirty_rect.is_empty() || self.atlas_shrink_timer.is_empty())
+        {
+            cx.stop_timer(self.atlas_shrink_timer);
+            self.atlas_shrink_timer = cx.start_timeout(ATLAS_IDLE_SECS);
+        }
+    }
+
+    /// Goes back to the base size, dropping the CPU pixels here and giving up the GPU texture.
+    fn shrink_atlas(&mut self, cx: &mut Cx) {
+        let size = self.atlas_base_size;
+        let mut rasterizer = self.layouter.rasterizer().borrow_mut();
+        if rasterizer.color_atlas().size() == size {
+            return;
+        }
+        *rasterizer.color_atlas_mut() = ColorAtlas::new(size);
+        rasterizer.on_atlas_reset();
+        let pixels = bgra_vec_into_u32(rasterizer.color_atlas_mut().take_pixels());
+        self.atlas_texture.release(cx);
+        self.atlas_texture.set_data_u32(cx, size.width, size.height, pixels);
+        cx.stop_timer(self.atlas_shrink_timer);
+        self.atlas_shrink_timer = Timer::empty();
+        self.atlas_refill_redraw_id = cx.redraw_id + 1;
     }
 
     pub fn prepare_atlases_if_needed(&mut self, cx: &mut Cx) {
@@ -559,6 +628,10 @@ impl Fonts {
         let pixels = self.atlas_texture.take_vec_u32(cx);
         let pixels = u32_vec_into_bgra(pixels);
         rasterizer.color_atlas_mut().replace_pixels(pixels);
+        let max_bytes = MAX_ATLAS_BYTES.min(cx.memory_budget() / 16);
+        rasterizer.max_atlas_height = (max_bytes / (self.atlas_base_size.width * 4))
+            .min(cx.gpu_info().max_texture_size)
+            .max(self.atlas_base_size.height);
     }
 
     fn dispatch_outline_jobs(&mut self) {
@@ -626,7 +699,7 @@ fn bgra_vec_into_u32(vec: Vec<Bgra>) -> Vec<u32> {
     unsafe { Vec::from_raw_parts(vec.as_mut_ptr().cast::<u32>(), vec.len(), vec.capacity()) }
 }
 
-fn u32_vec_into_bgra(vec: Vec<u32>) -> Vec<Bgra> {
+pub(super) fn u32_vec_into_bgra(vec: Vec<u32>) -> Vec<Bgra> {
     debug_assert_eq!(std::mem::size_of::<Bgra>(), std::mem::size_of::<u32>());
     debug_assert_eq!(std::mem::align_of::<Bgra>(), std::mem::align_of::<u32>());
     let mut vec = ManuallyDrop::new(vec);
