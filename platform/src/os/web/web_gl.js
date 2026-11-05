@@ -9,6 +9,10 @@ const MAKEPAD_WEBGL_FALLBACK_DIMENSION = 2048;
 const MAKEPAD_WEBGL_FALLBACK_VERTEX_ATTRIBS = 16;
 const MAKEPAD_WEBGL_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
 const MAKEPAD_WEBGL_MAX_TEXTURE_BYTES = 64 * 1024 * 1024;
+
+function makepad_swap_red_blue(value) {
+  return ((value & 0xff) << 16) | (value & 0xff00ff00) | ((value >>> 16) & 0xff);
+}
 const MAKEPAD_WEBGL_MAX_EXPANDED_TRIANGLES = 16 * 1024 * 1024;
 const MAKEPAD_WEBGL_MAX_SUBMISSION_REPORTS = 64;
 const MAKEPAD_WEBGL_VIDEO_UPLOAD_FORMAT = "video-rgba8";
@@ -806,26 +810,26 @@ export class WasmWebGL extends WasmWebBrowser {
     }
   }
 
+  get_bgra_upload_scratch(count) {
+    if (
+      !(this.bgra_upload_scratch instanceof Uint32Array) ||
+      this.bgra_upload_scratch.length < count ||
+      this.bgra_upload_scratch.byteLength > MAKEPAD_WEBGL_MAX_TEXTURE_BYTES
+    ) {
+      this.bgra_upload_scratch = new Uint32Array(count);
+    }
+    return this.bgra_upload_scratch;
+  }
+
   make_bgra_upload_view(admission) {
     const source = this.make_texture_source_view(admission, Uint32Array);
     if (!source) {
       return null;
     }
     try {
-      if (
-        !(this.bgra_upload_scratch instanceof Uint32Array) ||
-        this.bgra_upload_scratch.length < admission.required_elements ||
-        this.bgra_upload_scratch.byteLength > MAKEPAD_WEBGL_MAX_TEXTURE_BYTES
-      ) {
-        this.bgra_upload_scratch = new Uint32Array(admission.required_elements);
-      }
-      const converted = this.bgra_upload_scratch;
+      const converted = this.get_bgra_upload_scratch(admission.required_elements);
       for (let i = 0; i < admission.required_elements; i++) {
-        const value = source[i];
-        converted[i] =
-          ((value & 0xff) << 16) |
-          (value & 0xff00ff00) |
-          ((value >>> 16) & 0xff);
+        converted[i] = makepad_swap_red_blue(source[i]);
       }
       return new Uint8Array(
         converted.buffer,
@@ -2542,6 +2546,41 @@ export class WasmWebGL extends WasmWebBrowser {
           );
         }
       },
+    );
+  }
+
+  FromWasmUpdateTextureRect_BGRAu8_32(args) {
+    const gl = this.gl;
+    const texture = this.textures[args.texture_id];
+    if (!texture || texture._render_target_valid === false) {
+      return this.FromWasmAllocTextureImage2D_BGRAu8_32({
+        texture_id: args.texture_id,
+        width: args.image_width,
+        height: args.image_height,
+        data: args.data,
+      });
+    }
+    const count = args.width * args.height;
+    const source = new Uint32Array(this.memory.buffer, args.data.ptr, args.data.len);
+    const converted = this.get_bgra_upload_scratch(count);
+    let out = 0;
+    for (let y = args.y; y < args.y + args.height; y++) {
+      const row = y * args.image_width + args.x;
+      for (let x = 0; x < args.width; x++) {
+        converted[out++] = makepad_swap_red_blue(source[row + x]);
+      }
+    }
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D,
+      0,
+      args.x,
+      args.y,
+      args.width,
+      args.height,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      new Uint8Array(converted.buffer, 0, count * 4),
     );
   }
 
