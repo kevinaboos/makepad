@@ -391,6 +391,9 @@ impl Cx {
         step: f32,
     ) {
         if !self.draw_lists.1.allocations.has_device_limit() {
+            let mut max_texture_size = 0;
+            unsafe { (self.os.gl().glGetIntegerv)(gl_sys::MAX_TEXTURE_SIZE, &mut max_texture_size) };
+            self.gpu_info.max_texture_size = max_texture_size as usize;
             let reported = self.retained_adapter_bytes();
             let allowance = if reported != 0 {
                 reported as usize

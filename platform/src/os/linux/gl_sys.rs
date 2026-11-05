@@ -139,6 +139,7 @@ pub const PACK_SKIP_ROWS: GLenum = 0x0D03;
 pub const DRAW_FRAMEBUFFER: GLenum = 0x8CA9;
 pub const TEXTURE_EXTERNAL_OES: GLenum = 0x8D65;
 pub const EXTENSIONS: GLenum = 0x1F03;
+pub const MAX_TEXTURE_SIZE: GLenum = 0x0D33;
 pub const VENDOR: GLenum = 0x1F00;
 pub const RENDERER: GLenum = 0x1F01;
 pub const VERSION: GLenum = 0x1F02;
@@ -307,6 +308,7 @@ pub type TglSamplerParameteri =
     unsafe extern "C" fn(sampler: GLuint, pname: GLenum, param: GLint) -> ();
 pub type TglFlush = unsafe extern "C" fn() -> ();
 pub type TglFinish = unsafe extern "C" fn() -> ();
+pub type TglGetIntegerv = unsafe extern "C" fn(pname: GLenum, data: *mut GLint) -> ();
 /// `glWaitSync` — wait on a share-group `GLsync` in the current context.
 pub type TglWaitSync =
     unsafe extern "C" fn(sync: *const raw::c_void, flags: GLbitfield, timeout: u64) -> ();
@@ -482,6 +484,7 @@ pub struct LibGl {
     pub glReadPixels: TglReadPixels,
     pub glFlush: TglFlush,
     pub glFinish: TglFinish,
+    pub glGetIntegerv: TglGetIntegerv,
     pub glWaitSync: Option<TglWaitSync>,
     pub glIsTexture: Option<TglIsTexture>,
     pub glGetProgramBinary: TglGetProgramBinary,
@@ -773,6 +776,7 @@ impl LibGl {
             glSamplerParameteri: load!(loadfn, TglSamplerParameteri, "glSamplerParameteri").ok(),
             glFlush: load!(loadfn, TglFlush, "glFlush")?,
             glFinish: load!(loadfn, TglFinish, "glFinish")?,
+            glGetIntegerv: load!(loadfn, TglGetIntegerv, "glGetIntegerv")?,
             glWaitSync: load!(loadfn, TglWaitSync, "glWaitSync").ok(),
             glIsTexture: load!(loadfn, TglIsTexture, "glIsTexture").ok(),
             glClearDepthf: load!(loadfn, TglClearDepthf, "glClearDepthf", "glClearDepthfOES")?,

@@ -10,6 +10,9 @@ pub struct GpuInfo {
     pub min_uniform_vectors: u32,
     /// Native backends support these formats; WebGL reports its extension.
     pub float_color_targets: bool,
+    /// GL, Vulkan and WebGL ask the driver.
+    /// Metal and D3D11 feature level 11 all allow the default.
+    pub max_texture_size: usize,
     pub performance: GpuPerformance,
     pub vendor: String,
     pub renderer: String,
@@ -21,6 +24,7 @@ impl Default for GpuInfo {
             // default to a nice gpu
             min_uniform_vectors: 1024,
             float_color_targets: true,
+            max_texture_size: 8192,
             performance: GpuPerformance::Tier4,
             vendor: "unknown".to_string(),
             renderer: "unknown".to_string(),

@@ -3933,6 +3933,7 @@ export class WasmWebGL extends WasmWebBrowser {
       min_uniforms: Math.min(max_vertex_uniforms, max_fragment_uniforms),
       min_uniform_vectors: Math.min(max_vertex_uniforms, max_fragment_uniforms),
       float_color_targets: !!this.ext_color_buffer_float,
+      max_texture_size: this.webgl_limits.max_texture_size,
       vendor: "unknown",
       renderer: "unknown",
     };
