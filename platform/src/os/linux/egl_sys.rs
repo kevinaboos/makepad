@@ -308,6 +308,12 @@ impl LibEgl {
         unsafe { self.eglGetError.map_or(0, |get_error| get_error()) }
     }
 
+    /// Returns a null surface if the config doesn't allow a pbuffer.
+    pub(crate) unsafe fn create_1x1_pbuffer(&self, display: EGLDisplay, config: EGLConfig) -> EGLSurface {
+        let attributes = [EGL_WIDTH as i32, 1, EGL_HEIGHT as i32, 1, EGL_NONE as i32];
+        (self.eglCreatePbufferSurface.unwrap())(display, config, attributes.as_ptr())
+    }
+
     pub fn try_load() -> Option<LibEgl> {
         let module = ModuleLoader::load("libEGL.so")
             .or_else(|_| ModuleLoader::load("libEGL.so.1"))

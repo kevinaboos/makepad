@@ -832,6 +832,9 @@ impl Cx {
             .and_then(|scope| d3d11_windows.iter().find(|window| window.window_id == scope))
             .map_or(0.0, |window| window.refresh_period);
         self.compute_pass_repaint_order(&mut passes_todo, time_now, frame_interval);
+        if !self.textures.1.retired.is_empty() {
+            self.poll_texture_lifetimes();
+        }
         self.repaint_id += 1;
         let pass_time = self.pass_time(time_now);
         let scope = self.os.link_scope;

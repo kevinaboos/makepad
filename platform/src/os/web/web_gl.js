@@ -2239,6 +2239,8 @@ export class WasmWebGL extends WasmWebBrowser {
       if (!texture) continue;
       gl.deleteTexture(texture);
       this.textures[id] = undefined;
+      // It's as big as the largest upload so far, which may be what we're letting go of.
+      this.bgra_upload_scratch = null;
     }
     for (const id of new Set(args.framebuffer_ids || [])) {
       const framebuffer = this.framebuffers[id];

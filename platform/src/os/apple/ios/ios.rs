@@ -773,6 +773,9 @@ impl Cx {
             }
             IosEvent::Background => {
                 self.call_event_handler(&Event::Background);
+                // No repaint comes now, so what the app just released can't wait for one.
+                self.poll_texture_lifetimes();
+                metal_cx.clear_staging_pool();
             }
             IosEvent::Pause => {
                 self.call_event_handler(&Event::Pause);

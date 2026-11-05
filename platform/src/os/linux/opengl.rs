@@ -4698,7 +4698,7 @@ impl CxOsTexture {
             allocated.then_some(total)
         }
     }
-    fn destroy_released(&mut self, gl: &LibGl) {
+    pub(crate) fn destroy_released(&mut self, gl: &LibGl) {
         if self.gl_texture_owned {
             for copy in self
                 .gl_atlas_copies

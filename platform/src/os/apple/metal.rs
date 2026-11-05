@@ -2973,6 +2973,15 @@ impl MetalCx {
         }
     }
 
+    pub(crate) fn clear_staging_pool(&self) {
+        let mut pool = self.staging_pool.borrow_mut();
+        pool.extend(self.staging_returned.try_iter());
+        let bytes = pool.iter().map(|staging| staging.len).sum();
+        self.staging_returner.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.staging_returner.count.fetch_sub(pool.len(), Ordering::AcqRel);
+        pool.clear();
+    }
+
     /// The smallest pooled staging buffer that fits `len`, or a fresh one.
     /// Fresh buffers round up to 64 KiB so sizes cluster and a returned
     /// buffer fits the next upload of the same texture.
@@ -3027,6 +3036,10 @@ impl Cx {
         command_buffer: ObjcId,
         pan_frame: Option<&mut PanFrame>,
     ) -> u64 {
+        if std::mem::take(&mut self.textures.1.has_stale_metal_staging) {
+            self.poll_texture_lifetimes();
+            metal_cx.clear_staging_pool();
+        }
         let mut enc = VecUploadEncoder::new(command_buffer, pan_frame);
         let mut stack: Vec<DrawListId> = vec![draw_list_id];
         while let Some(list_id) = stack.pop() {
@@ -6959,7 +6972,9 @@ impl CxOsTexture {
 }
 
 impl Cx {
-    pub(crate) fn detach_released_texture(&mut self, _id: crate::texture::TextureId) {}
+    pub(crate) fn detach_released_texture(&mut self, _id: crate::texture::TextureId) {
+        self.textures.1.has_stale_metal_staging = true;
+    }
 
     pub(crate) fn poll_texture_lifetimes(&mut self) {
         let completed = self.textures.1.serials.completed.load(Ordering::Acquire);

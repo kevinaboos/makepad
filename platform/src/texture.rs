@@ -500,6 +500,9 @@ pub(crate) struct TextureLifetime {
     pub(crate) readbacks: TextureReadbacks,
     #[cfg(all(not(gpusim), any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     pub(crate) metal_readbacks: crate::os::apple::metal::MetalReadbacks,
+    /// A released texture's upload left a staging buffer its size in the pool.
+    #[cfg(all(not(gpusim), any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    pub(crate) has_stale_metal_staging: bool,
     #[cfg(all(not(gpusim), not(any(linux_direct, target_env = "ohos", all(use_vulkan, not(target_os = "linux")))), any(target_os = "linux", target_os = "android")))]
     pub(crate) gl_readbacks: crate::os::linux::opengl::GlReadbacks,
     #[cfg(all(not(gpusim), target_os = "windows"))]

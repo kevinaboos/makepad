@@ -481,15 +481,7 @@ impl WorkerGl {
             return Err(format!("eglCreateContext failed: EGL error {:#x}", egl.libegl.last_error()));
         }
         if has_pbuffer || !surfaceless {
-            let pbuffer_attributes = [
-                egl_sys::EGL_WIDTH as i32,
-                1,
-                egl_sys::EGL_HEIGHT as i32,
-                1,
-                egl_sys::EGL_NONE as i32,
-            ];
-            egl.surface =
-                (egl.libegl.eglCreatePbufferSurface.unwrap())(display, config, pbuffer_attributes.as_ptr());
+            egl.surface = egl.libegl.create_1x1_pbuffer(display, config);
             if egl.surface.is_null() {
                 return Err(format!(
                     "eglCreatePbufferSurface failed: EGL error {:#x}",

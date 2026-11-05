@@ -1494,6 +1494,34 @@ impl Cx {
             }
             FromJavaMessage::Stop => {
                 self.call_event_handler(&Event::Background);
+                // Nothing ticks in the background, so what the app just released can't wait for a frame.
+                #[cfg(not(use_vulkan))]
+                if let Some(display) = self.os.display.as_ref().filter(|_| !self.textures.1.retired.is_empty()) {
+                    let make_current = display.libegl.eglMakeCurrent.unwrap();
+                    let has_surface = display.is_surface_alive();
+                    // Our config may not allow a pbuffer, and then a null one asks for a surfaceless bind.
+                    let bind_surface = if has_surface {
+                        display.surface
+                    } else {
+                        unsafe { display.libegl.create_1x1_pbuffer(display.egl_display, display.egl_config) }
+                    };
+                    unsafe {
+                        if make_current(display.egl_display, bind_surface, bind_surface, display.egl_context) != 0 {
+                            (display.libgl.glFinish)();
+                            for mut retired in self.textures.1.retired.drain(..) {
+                                retired.os.destroy_released(&display.libgl);
+                            }
+                            (display.libgl.glFlush)();
+                        }
+                        if !has_surface {
+                            let null = std::ptr::null_mut();
+                            make_current(display.egl_display, null, null, null);
+                            if !bind_surface.is_null() {
+                                (display.libegl.eglDestroySurface.unwrap())(display.egl_display, bind_surface);
+                            }
+                        }
+                    }
+                }
             }
             FromJavaMessage::Destroy => {
                 if !self.os.ignore_destroy {
@@ -2303,20 +2331,7 @@ impl Cx {
             };
 
             #[cfg(use_vulkan)]
-            let surface = unsafe {
-                let pbuffer_attribs = [
-                    egl_sys::EGL_WIDTH as i32,
-                    1,
-                    egl_sys::EGL_HEIGHT as i32,
-                    1,
-                    egl_sys::EGL_NONE as i32,
-                ];
-                (libegl.eglCreatePbufferSurface.unwrap())(
-                    egl_display,
-                    egl_config,
-                    pbuffer_attribs.as_ptr(),
-                )
-            };
+            let surface = unsafe { libegl.create_1x1_pbuffer(egl_display, egl_config) };
             // Vulkan only uses this context for GL calls, so without its pbuffer it can still go on surfaceless.
             #[cfg(not(use_vulkan))]
             if surface.is_null() {
