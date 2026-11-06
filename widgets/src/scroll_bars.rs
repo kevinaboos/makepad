@@ -475,6 +475,7 @@ impl ScrollBars {
     }
 
     fn draw_scroll_bars_along(&mut self, cx: &mut Cx2d, track: Rect, view_visible: Vec2d, view_total: Vec2d) {
+        let laid_out_at = self.get_unstretched_scroll_pos();
         if self.show_scroll_x {
             let scroll_pos = self.scroll_bar_x
                 .draw_scroll_bar_along(cx, ScrollAxis::Horizontal, track, view_visible, view_total);
@@ -484,6 +485,11 @@ impl ScrollBars {
             let scroll_pos = self.scroll_bar_y
                 .draw_scroll_bar_along(cx, ScrollAxis::Vertical, track, view_visible, view_total);
             self.set_scroll_y(cx, scroll_pos);
+        }
+        // Content that got shorter (or a view that got bigger) can leave us scrolled past the end. The bars just
+        // pulled us back, but only after the content was laid out at the old offset, so we lay it out once more.
+        if self.get_unstretched_scroll_pos() != laid_out_at {
+            cx.redraw_area_in_draw(self.area);
         }
     }
 
