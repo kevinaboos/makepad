@@ -514,6 +514,13 @@ impl ViewRef {
         }
     }
 
+    /// See [`View::set_scroll_pos_no_clip()`].
+    pub fn set_scroll_pos_no_clip(&self, cx: &mut Cx, v: Vec2d) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_scroll_pos_no_clip(cx, v)
+        }
+    }
+
     /// See [`View::scroll_pos()`].
     pub fn scroll_pos(&self) -> Vec2d {
         self.borrow().map_or(Vec2d::default(), |inner| inner.scroll_pos())
@@ -1372,6 +1379,17 @@ impl View {
         if let Some(scroll_bars) = &mut self.scroll_bars_obj {
             scroll_bars.stop_motion();
             scroll_bars.set_scroll_pos(cx, v);
+        } else {
+            self.layout.scroll = v;
+        }
+    }
+
+    /// Like [`View::set_scroll_pos()`], but it doesn't clamp to the content of our last draw,
+    /// so we can scroll to content that we'll only draw next time. That draw clamps it instead.
+    pub fn set_scroll_pos_no_clip(&mut self, cx: &mut Cx, v: Vec2d) {
+        if let Some(scroll_bars) = &mut self.scroll_bars_obj {
+            scroll_bars.stop_motion();
+            scroll_bars.set_scroll_pos_no_clip(cx, v);
         } else {
             self.layout.scroll = v;
         }
