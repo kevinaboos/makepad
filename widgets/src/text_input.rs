@@ -3,7 +3,7 @@ use {
         animator::{Animate, Animator, AnimatorAction, AnimatorImpl, Play},
         makepad_derive_widget::*,
         makepad_draw::{
-            event::finger::{ScrollDirection, TouchState},
+            event::finger::{DigitId, ScrollDirection, TouchState},
             event::keyboard::CharOffset,
             ime::{
                 AutoCapitalize, AutoCorrect, InputMode, ReturnKeyType, SoftKeyboardConfig,
@@ -655,6 +655,9 @@ pub struct TextInput {
     /// Touch that started outside this input while focused and may blur on release, with where it started.
     #[rust]
     pending_outside_focus_loss_touch: Option<(u64, DVec2)>,
+    /// A touch on this input that focuses it if it turns out to be a tap, rather than a scroll or a long press.
+    #[rust]
+    pending_tap_focus: Option<DigitId>,
     /// IME composition tracking - byte index where composition starts
     #[rust]
     composition_start: usize,
@@ -2676,6 +2679,18 @@ impl Widget for TextInput {
                     cx.show_clipboard_actions(has_selection, selection_rect, cx.keyboard_shift);
                 }
             }
+            // A touch on a single-line input waits to see if it's a tap before focusing it, so a drag can scroll the page.
+            // Its press also keeps a focused input elsewhere from dropping the focus that we might take.
+            Hit::FingerDown(FingerDownEvent {
+                tap_count: 1,
+                device,
+                digit_id,
+                ..
+            }) if device.is_touch() && !self.is_multiline && device.is_primary_hit() && !scrollbar_captured => {
+                self.pending_tap_focus = Some(digit_id);
+                cx.fingers.mark_press_as_keeping_key_focus(digit_id);
+                self.animator_play(cx, ids!(hover.down));
+            }
             Hit::FingerDown(FingerDownEvent {
                 abs,
                 tap_count,
@@ -2744,6 +2759,18 @@ impl Widget for TextInput {
             Hit::FingerUp(fe) => {
                 self.ignore_next_move = false;
 
+                if self.pending_tap_focus.take() == Some(fe.digit_id)
+                    && fe.is_over
+                    && ScrollDirection::from_travel(fe.abs - fe.abs_start).is_none()
+                {
+                    self.reset_blink_timer(cx);
+                    self.set_key_focus(cx);
+                    let rel = fe.abs - self.text_area.rect(cx).pos;
+                    if let Ok(cursor) = self.point_in_lpxs_to_cursor(Point::new(rel.x as f32, rel.y as f32)) {
+                        self.set_cursor(cx, cursor, false);
+                    }
+                }
+
                 if fe.was_tap() {
                     if let Some(cursor) = self.preserved_selection_cursor.take() {
                         self.set_cursor(cx, cursor, false);
@@ -2764,6 +2791,11 @@ impl Widget for TextInput {
             }
             Hit::FingerLongPress(lp) => {
                 self.preserved_selection_cursor = None;
+                // A long press focuses us right away, and a drag after it adjusts the selection instead of scrolling.
+                self.pending_tap_focus = None;
+                cx.claim_finger_drag(lp.digit_id);
+                self.reset_blink_timer(cx);
+                self.set_key_focus(cx);
 
                 // Select word at long press position
                 let rel = lp.abs - self.text_area.rect(cx).pos;
@@ -2790,6 +2822,8 @@ impl Widget for TextInput {
                 // Skip next move to prevent selection change when finger lifts
                 self.ignore_next_move = true;
             }
+            // A touch that might still be a tap or a scroll doesn't select anything.
+            Hit::FingerMove(FingerMoveEvent { digit_id, .. }) if self.pending_tap_focus == Some(digit_id) => {}
             Hit::FingerMove(FingerMoveEvent {
                 abs,
                 tap_count,
