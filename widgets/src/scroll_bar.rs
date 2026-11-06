@@ -313,6 +313,10 @@ pub struct ScrollBar {
     /// Whether to enable drag scrolling
     #[live(false)]
     drag_scrolling: bool,
+    /// Whether a mouse drag that starts on a widget inside us, like a button, drags us once it's
+    /// a drag our way, like a touch drag always does (e.g., for a sideways row of buttons).
+    #[live(false)]
+    mouse_drags_from_widgets: bool,
     /// Whether the bar fades out once scrolling stops and the pointer leaves it.
     #[live(true)]
     auto_hide: bool,
@@ -962,13 +966,19 @@ impl ScrollBar {
 
         let axis = self.axis.vec_index();
         // We can share a press that only nested drag scrollers hold, along an axis none of them took,
-        // and a touch that widgets inside us hold, which we take from them once it's a drag our way.
+        // and a touch (or with `mouse_drags_from_widgets`, a mouse press) that widgets inside us hold,
+        // which we take from them once it's a drag our way.
         let joins = self.scrollable()
             && match event {
                 Event::MouseDown(e) => {
+                    let digit_id = live_id!(mouse).into();
                     e.button.is_primary()
                         && cx.fingers.can_mouse_drag_scroll()
-                        && cx.fingers.can_join_scroll_drag(live_id!(mouse).into(), axis, scroll_area)
+                        && if self.mouse_drags_from_widgets {
+                            cx.fingers.can_take_over_press(digit_id, axis, scroll_area)
+                        } else {
+                            cx.fingers.can_join_scroll_drag(digit_id, axis, scroll_area)
+                        }
                 }
                 Event::TouchUpdate(e) => {
                     let mut held = e

@@ -988,6 +988,14 @@ impl CxFingers {
         Some(direction)
     }
 
+    /// Removes `area`'s capture of `digit_id`'s press if a drag scroller took it over, see [`Self::take_over_press`].
+    fn remove_taken_over_capture(&mut self, digit_id: DigitId, area: Area) -> Option<CxDigitCapture> {
+        let index = self.captures.iter().position(|capture| {
+            capture.digit_id == digit_id && capture.area == area && capture.is_taken_over
+        })?;
+        Some(self.captures.remove(index))
+    }
+
     /// The way `digit_id`'s drag goes, picked once it has traveled the tap distance and kept for the rest of its press.
     fn drag_direction(&mut self, digit_id: DigitId, travel: Vec2d) -> Option<ScrollDirection> {
         if let Some((_, direction)) = self.scroll_drag_locks.iter().find(|(id, _)| *id == digit_id) {
@@ -1703,11 +1711,7 @@ impl Event {
                     // A drag scroller took this press over from our widget, which gets one last FingerUp
                     // as a sweep (so it isn't taken for a tap or a click), then nothing more of the press.
                     if t.state != TouchState::Start {
-                        let taken_over = cx.fingers.captures.iter().position(|capture| {
-                            capture.digit_id == digit_id && capture.area == area && capture.is_taken_over
-                        });
-                        if let Some(index) = taken_over {
-                            let capture = cx.fingers.captures.remove(index);
+                        if let Some(capture) = cx.fingers.remove_taken_over_capture(digit_id, area) {
                             return Hit::FingerUp(FingerUpEvent {
                                 abs_start: capture.abs_start,
                                 rect: area.clipped_rect(cx),
@@ -1934,6 +1938,25 @@ impl Event {
 
                 if let Some((button, _window_id)) = cx.fingers.first_mouse_button {
                     let device = DigitDevice::Mouse { button };
+                    // Like a touch, a press that a drag scroller took over from our widget gets one last
+                    // FingerUp as a sweep, then nothing more.
+                    if let Some(capture) = cx.fingers.remove_taken_over_capture(digit_id, area) {
+                        return Hit::FingerUp(FingerUpEvent {
+                            abs_start: capture.abs_start,
+                            rect,
+                            window_id: e.window_id,
+                            abs: e.abs,
+                            digit_id,
+                            device,
+                            has_long_press_occurred: capture.has_long_press_occurred,
+                            tap_count,
+                            capture_time: capture.time,
+                            modifiers: e.modifiers,
+                            time: e.time,
+                            is_over: false,
+                            is_sweep: true,
+                        });
+                    }
                     //let handled_area = e.handled.get();
                     if !options.sweep_area.is_empty() {
                         if let Some(capture) = cx.fingers.find_digit_capture(digit_id) {
@@ -2140,6 +2163,25 @@ impl Event {
                 let device = DigitDevice::Mouse { button: e.button };
                 let tap_count = cx.fingers.tap_count();
                 let rect = area.clipped_rect(&cx);
+
+                // A press that a drag scroller took over on its last move ends as a sweep too.
+                if let Some(capture) = cx.fingers.remove_taken_over_capture(digit_id, area) {
+                    return Hit::FingerUp(FingerUpEvent {
+                        abs_start: capture.abs_start,
+                        rect,
+                        window_id: e.window_id,
+                        abs: e.abs,
+                        digit_id,
+                        device,
+                        has_long_press_occurred: capture.has_long_press_occurred,
+                        tap_count,
+                        capture_time: capture.time,
+                        modifiers: e.modifiers,
+                        time: e.time,
+                        is_over: false,
+                        is_sweep: true,
+                    });
+                }
 
                 if let Some(capture) = cx.fingers.find_area_capture(area) {
                     let is_over = hit_test(e.abs, &rect, &options.margin);
