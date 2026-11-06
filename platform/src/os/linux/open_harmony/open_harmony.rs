@@ -247,7 +247,7 @@ impl Cx {
                 } else {
                     panic!()
                 };
-                self.fingers.process_touch_update_end(&e.touches);
+                self.end_touch_update(&e.touches);
             }
             FromOhosMessage::TextInput(e) => {
                 self.call_event_handler(&Event::TextInput(e));

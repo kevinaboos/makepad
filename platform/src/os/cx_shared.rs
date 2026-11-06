@@ -904,7 +904,7 @@ impl Cx {
         });
         self.call_event_handler(&event);
         if let Event::TouchUpdate(e) = event {
-            self.fingers.process_touch_update_end(&e.touches);
+            self.end_touch_update(&e.touches);
         }
     }
 
@@ -1332,6 +1332,10 @@ impl Cx {
     fn inner_key_focus_change(&mut self) {
         if let Some((prev, focus)) = self.keyboard.cycle_key_focus_changed() {
             self.inner_call_event_handler(&Event::KeyFocus(KeyFocusEvent { prev, focus }));
+        }
+        // A text input that lost the key focus may have asked for a hide after the one that took it cancelled it.
+        if std::mem::take(&mut self.keyboard.is_text_ime_hide_cancelled) {
+            self.keyboard.is_text_ime_hide_deferred = false;
         }
     }
 

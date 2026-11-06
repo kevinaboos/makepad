@@ -627,6 +627,7 @@ pub struct CxFingers {
     scroll_drag_locks: Vec<(DigitId, ScrollDirection)>,
     /// The presses something outside a drag scroller already held when it got them, which it never joins.
     presses_held_outside: Vec<(DigitId, Area)>,
+    is_touching: bool,
     is_mouse_drag_scrolling_disabled: bool,
 }
 
@@ -936,6 +937,12 @@ impl CxFingers {
         }
     }
 
+    /// Whether a widget holds the press of a finger on the screen,
+    /// counting a finger being lifted until its touch update is done.
+    pub fn is_touch_press_held(&self) -> bool {
+        self.is_touching && !self.captures.is_empty()
+    }
+
     /// See [`Cx::lock_scroll_drag`].
     pub(crate) fn lock_scroll_drag(&mut self, digit_id: DigitId, travel: Vec2d) -> Option<ScrollDirection> {
         let owners = [Vec2Index::X, Vec2Index::Y].map(|axis| self.scroll_drag_owner(digit_id, axis));
@@ -1020,6 +1027,9 @@ impl CxFingers {
     }
 
     pub(crate) fn process_touch_update_start(&mut self, time: f64, touches: &[TouchPoint]) {
+        if !touches.is_empty() {
+            self.is_touching = true;
+        }
         for touch in touches {
             if let TouchState::Start = touch.state {
                 self.process_tap_count(touch.abs, time);
@@ -1028,6 +1038,9 @@ impl CxFingers {
     }
 
     pub(crate) fn process_touch_update_end(&mut self, touches: &[TouchPoint]) {
+        self.is_touching = touches
+            .iter()
+            .any(|touch| !matches!(touch.state, TouchState::Stop | TouchState::Cancel));
         for touch in touches {
             let digit_id = live_id_num!(touch, touch.uid).into();
             match touch.state {

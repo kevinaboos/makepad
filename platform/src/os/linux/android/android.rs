@@ -1040,7 +1040,7 @@ impl Cx {
                     }
                 }
 
-                self.fingers.process_touch_update_end(&e.touches);
+                self.end_touch_update(&e.touches);
             }
             FromJavaMessage::Character { character } => {
                 if let Some(character) = char::from_u32(character) {

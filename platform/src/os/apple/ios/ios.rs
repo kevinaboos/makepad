@@ -1041,7 +1041,7 @@ impl Cx {
                     }
                 }
 
-                self.fingers.process_touch_update_end(&e.touches);
+                self.end_touch_update(&e.touches);
             }
             IosEvent::LongPress(mut e) => {
                 e.abs = self.windows[e.window_id].native_vec2d_to_layout(e.abs);

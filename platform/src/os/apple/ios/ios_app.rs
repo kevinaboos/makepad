@@ -914,8 +914,14 @@ impl IosApp {
         let view = if recreate {
             if let (Some(old_view), Some(mtk)) = (old_view, mtk) {
                 let new_view = unsafe {
-                    // The old view was resigned in a prior drain and is now detached
-                    // with no strong refs; release balances its alloc+1.
+                    // This show may have cancelled the hide that would've resigned the old view, so we
+                    // resign it here, without sending makepad whatever it commits on the way out.
+                    let is_first_responder: BOOL = msg_send![old_view, isFirstResponder];
+                    if is_first_responder == YES {
+                        (*old_view).set_ivar::<BOOL>("programmatic_update", YES);
+                        let () = msg_send![old_view, resignFirstResponder];
+                    }
+                    // Once removed, the old view has no strong refs, so release balances its alloc+1.
                     let () = msg_send![old_view, removeFromSuperview];
                     let () = msg_send![old_view, release];
                     create_makepad_text_view(mtk, native_appearance)
