@@ -495,6 +495,11 @@ pub struct Button {
     #[live(true)]
     grab_key_focus: bool,
 
+    /// Whether a touch on this button leaves the key focus where it is, even while it's disabled,
+    /// e.g., so a chat's send button doesn't take it from the message input and hide the soft keyboard.
+    #[live]
+    keep_key_focus: bool,
+
     #[live(true)]
     enabled: bool,
 
@@ -615,10 +620,19 @@ impl Widget for Button {
             self.animator_cut(cx, ids!(hover.off));
         }
 
+        let hit = event.hits(cx, self.draw_bg.area());
+        let key_focus_keeping_press = match &hit {
+            Hit::FingerDown(fe) if self.keep_key_focus && fe.device.is_touch() => Some(fe.digit_id),
+            _ => None,
+        };
+        if let Some(digit_id) = key_focus_keeping_press {
+            cx.fingers.mark_press_as_keeping_key_focus(digit_id);
+        }
+
         // The button only handles hits when it's visible and enabled.
         // If it's not enabled, we still show the button, but we set
         // the NotAllowed mouse cursor upon hover instead of the Hand cursor.
-        match event.hits(cx, self.draw_bg.area()) {
+        match hit {
             Hit::KeyFocus(_) => {
                 self.animator_play(cx, ids!(focus.on));
             }
@@ -664,7 +678,7 @@ impl Widget for Button {
                 self.animator_play(cx, ids!(hover.off));
             }
             Hit::FingerDown(fe) if self.enabled && fe.is_primary_hit() => {
-                if self.grab_key_focus {
+                if self.grab_key_focus && key_focus_keeping_press.is_none() {
                     cx.set_key_focus(self.draw_bg.area());
                 }
                 cx.widget_action_with_data(
