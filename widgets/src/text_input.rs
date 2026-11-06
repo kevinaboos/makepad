@@ -3,7 +3,7 @@ use {
         animator::{Animate, Animator, AnimatorAction, AnimatorImpl, Play},
         makepad_derive_widget::*,
         makepad_draw::{
-            event::finger::TouchState,
+            event::finger::{ScrollDirection, TouchState},
             event::keyboard::CharOffset,
             ime::{
                 AutoCapitalize, AutoCorrect, InputMode, ReturnKeyType, SoftKeyboardConfig,
@@ -652,9 +652,9 @@ pub struct TextInput {
     /// Skip finger move after long press to prevent selection changes
     #[rust]
     ignore_next_move: bool,
-    /// Touch that started outside this input while focused and may blur on release.
+    /// Touch that started outside this input while focused and may blur on release, with where it started.
     #[rust]
-    pending_outside_focus_loss_touch: Option<u64>,
+    pending_outside_focus_loss_touch: Option<(u64, DVec2)>,
     /// IME composition tracking - byte index where composition starts
     #[rust]
     composition_start: usize,
@@ -2524,16 +2524,24 @@ impl Widget for TextInput {
                                 if rect.contains(touch.abs) {
                                     self.pending_outside_focus_loss_touch = None;
                                 } else {
-                                    self.pending_outside_focus_loss_touch = Some(touch.uid);
+                                    self.pending_outside_focus_loss_touch = Some((touch.uid, touch.abs));
+                                }
+                            }
+                            // Only a tap takes our focus away, not a touch that moves far enough to scroll something.
+                            TouchState::Move => {
+                                if self.pending_outside_focus_loss_touch.is_some_and(|(uid, start)| {
+                                    uid == touch.uid && ScrollDirection::from_travel(touch.abs - start).is_some()
+                                }) {
+                                    self.pending_outside_focus_loss_touch = None;
                                 }
                             }
                             TouchState::Cancel => {
-                                if self.pending_outside_focus_loss_touch == Some(touch.uid) {
+                                if self.pending_outside_focus_loss_touch.is_some_and(|(uid, _)| uid == touch.uid) {
                                     self.pending_outside_focus_loss_touch = None;
                                 }
                             }
                             TouchState::Stop => {
-                                if self.pending_outside_focus_loss_touch == Some(touch.uid) {
+                                if self.pending_outside_focus_loss_touch.is_some_and(|(uid, _)| uid == touch.uid) {
                                     should_lose_focus = !rect.contains(touch.abs)
                                         && !cx.fingers.is_press_keeping_key_focus(
                                             live_id_num!(touch, touch.uid).into(),
