@@ -757,6 +757,10 @@ pub struct PortalList {
     grab_key_focus: bool,
     #[live(true)]
     drag_scrolling: bool,
+    /// Whether a drag that scrolls us hides the soft keyboard when it ends (the focused text input loses its focus),
+    /// like a tap elsewhere does. Turn it off for, e.g., a list of suggestions for what's being typed.
+    #[live(true)]
+    hide_keyboard_on_scroll: bool,
     /// Whether a horizontal list also scrolls sideways on vertical scrolls, like a mouse wheel's.
     #[live]
     use_vertical_finger_scroll: bool,
@@ -3695,6 +3699,9 @@ impl Widget for PortalList {
                                     // Don't apply scroll delta yet.
                                     return;
                                 }
+                            }
+                            if !self.hide_keyboard_on_scroll {
+                                cx.fingers.mark_press_as_keeping_key_focus(e.digit_id);
                             }
 
                             let old_sample = *samples.last().unwrap();
