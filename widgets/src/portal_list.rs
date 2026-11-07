@@ -3730,6 +3730,10 @@ impl Widget for PortalList {
                             push_sample(samples, new_abs, e.time);
                             // Android keeps sending moves for a still finger.
                             if new_abs != old_sample.abs {
+                                // Like the other scroll paths, we only follow the end again once a draw finds us there,
+                                // since a draw before the drag got going may have found us still at the end.
+                                self.tail_range = false;
+                                self.detect_tail_in_draw = true;
                                 self.delta_top_scroll(cx, new_abs - old_sample.abs, false, false, 0.0, true, true);
                                 self.area.redraw(cx);
                             }
