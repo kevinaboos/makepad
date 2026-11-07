@@ -655,6 +655,10 @@ pub struct TextInput {
     /// Touch that started outside this input while focused and may blur on release.
     #[rust]
     pending_outside_focus_loss_touch: Option<u64>,
+    /// Our own touch that a scroller took over while we're focused, which blurs us on release wherever it ends,
+    /// unless that scroller keeps the keyboard up.
+    #[rust]
+    pending_scroll_focus_loss_touch: Option<u64>,
     /// A touch on this input that hasn't focused it, and what it has turned out to be so far.
     #[rust]
     touch_press: Option<(DigitId, TouchPress)>,
@@ -1887,6 +1891,7 @@ impl TextInput {
         self.composition_start = 0;
         self.composition_end = 0;
         self.pending_outside_focus_loss_touch = None;
+        self.pending_scroll_focus_loss_touch = None;
         // Only hide clipboard actions on mobile platforms where they're supported
         match cx.os_type() {
             OsType::Android(_) | OsType::Ios(_) => {
@@ -2522,6 +2527,14 @@ impl Widget for TextInput {
                 Event::TouchUpdate(tu) => {
                     let mut should_lose_focus = false;
                     for touch in &tu.touches {
+                        // We moved with the view our drag scrolled, so it doesn't matter where it ends.
+                        if self.pending_scroll_focus_loss_touch == Some(touch.uid)
+                            && !matches!(touch.state, TouchState::Move | TouchState::Stable)
+                        {
+                            self.pending_scroll_focus_loss_touch = None;
+                            should_lose_focus |= touch.state == TouchState::Stop
+                                && !cx.fingers.is_press_keeping_key_focus(live_id_num!(touch, touch.uid).into());
+                        }
                         match touch.state {
                             TouchState::Start => {
                                 if rect.contains(touch.abs) {
@@ -2537,7 +2550,7 @@ impl Widget for TextInput {
                             }
                             TouchState::Stop => {
                                 if self.pending_outside_focus_loss_touch == Some(touch.uid) {
-                                    should_lose_focus = !rect.contains(touch.abs)
+                                    should_lose_focus |= !rect.contains(touch.abs)
                                         && !cx.fingers.is_press_keeping_key_focus(
                                             live_id_num!(touch, touch.uid).into(),
                                         );
@@ -2671,6 +2684,8 @@ impl Widget for TextInput {
                     cx.show_clipboard_actions(has_selection, selection_rect, cx.keyboard_shift);
                 }
             }
+            // While we hold a press, we also get every other finger that lands, wherever it lands, so we leave those be.
+            Hit::FingerDown(fe) if cx.fingers.find_digit_for_captured_area(self.draw_bg.area()) != Some(fe.digit_id) => {}
             // A touch waits to see if it's a tap before focusing us, so a drag can scroll our text or the page instead.
             // Until then, its press keeps a focused input elsewhere from dropping the focus that we might take.
             Hit::FingerDown(FingerDownEvent {
@@ -2750,8 +2765,9 @@ impl Widget for TextInput {
             }
             Hit::FingerUp(fe) => {
                 self.ignore_next_move = false;
+                let touch_press = self.touch_press.take();
 
-                if self.touch_press.take() == Some((fe.digit_id, TouchPress::Undecided))
+                if touch_press == Some((fe.digit_id, TouchPress::Undecided))
                     && fe.is_over
                     && ScrollDirection::from_travel(fe.abs - fe.abs_start).is_none()
                 {
@@ -2760,6 +2776,31 @@ impl Widget for TextInput {
                     let rel = fe.abs - self.text_area.rect(cx).pos;
                     if let Ok(cursor) = self.point_in_lpxs_to_cursor(Point::new(rel.x as f32, rel.y as f32)) {
                         self.set_cursor(cx, cursor, false);
+                    }
+                }
+
+                // A scroller around us took our drag over, so like a drag from anywhere else,
+                // it blurs us when it ends if that scroller hides the keyboard on scroll.
+                if fe.is_sweep
+                    && touch_press == Some((fe.digit_id, TouchPress::Dragging))
+                    && cx.has_key_focus(self.draw_bg.area())
+                {
+                    let touch = match event {
+                        Event::TouchUpdate(tu) => tu.touches.iter().find(|touch| Some(touch.uid) == fe.device.touch_uid()),
+                        _ => None,
+                    };
+                    match touch.map(|touch| touch.state) {
+                        // It ends with this update, which the check at the top skipped while we still held it.
+                        Some(TouchState::Stop) => {
+                            if !cx.fingers.is_press_keeping_key_focus(fe.digit_id) {
+                                cx.set_key_focus(Area::Empty);
+                                self.handle_focus_lost(cx, uid);
+                            }
+                        }
+                        Some(TouchState::Move | TouchState::Stable) => {
+                            self.pending_scroll_focus_loss_touch = fe.device.touch_uid();
+                        }
+                        _ => {}
                     }
                 }
 
@@ -2823,7 +2864,7 @@ impl Widget for TextInput {
                 let travel = fe.abs - fe.abs_start;
                 if let Some((_, press @ TouchPress::Undecided)) = &mut self.touch_press {
                     let Some(direction) = ScrollDirection::from_travel(travel) else { return };
-                    // A drag hides the keyboard of an input elsewhere like any other scroll, since it can't focus us.
+                    // It can't focus us now, so whatever it scrolls decides if an input elsewhere keeps its keyboard.
                     cx.fingers.unmark_press_as_keeping_key_focus(fe.digit_id);
                     let has_more_text_that_way =
                         if travel.y > 0.0 { self.scroll_y > 0.0 } else { self.scroll_y < self.cached_max_scroll_y };
@@ -2833,6 +2874,8 @@ impl Widget for TextInput {
                         && cx.is_scroll_area_unblocked(self.draw_bg.area())
                     {
                         cx.claim_finger_drag(fe.digit_id);
+                        // Scrolling our text keeps the keyboard up, like any other scroll.
+                        cx.fingers.mark_press_as_keeping_key_focus(fe.digit_id);
                         TouchPress::ScrollingText(self.scroll_y)
                     } else {
                         TouchPress::Dragging

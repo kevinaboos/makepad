@@ -739,7 +739,7 @@ impl Widget for StackNavigation {
                         self.swipe_back_candidate = Some(candidate);
                     } else if let (true, Some(current)) = (
                         delta.x >= SWIPE_DIRECTION_RATIO * delta.y.abs()
-                            && !is_swipe_taken(cx, touch.uid)
+                            && !is_swipe_taken(cx, touch.uid, false)
                             && self.transition.is_none(),
                         self.current_view,
                     ) {
@@ -770,8 +770,12 @@ impl Widget for StackNavigation {
                 }
                 self.forward_event_to_views(cx, event, scope);
                 // A widget that gives this finger's drag its own meaning keeps it.
-                if self.swipe_back_candidate.is_some_and(|candidate| is_swipe_taken(cx, candidate.uid)) {
-                    self.swipe_back_candidate = None;
+                if let Some(candidate) = self.swipe_back_candidate {
+                    let has_just_landed = e.touches.iter()
+                        .any(|touch| touch.uid == candidate.uid && touch.state == TouchState::Start);
+                    if is_swipe_taken(cx, candidate.uid, has_just_landed) {
+                        self.swipe_back_candidate = None;
+                    }
                 }
             }
             (Event::LongPress(_), None) => {
@@ -1911,11 +1915,18 @@ impl StackNavigationRef {
     }
 }
 
-/// Whether a widget in the view keeps this touch's drag: one that gives it its own meaning,
-/// or a scroller that took its horizontal drag.
-fn is_swipe_taken(cx: &Cx, uid: u64) -> bool {
+/// Whether a widget in the view keeps this touch's drag: one that gives it its own meaning, a scroller that took
+/// its horizontal drag, or the focused one when the press keeps its focus, like a text input being edited.
+fn is_swipe_taken(cx: &Cx, uid: u64, has_just_landed: bool) -> bool {
+    let digit_id = live_id_num!(touch, uid).into();
+    let key_focus = cx.key_focus();
     cx.fingers.is_touch_drag_claimed(uid)
-        || cx.fingers.scroll_drag_owner(live_id_num!(touch, uid).into(), Vec2Index::X).is_some()
+        || cx.fingers.scroll_drag_owner(digit_id, Vec2Index::X).is_some()
+        // A focused text input marks its press as it lands, while a scroller marks it later, so only that counts.
+        || (has_just_landed
+            && cx.fingers.is_press_keeping_key_focus(digit_id)
+            && !key_focus.is_empty()
+            && cx.fingers.find_digit_for_captured_area(key_focus) == Some(digit_id))
 }
 
 /// A copy of `e` with just the given touches, canceled and not yet hit by anything,

@@ -1038,7 +1038,8 @@ impl Widget for View {
         if !fling_caught && (self.visible && self.cursor.is_some() || self.animator.is_defined) {
             match event.hits_with_capture_overload(cx, self.area(), self.capture_overload) {
                 Hit::FingerDown(e) => {
-                    if self.grab_key_focus {
+                    // A touch waits until it's a tap, so a drag that scrolls from here keeps the keyboard up.
+                    if self.grab_key_focus && !e.device.is_touch() {
                         cx.set_key_focus(self.area());
                     }
                     cx.widget_action(uid, ViewAction::FingerDown(e));
@@ -1049,6 +1050,9 @@ impl Widget for View {
                 Hit::FingerMove(e) => cx.widget_action(uid, ViewAction::FingerMove(e)),
                 Hit::FingerLongPress(e) => cx.widget_action(uid, ViewAction::FingerLongPress(e)),
                 Hit::FingerUp(e) => {
+                    if self.grab_key_focus && e.device.is_touch() && e.is_over && e.was_tap() {
+                        cx.set_key_focus(self.area());
+                    }
                     cx.widget_action(uid, ViewAction::FingerUp(e));
                     if self.animator.is_defined {
                         self.animator_play(cx, ids!(down.off));

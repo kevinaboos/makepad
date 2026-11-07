@@ -1,7 +1,7 @@
 use {
     crate::{
         animator::AnimatorImpl,
-        event::{DigitId, ScrollEvent, ScrollPhase, TouchState, TAP_COUNT_DISTANCE},
+        event::{DigitId, ScrollDirection, ScrollEvent, ScrollPhase, TouchState},
         flat_list::WidgetItem,
         makepad_derive_widget::*,
         makepad_draw::*,
@@ -73,11 +73,12 @@ enum ScrollState {
     Stopped,
     Drag {
         samples: Vec<ScrollSample>,
-        /// The initial touch position along the scroll axis at FingerDown.
-        initial_abs: f64,
         /// Whether this drag has exceeded the minimum threshold to be treated
         /// as scroll rather than a tap. Until committed, no scroll deltas are applied.
         committed: bool,
+        /// Whether the press has traveled the tap distance our way, so it's a scroll and not a tap.
+        /// Unlike `committed`, a press away from interactive items doesn't start out with it.
+        has_traveled: bool,
     },
     Flick {
         /// The momentum-fling animation state (native iOS-style exponential decay,
@@ -758,19 +759,12 @@ pub struct PortalList {
     #[live(true)]
     drag_scrolling: bool,
     /// Whether a drag that scrolls us hides the soft keyboard when it ends (the focused text input loses its focus),
-    /// like a tap elsewhere does. Turn it off for, e.g., a list of suggestions for what's being typed.
-    #[live(true)]
+    /// like a tap elsewhere does. It's off by default, since most apps keep the keyboard up while you scroll.
+    #[live]
     hide_keyboard_on_scroll: bool,
     /// Whether a horizontal list also scrolls sideways on vertical scrolls, like a mouse wheel's.
     #[live]
     use_vertical_finger_scroll: bool,
-    /// The minimum distance (in pixels) a finger/mouse must move before a drag is
-    /// "committed" and treated as a scroll gesture rather than a tap/click.
-    /// This prevents accidental micro-scrolling when tapping interactive items.
-    /// Defaults to `TAP_COUNT_DISTANCE`, keeping it consistent with the
-    /// platform's tap-vs-drag distinction.
-    #[rust(TAP_COUNT_DISTANCE)]
-    drag_scroll_threshold: f64,
 
     /// Whether the current gesture should be suppressed from child widgets.
     /// Set when either:
@@ -943,6 +937,8 @@ impl ScriptHook for PortalList {
         } else {
             self.vec_index = Vec2Index::X;
         }
+        // Dragging our scroll bar scrolls us too.
+        self.scroll_bar.hide_keyboard_on_scroll = self.hide_keyboard_on_scroll;
 
         // Only a new list starts out following its end; a reload keeps the user's scroll intent.
         if self.auto_tail && apply.is_new() {
@@ -3558,7 +3554,8 @@ impl Widget for PortalList {
                     }
                 }
                 Hit::FingerDown(fe) => {
-                    if self.grab_key_focus {
+                    // A touch waits until it's a tap, so a drag that scrolls us keeps the keyboard up.
+                    if self.grab_key_focus && !fe.device.is_touch() {
                         cx.set_key_focus(self.area);
                     }
                     // A press that doesn't end up moving us off the end shouldn't stop
@@ -3572,6 +3569,10 @@ impl Widget for PortalList {
                         // is a stop, not a click. The bounce spring itself keeps settling.
                         _ => self.motion_live(fe.time) || self.press_is_catch(fe.time),
                     };
+                    // Stopping us is part of scrolling, so it keeps the keyboard up like our drags do.
+                    if self.was_scrolling && !self.hide_keyboard_on_scroll {
+                        cx.fingers.mark_press_as_keeping_key_focus(fe.digit_id);
+                    }
                     // One press consumes the catch; later presses are ordinary clicks.
                     self.touch_caught_motion_at = None;
 
@@ -3629,18 +3630,17 @@ impl Widget for PortalList {
                         // interactive widgets (buttons, links, etc.). The drag threshold
                         // prevents micro-scrolling during taps/clicks, and child widgets
                         // use `was_tap()` to distinguish taps from drags on FingerUp.
-                        let initial = fe.abs.index(vi);
                         self.scroll_state = ScrollState::Drag {
                             samples: vec![ScrollSample {
-                                abs: initial,
+                                abs: fe.abs.index(vi),
                                 time: fe.time,
                             }],
-                            initial_abs: initial,
                             // When on interactive items, require a drag threshold before
                             // committing to scroll (for both touch and mouse).
                             // For non-interactive areas, commit immediately since
                             // there's no ambiguity.
                             committed: !on_interactive,
+                            has_traveled: false,
                         };
                     }
                 }
@@ -3673,12 +3673,13 @@ impl Widget for PortalList {
                             self.scroll_state = ScrollState::Stopped;
                         } else if let ScrollState::Drag {
                             samples,
-                            initial_abs,
                             committed,
+                            has_traveled,
                         } = &mut self.scroll_state
                         {
+                            let travel = e.abs - e.abs_start;
                             // A drag we share with a scroller along the other axis keeps to the way it started out.
-                            match cx.lock_scroll_drag(e.digit_id, e.abs - e.abs_start) {
+                            match cx.lock_scroll_drag(e.digit_id, travel) {
                                 None => return,
                                 Some(direction) if !direction.allows(vi) => {
                                     self.scroll_state = ScrollState::Stopped;
@@ -3687,14 +3688,18 @@ impl Widget for PortalList {
                                 Some(_) => {}
                             }
                             let new_abs = e.abs.index(vi);
+                            // It's a scroll once it goes the tap distance our way, the rule `take_over_press` uses too.
+                            *has_traveled |= ScrollDirection::from_travel(travel)
+                                .is_some_and(|direction| direction.allows(vi));
 
                             // Check if the drag threshold has been exceeded.
                             if !*committed {
-                                if (new_abs - *initial_abs).abs() >= self.drag_scroll_threshold {
+                                if *has_traveled {
                                     *committed = true;
                                     self.suppress_child_events = true;
-                                    // It's a drag now, not a tap on an item, so it only keeps the key focus if we mark it again.
-                                    cx.fingers.unmark_press_as_keeping_key_focus(e.digit_id);
+                                    // It's a drag now, not a tap on an item, so the item gets a sweep instead,
+                                    // and the press only keeps the key focus if we mark it again.
+                                    cx.take_over_press(e.digit_id, vi, self.area, travel);
                                 } else {
                                     // Still under threshold — track samples but don't scroll.
                                     push_sample(samples, new_abs, e.time);
@@ -3702,7 +3707,7 @@ impl Widget for PortalList {
                                     return;
                                 }
                             }
-                            if !self.hide_keyboard_on_scroll {
+                            if *has_traveled && !self.hide_keyboard_on_scroll {
                                 cx.fingers.mark_press_as_keeping_key_focus(e.digit_id);
                             }
 
@@ -3717,6 +3722,12 @@ impl Widget for PortalList {
                     }
                 }
                 Hit::FingerUp(fe) if fe.is_primary_hit() => {
+                    // A tap that only stopped us is part of scrolling, so it leaves the key focus be.
+                    if self.grab_key_focus && fe.device.is_touch() && fe.is_over && fe.was_tap()
+                        && !self.was_scrolling
+                    {
+                        cx.set_key_focus(self.area);
+                    }
                     if fe.is_sweep {
                         self.stop_all_scroll_motion();
                         self.is_selecting = false;

@@ -1473,7 +1473,10 @@ impl Video {
                 }
             }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                cx.set_key_focus(self.draw_bg.area());
+                // A touch waits until it's a tap, so a drag that scrolls from here keeps the keyboard up.
+                if !fe.device.is_touch() {
+                    cx.set_key_focus(self.draw_bg.area());
+                }
 
                 // Double-tap detection: use platform tap_count OR manual fallback
                 let is_double_tap = if fe.tap_count >= 2 {
@@ -1513,6 +1516,9 @@ impl Video {
                 }
             }
             Hit::FingerUp(fe) if fe.is_primary_hit() => {
+                if fe.device.is_touch() && fe.is_over && fe.was_tap() {
+                    cx.set_key_focus(self.draw_bg.area());
+                }
                 if self.is_dragging_progress {
                     self.is_dragging_progress = false;
                     self.seek_to_position_from_x(cx, fe.abs.x);

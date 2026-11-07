@@ -621,12 +621,11 @@ impl Widget for Button {
         }
 
         let hit = event.hits(cx, self.draw_bg.area());
-        let key_focus_keeping_press = match &hit {
-            Hit::FingerDown(fe) if !self.hide_keyboard_on_tap && fe.device.is_touch() => Some(fe.digit_id),
-            _ => None,
-        };
-        if let Some(digit_id) = key_focus_keeping_press {
-            cx.fingers.mark_press_as_keeping_key_focus(digit_id);
+        if let Hit::FingerDown(fe) = &hit {
+            // We also get every other finger that lands while we hold one, so only one that lands on us is a tap on us.
+            if !self.hide_keyboard_on_tap && fe.device.is_touch() && fe.rect.contains(fe.abs) {
+                cx.fingers.mark_press_as_keeping_key_focus(fe.digit_id);
+            }
         }
 
         // The button only handles hits when it's visible and enabled.
@@ -678,7 +677,8 @@ impl Widget for Button {
                 self.animator_play(cx, ids!(hover.off));
             }
             Hit::FingerDown(fe) if self.enabled && fe.is_primary_hit() => {
-                if self.grab_key_focus && key_focus_keeping_press.is_none() {
+                // A touch waits until it clicks us, so a drag that scrolls from here keeps the keyboard up.
+                if self.grab_key_focus && !fe.device.is_touch() {
                     cx.set_key_focus(self.draw_bg.area());
                 }
                 cx.widget_action_with_data(
@@ -720,6 +720,9 @@ impl Widget for Button {
                         true
                     };
                 if was_clicked {
+                    if self.grab_key_focus && self.hide_keyboard_on_tap && fe.device.is_touch() {
+                        cx.set_key_focus(self.draw_bg.area());
+                    }
                     cx.widget_action_with_data(
                         &self.action_data,
                         uid,
