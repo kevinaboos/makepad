@@ -826,6 +826,12 @@ pub struct PortalList {
     /// Speed factor for smooth tail animation (0.0-1.0, lower = slower). Default 0.25.
     #[live(0.25)]
     smooth_tail_speed: f64,
+    /// Whether the end of the list stays put when the viewport gets shorter or longer, like a chat
+    /// timeline whose latest messages stay right above its input as the soft keyboard shrinks it.
+    #[live(false)]
+    keep_end_on_resize: bool,
+    #[rust]
+    last_viewport_size: f64,
 
     #[rust(false)]
     tail_range: bool,
@@ -1457,6 +1463,11 @@ impl PortalList {
                         self.first_scroll = 0.0;
                     }
                     let viewport = cx.turtle().inner_rect();
+                    let viewport_size = viewport.size.index(vi);
+                    if self.keep_end_on_resize && self.last_viewport_size > 0.0 {
+                        self.first_scroll += viewport_size - self.last_viewport_size;
+                    }
+                    self.last_viewport_size = viewport_size;
                     self.draw_state.set(ListDrawState::Down {
                         index: self.first_id,
                         pos: self.first_scroll,
