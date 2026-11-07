@@ -655,9 +655,9 @@ pub struct TextInput {
     /// Touch that started outside this input while focused and may blur on release, with where it started.
     #[rust]
     pending_outside_focus_loss_touch: Option<(u64, DVec2)>,
-    /// A touch on this input that focuses it if it turns out to be a tap, rather than a scroll or a long press.
+    /// A touch on this input that hasn't focused it, and what it has turned out to be so far.
     #[rust]
-    pending_tap_focus: Option<DigitId>,
+    touch_press: Option<(DigitId, TouchPress)>,
     /// IME composition tracking - byte index where composition starts
     #[rust]
     composition_start: usize,
@@ -2679,15 +2679,15 @@ impl Widget for TextInput {
                     cx.show_clipboard_actions(has_selection, selection_rect, cx.keyboard_shift);
                 }
             }
-            // A touch on a single-line input waits to see if it's a tap before focusing it, so a drag can scroll the page.
+            // A touch waits to see if it's a tap before focusing us, so a drag can scroll our text or the page instead.
             // Its press also keeps a focused input elsewhere from dropping the focus that we might take.
             Hit::FingerDown(FingerDownEvent {
                 tap_count: 1,
                 device,
                 digit_id,
                 ..
-            }) if device.is_touch() && !self.is_multiline && device.is_primary_hit() && !scrollbar_captured => {
-                self.pending_tap_focus = Some(digit_id);
+            }) if device.is_touch() && device.is_primary_hit() && !scrollbar_captured => {
+                self.touch_press = Some((digit_id, TouchPress::Undecided));
                 cx.fingers.mark_press_as_keeping_key_focus(digit_id);
                 self.animator_play(cx, ids!(hover.down));
             }
@@ -2759,7 +2759,7 @@ impl Widget for TextInput {
             Hit::FingerUp(fe) => {
                 self.ignore_next_move = false;
 
-                if self.pending_tap_focus.take() == Some(fe.digit_id)
+                if self.touch_press.take() == Some((fe.digit_id, TouchPress::Undecided))
                     && fe.is_over
                     && ScrollDirection::from_travel(fe.abs - fe.abs_start).is_none()
                 {
@@ -2789,10 +2789,13 @@ impl Widget for TextInput {
                     self.animator_play(cx, ids!(hover.off));
                 }
             }
+            // A touch that's already scrolling our text is a drag, not a long press.
+            Hit::FingerLongPress(lp)
+                if matches!(self.touch_press, Some((digit_id, TouchPress::ScrollingText(_))) if digit_id == lp.digit_id) => {}
             Hit::FingerLongPress(lp) => {
                 self.preserved_selection_cursor = None;
                 // A long press focuses us right away, and a drag after it adjusts the selection instead of scrolling.
-                self.pending_tap_focus = None;
+                self.touch_press = None;
                 cx.claim_finger_drag(lp.digit_id);
                 self.reset_blink_timer(cx);
                 self.set_key_focus(cx);
@@ -2822,8 +2825,30 @@ impl Widget for TextInput {
                 // Skip next move to prevent selection change when finger lifts
                 self.ignore_next_move = true;
             }
-            // A touch that might still be a tap or a scroll doesn't select anything.
-            Hit::FingerMove(FingerMoveEvent { digit_id, .. }) if self.pending_tap_focus == Some(digit_id) => {}
+            // A drag doesn't select anything. It scrolls our text if there's more of it that way,
+            // or else leaves the drag to whatever scrolls around us.
+            Hit::FingerMove(fe) if self.touch_press.is_some_and(|(digit_id, _)| digit_id == fe.digit_id) => {
+                let travel = fe.abs - fe.abs_start;
+                if let Some((_, press @ TouchPress::Undecided)) = &mut self.touch_press {
+                    let Some(direction) = ScrollDirection::from_travel(travel) else { return };
+                    let has_more_text_that_way =
+                        if travel.y > 0.0 { self.scroll_y > 0.0 } else { self.scroll_y < self.cached_max_scroll_y };
+                    *press = if self.is_multiline
+                        && direction.allows(Vec2Index::Y)
+                        && has_more_text_that_way
+                        && cx.is_scroll_area_unblocked(self.draw_bg.area())
+                    {
+                        cx.claim_finger_drag(fe.digit_id);
+                        TouchPress::ScrollingText(self.scroll_y)
+                    } else {
+                        TouchPress::Dragging
+                    };
+                }
+                if let Some((_, TouchPress::ScrollingText(start_scroll_y))) = self.touch_press {
+                    self.scroll_y = (start_scroll_y - travel.y).clamp(0.0, self.cached_max_scroll_y);
+                    self.draw_bg.redraw(cx);
+                }
+            }
             Hit::FingerMove(FingerMoveEvent {
                 abs,
                 tap_count,
@@ -3692,6 +3717,17 @@ pub enum TextInputAction {
     Escaped,
     Changed(String),
     KeyDownUnhandled(KeyEvent),
+}
+
+/// What a touch on a text input has turned out to be so far.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TouchPress {
+    /// It hasn't moved far enough to be a drag, so it might still be a tap (which focuses the input) or a long press.
+    Undecided,
+    /// A drag scrolling the input's text, which was at this scroll offset when the drag began.
+    ScrollingText(f64),
+    /// A drag that the input leaves to whatever scrolls around it.
+    Dragging,
 }
 
 #[derive(Clone, Copy, Debug)]
