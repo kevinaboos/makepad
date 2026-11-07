@@ -1050,7 +1050,10 @@ impl Widget for View {
                 Hit::FingerMove(e) => cx.widget_action(uid, ViewAction::FingerMove(e)),
                 Hit::FingerLongPress(e) => cx.widget_action(uid, ViewAction::FingerLongPress(e)),
                 Hit::FingerUp(e) => {
-                    if self.grab_key_focus && e.device.is_touch() && e.is_over && e.was_tap() {
+                    // A child that keeps the key focus, like a text input it's about to take, wins over us.
+                    if self.grab_key_focus && e.device.is_touch() && e.is_over && e.was_tap()
+                        && !cx.fingers.is_press_keeping_key_focus(e.digit_id)
+                    {
                         cx.set_key_focus(self.area());
                     }
                     cx.widget_action(uid, ViewAction::FingerUp(e));

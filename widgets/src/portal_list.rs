@@ -1,7 +1,7 @@
 use {
     crate::{
         animator::AnimatorImpl,
-        event::{DigitId, ScrollDirection, ScrollEvent, ScrollPhase, TouchState},
+        event::{DigitId, ScrollDirection, ScrollEvent, ScrollPhase, TouchState, TAP_COUNT_DISTANCE},
         flat_list::WidgetItem,
         makepad_derive_widget::*,
         makepad_draw::*,
@@ -3050,7 +3050,8 @@ impl Widget for PortalList {
         let coasting_now = match event {
             Event::MouseDown(e) => self.motion_live(e.time) || self.press_is_catch(e.time),
             Event::MouseMove(e) => self.momentum.is_live(e.time),
-            Event::TouchUpdate(e) => self.momentum.is_live(e.time),
+            Event::TouchUpdate(e) => self.momentum.is_live(e.time)
+                || (e.touches.iter().any(|t| t.state == TouchState::Start) && self.motion_live(e.time)),
             _ => false,
         };
         let is_scroll_animating = matches!(
@@ -3553,6 +3554,8 @@ impl Widget for PortalList {
                     _ => (),
                     }
                 }
+                // While we hold a press, we also get every other finger that lands, wherever it lands, so we leave those be.
+                Hit::FingerDown(fe) if cx.fingers.find_digit_for_captured_area(self.area).is_some_and(|digit| digit != fe.digit_id) => {}
                 Hit::FingerDown(fe) => {
                     // A touch waits until it's a tap, so a drag that scrolls us keeps the keyboard up.
                     if self.grab_key_focus && !fe.device.is_touch() {
@@ -3688,9 +3691,10 @@ impl Widget for PortalList {
                                 Some(_) => {}
                             }
                             let new_abs = e.abs.index(vi);
-                            // It's a scroll once it goes the tap distance our way, the rule `take_over_press` uses too.
-                            *has_traveled |= ScrollDirection::from_travel(travel)
-                                .is_some_and(|direction| direction.allows(vi));
+                            // It's a scroll once it goes the tap distance along our axis, in a direction
+                            // `take_over_press` lets us take, so a sloppy tap on an item still clicks it.
+                            *has_traveled |= travel.index(vi).abs() >= TAP_COUNT_DISTANCE
+                                && ScrollDirection::from_travel(travel).is_some_and(|direction| direction.allows(vi));
 
                             // Check if the drag threshold has been exceeded.
                             if !*committed {
@@ -3725,6 +3729,7 @@ impl Widget for PortalList {
                     // A tap that only stopped us is part of scrolling, so it leaves the key focus be.
                     if self.grab_key_focus && fe.device.is_touch() && fe.is_over && fe.was_tap()
                         && !self.was_scrolling
+                        && !cx.fingers.is_press_keeping_key_focus(fe.digit_id)
                     {
                         cx.set_key_focus(self.area);
                     }
