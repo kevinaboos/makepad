@@ -495,10 +495,10 @@ pub struct Button {
     #[live(true)]
     grab_key_focus: bool,
 
-    /// Whether a touch on this button leaves the key focus where it is, even while it's disabled,
-    /// e.g., so a chat's send button doesn't take it from the message input and hide the soft keyboard.
-    #[live]
-    keep_key_focus: bool,
+    /// Whether a tap on this button hides the soft keyboard (the focused text input loses its focus),
+    /// even while it's disabled. Turn it off for, e.g., a chat's send button.
+    #[live(true)]
+    hide_keyboard_on_tap: bool,
 
     #[live(true)]
     enabled: bool,
@@ -622,7 +622,7 @@ impl Widget for Button {
 
         let hit = event.hits(cx, self.draw_bg.area());
         let key_focus_keeping_press = match &hit {
-            Hit::FingerDown(fe) if self.keep_key_focus && fe.device.is_touch() => Some(fe.digit_id),
+            Hit::FingerDown(fe) if !self.hide_keyboard_on_tap && fe.device.is_touch() => Some(fe.digit_id),
             _ => None,
         };
         if let Some(digit_id) = key_focus_keeping_press {
