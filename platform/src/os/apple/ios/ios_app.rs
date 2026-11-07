@@ -917,17 +917,7 @@ impl IosApp {
         // Phase 2 (OUTSIDE the borrow): recreate the view if leaving a secure field.
         let view = if recreate {
             if let (Some(old_view), Some(mtk)) = (old_view, mtk) {
-                let (new_view, seed) = unsafe {
-                    // A config change of the focused field itself pushes nothing, so then we keep the old view's
-                    // text, which is that field's own (a field taking the focus always pushes its text first).
-                    let seed = pushed_text.or_else(|| {
-                        let ns_text: ObjcId = msg_send![old_view, text];
-                        let selection: NSRange = msg_send![old_view, selectedRange];
-                        (ns_text != nil).then(|| {
-                            let start = selection.location as usize;
-                            (nsstring_to_string(ns_text), start..start + selection.length as usize)
-                        })
-                    });
+                let new_view = unsafe {
                     // This show may have cancelled the hide that would've resigned the old view, so we
                     // resign it here, without sending makepad whatever it commits on the way out.
                     let is_first_responder: BOOL = msg_send![old_view, isFirstResponder];
@@ -939,9 +929,9 @@ impl IosApp {
                     let () = msg_send![old_view, removeFromSuperview];
                     let () = msg_send![old_view, release];
                     let new_view = create_makepad_text_view(mtk, native_appearance);
-                    // Nothing re-pushes the field's text into the fresh view, so we fill it ourselves,
-                    // or the first keystroke would leave the field holding just that character.
-                    if let Some((text, selection)) = &seed {
+                    // Nothing re-pushes the field's text into the fresh view, so we fill it with makepad's
+                    // last push, or the first keystroke would leave the field holding just that character.
+                    if let Some((text, selection)) = &pushed_text {
                         (*new_view).set_ivar::<BOOL>("programmatic_update", YES);
                         let ns_text = str_to_nsstring(text);
                         let () = msg_send![new_view, setText: ns_text];
@@ -952,13 +942,13 @@ impl IosApp {
                         let () = msg_send![new_view, setSelectedRange: range];
                         (*new_view).set_ivar::<BOOL>("programmatic_update", NO);
                     }
-                    (new_view, seed)
+                    new_view
                 };
                 let _ = IOS_APP.try_with(|app| {
                     if let Ok(mut app_ref) = app.try_borrow_mut() {
                         if let Some(app) = app_ref.as_mut() {
                             app.makepad_text_view = Some(new_view);
-                            app.last_forwarded_text = seed.map(|(text, _)| text);
+                            app.last_forwarded_text = pushed_text.map(|(text, _)| text);
                         }
                     }
                 });
