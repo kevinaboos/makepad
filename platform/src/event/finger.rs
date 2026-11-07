@@ -948,6 +948,11 @@ impl CxFingers {
         }
     }
 
+    /// Undoes [`Self::mark_press_as_keeping_key_focus`], e.g., once a press that might have been a tap turns into a drag.
+    pub fn unmark_press_as_keeping_key_focus(&mut self, digit_id: DigitId) {
+        self.presses_keeping_key_focus.retain(|id| *id != digit_id);
+    }
+
     /// Whether `digit_id`'s press leaves the key focus where it is, see [`Self::mark_press_as_keeping_key_focus`].
     pub fn is_press_keeping_key_focus(&self, digit_id: DigitId) -> bool {
         self.presses_keeping_key_focus.contains(&digit_id)
