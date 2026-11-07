@@ -941,7 +941,8 @@ impl CxFingers {
     }
 
     /// Marks `digit_id`'s press as leaving the key focus where it is, so a focused text input stays focused
-    /// (and keeps its soft keyboard up) even though the press ends outside of it. Call it on `Hit::FingerDown`.
+    /// (and keeps its soft keyboard up) even though the press ends outside of it. Call it before the press ends,
+    /// e.g., on `Hit::FingerDown`.
     pub fn mark_press_as_keeping_key_focus(&mut self, digit_id: DigitId) {
         if !self.presses_keeping_key_focus.contains(&digit_id) {
             self.presses_keeping_key_focus.push(digit_id);
@@ -989,6 +990,8 @@ impl CxFingers {
             for capture in self.captures.iter_mut().filter(|c| c.digit_id == digit_id && taken.contains(&c.area)) {
                 capture.is_taken_over = true;
             }
+            // It's a drag now, not a tap, so it only keeps the key focus if the scroller marks it again.
+            self.unmark_press_as_keeping_key_focus(digit_id);
         }
         Some(direction)
     }

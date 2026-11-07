@@ -3693,6 +3693,8 @@ impl Widget for PortalList {
                                 if (new_abs - *initial_abs).abs() >= self.drag_scroll_threshold {
                                     *committed = true;
                                     self.suppress_child_events = true;
+                                    // It's a drag now, not a tap on an item, so it only keeps the key focus if we mark it again.
+                                    cx.fingers.unmark_press_as_keeping_key_focus(e.digit_id);
                                 } else {
                                     // Still under threshold — track samples but don't scroll.
                                     push_sample(samples, new_abs, e.time);
