@@ -121,6 +121,8 @@ impl KeyboardView {
     /// is nested under padding/scrollers, when the platform has already shrunk
     /// the surface to make room for the IME, or when there is no settled rect
     /// yet for `self.area`.
+    ///
+    /// With `keyboard_resize`, it's how much we shrink instead.
     fn compute_target_shift(&self, keyboard_height: f64, cx: &Cx) -> f64 {
         if keyboard_height <= 0.0 || !self.owns_ime(cx) {
             return 0.0;
@@ -171,9 +173,9 @@ impl KeyboardView {
 
     fn set_keyboard_shift(&mut self, cx: &mut Cx, shift: f64) {
         let shift = shift.max(0.0);
-        // Things outside a nested KeyboardView, like popups, can be anchored to what it moves.
-        if self.outer_ime_scope != 0 && shift != self.keyboard_shift {
-            cx.redraw_all();
+        // Unlike `redraw()`, this also works mid-draw, e.g., when the post-draw reconcile snaps us to a new shift.
+        if shift != self.keyboard_shift {
+            cx.redraw_area_in_draw(self.area);
         }
         self.keyboard_shift = shift;
         // Overlays like modals aren't inside any of us, so they pan along with the outermost one.
@@ -367,6 +369,35 @@ impl Widget for KeyboardView {
             walk.margin = Inset::default();
             walk
         }) {
+            // We can miss keyboard events, e.g., while a hidden ancestor isn't passing them along,
+            // so we catch up with wherever the keyboard is now.
+            let time = cx.time();
+            match self.anim_state {
+                AnimState::Opening { duration, start_time, to_shift, .. } if time >= start_time + duration => {
+                    self.set_keyboard_shift(cx, to_shift);
+                    self.anim_state = AnimState::Open;
+                }
+                AnimState::Closing { duration, start_time, .. } if time >= start_time + duration => {
+                    self.set_keyboard_shift(cx, 0.0);
+                    self.anim_state = AnimState::Closed;
+                    self.keyboard_height = 0.0;
+                }
+                AnimState::Open | AnimState::Closed => {
+                    let keyboard_height = cx.keyboard.virtual_keyboard_height();
+                    if (keyboard_height - self.keyboard_height).abs() > KEYBOARD_SHIFT_EPSILON {
+                        if keyboard_height > 0.0 {
+                            // The post-draw reconcile below moves us to wherever this keyboard needs us.
+                            self.keyboard_height = keyboard_height;
+                            self.anim_state = AnimState::Open;
+                        } else {
+                            self.set_keyboard_shift(cx, 0.0);
+                            self.anim_state = AnimState::Closed;
+                            self.keyboard_height = 0.0;
+                        }
+                    }
+                }
+                _ => {}
+            }
             self.begin(cx, walk);
         }
         if let Some(mut walk) = self.draw_state.get() {

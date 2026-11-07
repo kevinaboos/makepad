@@ -1464,10 +1464,23 @@ impl PortalList {
                     }
                     let viewport = cx.turtle().inner_rect();
                     let viewport_size = viewport.size.index(vi);
-                    if self.keep_end_on_resize && self.last_viewport_size > 0.0 {
-                        self.first_scroll += viewport_size - self.last_viewport_size;
+                    // A list with no size isn't laid out yet, so it has no end to keep in place.
+                    if viewport_size > 0.0 {
+                        if self.keep_end_on_resize && self.last_viewport_size > 0.0 {
+                            let mut delta = viewport_size - self.last_viewport_size;
+                            // Growing taller can't pull down more content than there is above the viewport.
+                            if delta > 0.0 {
+                                let first_index = self.first_id.saturating_sub(self.range_start);
+                                let height_before = match &self.height_tree {
+                                    Some(tree) if first_index > 0 => tree.prefix_sum(first_index - 1),
+                                    _ => 0.0,
+                                };
+                                delta = delta.min((height_before - self.first_scroll).max(0.0));
+                            }
+                            self.first_scroll += delta;
+                        }
+                        self.last_viewport_size = viewport_size;
                     }
-                    self.last_viewport_size = viewport_size;
                     self.draw_state.set(ListDrawState::Down {
                         index: self.first_id,
                         pos: self.first_scroll,
@@ -2339,6 +2352,8 @@ impl PortalList {
         // The list was repositioned by code, so showing the start/end now is
         // news again (e.g. a list re-purposed for other content).
         self.forget_reached_edges();
+        // The new position is meant for the viewport we'll draw next, not the last one.
+        self.last_viewport_size = 0.0;
     }
 
     /// Sets the first visible item and scroll offset to keep showing the same content.
@@ -3730,9 +3745,11 @@ impl Widget for PortalList {
                             push_sample(samples, new_abs, e.time);
                             // Android keeps sending moves for a still finger.
                             if new_abs != old_sample.abs {
-                                // Like the other scroll paths, we only follow the end again once a draw finds us there,
-                                // since a draw before the drag got going may have found us still at the end.
-                                self.tail_range = false;
+                                // A draw before the drag got going may have found us still at the end, so moving away
+                                // from it stops following it, and a later draw that finds us there follows it again.
+                                if new_abs > old_sample.abs {
+                                    self.tail_range = false;
+                                }
                                 self.detect_tail_in_draw = true;
                                 self.delta_top_scroll(cx, new_abs - old_sample.abs, false, false, 0.0, true, true);
                                 self.area.redraw(cx);

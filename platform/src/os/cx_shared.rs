@@ -6,7 +6,7 @@ use {
         draw_pass::{CxDrawPassParent, DrawPassId, TimeFpsClock, TimeFpsFrames},
         event::{
             DrawEvent, Event, KeyFocusEvent, NextFrameEvent, TextClipboardEvent,
-            TimerEvent, TriggerEvent,
+            TimerEvent, TriggerEvent, VirtualKeyboardEvent,
         },
         makepad_live_id::{live_id, LiveId},
         makepad_math::Vec2Index,
@@ -1415,6 +1415,12 @@ impl Cx {
         if self.event_dispatch_is_reentrant(event) {
             return;
         }
+        if let Event::VirtualKeyboard(keyboard_event) = event {
+            self.keyboard.virtual_keyboard_height = match keyboard_event {
+                VirtualKeyboardEvent::WillShow { height, .. } | VirtualKeyboardEvent::DidShow { height, .. } => *height,
+                VirtualKeyboardEvent::WillHide { .. } | VirtualKeyboardEvent::DidHide { .. } => 0.0,
+            };
+        }
         crate::remote::note_user_event(self, event);
         #[cfg(any(target_arch = "wasm32", target_os = "linux", test))]
         if let Some(drag) = self.drag_drop.internal_drag_event(event) {
@@ -1583,6 +1589,8 @@ impl Cx {
         std::mem::swap(&mut draw_event, &mut self.new_draw_event);
         draw_event.time = time;
         self.in_draw_event = true;
+        // A draw that unwound (e.g., a panic the platform caught) can't leave a KeyboardView's scope behind.
+        self.ime_scope = 0;
         // The flag comes down whether the draw returned or unwound: a
         // platform that catches the panic and goes on must not have every
         // later `redraw` refused as "already drawing".

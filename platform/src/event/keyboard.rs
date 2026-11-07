@@ -21,11 +21,17 @@ pub struct CxKeyboard {
     /// Whether that hide was cancelled while the key focus was changing, see `Cx::cancel_text_ime_hide`.
     pub(crate) is_text_ime_hide_cancelled: bool,
     pub(crate) has_physical_keyboard: bool,
+    /// The soft keyboard's height from the latest `VirtualKeyboard` event, or 0 once it's hiding.
+    pub(crate) virtual_keyboard_height: f64,
 }
 
 impl CxKeyboard {
     pub fn has_physical_keyboard(&self) -> bool {
         self.has_physical_keyboard
+    }
+
+    pub fn virtual_keyboard_height(&self) -> f64 {
+        self.virtual_keyboard_height
     }
 
     pub fn modifiers(&self) -> KeyModifiers {
