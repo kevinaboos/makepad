@@ -317,6 +317,10 @@ pub struct ScrollBar {
     /// a drag our way, like a touch drag always does (e.g., for a sideways row of buttons).
     #[live(false)]
     mouse_drags_from_widgets: bool,
+    /// Whether a drag that scrolls us leaves the key focus where it is, so a focused text input keeps its
+    /// soft keyboard up (e.g., for a row of filter buttons below a search bar). Otherwise it hides like after a tap.
+    #[live(false)]
+    keep_key_focus: bool,
     /// Whether the bar fades out once scrolling stops and the pointer leaves it.
     #[live(true)]
     auto_hide: bool,
@@ -1042,6 +1046,9 @@ impl ScrollBar {
                         None => return,
                         Some(direction) if !direction.allows(axis) => return self.yield_drag(cx, dispatch_action),
                         Some(_) => {}
+                    }
+                    if self.keep_key_focus {
+                        cx.fingers.mark_press_as_keeping_key_focus(e.digit_id);
                     }
                     let old_sample = *samples.last().unwrap();
                     push_sample(samples, new_abs, e.time);

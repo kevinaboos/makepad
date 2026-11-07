@@ -652,9 +652,9 @@ pub struct TextInput {
     /// Skip finger move after long press to prevent selection changes
     #[rust]
     ignore_next_move: bool,
-    /// Touch that started outside this input while focused and may blur on release, with where it started.
+    /// Touch that started outside this input while focused and may blur on release.
     #[rust]
-    pending_outside_focus_loss_touch: Option<(u64, DVec2)>,
+    pending_outside_focus_loss_touch: Option<u64>,
     /// A touch on this input that hasn't focused it, and what it has turned out to be so far.
     #[rust]
     touch_press: Option<(DigitId, TouchPress)>,
@@ -2527,24 +2527,16 @@ impl Widget for TextInput {
                                 if rect.contains(touch.abs) {
                                     self.pending_outside_focus_loss_touch = None;
                                 } else {
-                                    self.pending_outside_focus_loss_touch = Some((touch.uid, touch.abs));
-                                }
-                            }
-                            // Only a tap takes our focus away, not a touch that moves far enough to scroll something.
-                            TouchState::Move => {
-                                if self.pending_outside_focus_loss_touch.is_some_and(|(uid, start)| {
-                                    uid == touch.uid && ScrollDirection::from_travel(touch.abs - start).is_some()
-                                }) {
-                                    self.pending_outside_focus_loss_touch = None;
+                                    self.pending_outside_focus_loss_touch = Some(touch.uid);
                                 }
                             }
                             TouchState::Cancel => {
-                                if self.pending_outside_focus_loss_touch.is_some_and(|(uid, _)| uid == touch.uid) {
+                                if self.pending_outside_focus_loss_touch == Some(touch.uid) {
                                     self.pending_outside_focus_loss_touch = None;
                                 }
                             }
                             TouchState::Stop => {
-                                if self.pending_outside_focus_loss_touch.is_some_and(|(uid, _)| uid == touch.uid) {
+                                if self.pending_outside_focus_loss_touch == Some(touch.uid) {
                                     should_lose_focus = !rect.contains(touch.abs)
                                         && !cx.fingers.is_press_keeping_key_focus(
                                             live_id_num!(touch, touch.uid).into(),
@@ -2680,7 +2672,7 @@ impl Widget for TextInput {
                 }
             }
             // A touch waits to see if it's a tap before focusing us, so a drag can scroll our text or the page instead.
-            // Its press also keeps a focused input elsewhere from dropping the focus that we might take.
+            // Until then, its press keeps a focused input elsewhere from dropping the focus that we might take.
             Hit::FingerDown(FingerDownEvent {
                 tap_count: 1,
                 device,
@@ -2831,6 +2823,8 @@ impl Widget for TextInput {
                 let travel = fe.abs - fe.abs_start;
                 if let Some((_, press @ TouchPress::Undecided)) = &mut self.touch_press {
                     let Some(direction) = ScrollDirection::from_travel(travel) else { return };
+                    // A drag hides the keyboard of an input elsewhere like any other scroll, since it can't focus us.
+                    cx.fingers.unmark_press_as_keeping_key_focus(fe.digit_id);
                     let has_more_text_that_way =
                         if travel.y > 0.0 { self.scroll_y > 0.0 } else { self.scroll_y < self.cached_max_scroll_y };
                     *press = if self.is_multiline
