@@ -2147,6 +2147,16 @@ impl Cx {
         self.keyboard.set_key_focus(focus_area);
     }
 
+    /// Like [`Self::set_key_focus`], for focus the user gave, e.g., by pressing on `focus_area` or tabbing to it.
+    pub fn set_key_focus_from_user(&mut self, focus_area: Area) {
+        self.keyboard.set_key_focus_from_user(focus_area);
+    }
+
+    /// Whether `focus_area` has key focus that the user gave it, rather than code.
+    pub fn has_key_focus_from_user(&self, focus_area: Area) -> bool {
+        self.keyboard.has_key_focus_from_user(focus_area)
+    }
+
     pub fn key_focus(&self) -> Area {
         self.keyboard.key_focus()
     }

@@ -66,7 +66,7 @@ impl NavControl {
                         {
                             if !prev_area.is_empty() {
                                 Self::send_trigger_to_scroll_stack(cx, scroll_stack);
-                                cx.set_key_focus(prev_area);
+                                cx.set_key_focus_from_user(prev_area);
                             }
                         }
                     } else {
@@ -83,7 +83,7 @@ impl NavControl {
                             })
                         {
                             Self::send_trigger_to_scroll_stack(cx, scroll_stack);
-                            cx.set_key_focus(next_area);
+                            cx.set_key_focus_from_user(next_area);
                         }
                     }
                 }
