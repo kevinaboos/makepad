@@ -460,8 +460,33 @@ impl CheckBox {
 
         self.draw_icon.draw_walk(cx, self.icon_walk);
 
-        self.draw_text
-            .draw_walk(cx, self.label_walk, self.label_align, self.text.as_ref());
+        // DrawText would wrap a Fit label at our whole inner width (or nowhere, while we're Fit),
+        // so we give it just the room left after the mark and icon, within our width or max width.
+        let label_room = self.label_walk.width.is_fit().then(|| {
+            let turtle = cx.turtle();
+            let width = Some(turtle.width())
+                .filter(|width| !width.is_nan())
+                .or_else(|| cx.current_turtle_max_width())?;
+            let label_x = turtle.pos().x + cx.turtle_next_walk_offset().x + self.label_walk.margin.left;
+            Some(turtle.origin().x + width - turtle.padding().right - label_x - self.label_walk.margin.right)
+        }).flatten();
+        if let Some(label_room) = label_room {
+            let wrap = matches!(cx.turtle().layout().flow, Flow::Right { wrap: true, .. });
+            let max_width_in_lpxs = label_room.max(0.0) as f32 / self.draw_text.font_scale.max(0.0001);
+            let text = self.draw_text.layout(
+                cx,
+                0.0,
+                0.0,
+                Some(max_width_in_lpxs),
+                wrap,
+                self.label_align,
+                self.text.as_ref(),
+            );
+            self.draw_text.draw_walk_laidout(cx, self.label_walk, &text);
+        } else {
+            self.draw_text
+                .draw_walk(cx, self.label_walk, self.label_align, self.text.as_ref());
+        }
         self.draw_bg.end(cx);
         cx.add_nav_stop(self.draw_bg.area(), NavRole::TextInput, Inset::default());
         DrawStep::done()
