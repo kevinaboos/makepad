@@ -521,6 +521,13 @@ impl ViewRef {
         }
     }
 
+    /// See [`View::smooth_scroll_to()`].
+    pub fn smooth_scroll_to(&self, cx: &mut Cx, v: Vec2d) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.smooth_scroll_to(cx, v)
+        }
+    }
+
     /// See [`View::scroll_pos()`].
     pub fn scroll_pos(&self) -> Vec2d {
         self.borrow().map_or(Vec2d::default(), |inner| inner.scroll_pos())
@@ -1397,6 +1404,16 @@ impl View {
         if let Some(scroll_bars) = &mut self.scroll_bars_obj {
             scroll_bars.stop_motion();
             scroll_bars.set_scroll_pos_no_clip(cx, v);
+        } else {
+            self.layout.scroll = v;
+        }
+    }
+
+    /// Like [`View::set_scroll_pos()`], but our scroll bars ease the content there over a short time.
+    /// A view without scroll bars just jumps there.
+    pub fn smooth_scroll_to(&mut self, cx: &mut Cx, v: Vec2d) {
+        if let Some(scroll_bars) = &mut self.scroll_bars_obj {
+            scroll_bars.smooth_scroll_to(cx, v);
         } else {
             self.layout.scroll = v;
         }

@@ -407,6 +407,16 @@ impl ScrollBars {
         }
     }
 
+    /// See [`ScrollBar::smooth_scroll_to`].
+    pub fn smooth_scroll_to(&mut self, cx: &mut Cx, pos: Vec2d) {
+        if self.show_scroll_x {
+            self.scroll_bar_x.smooth_scroll_to(cx, pos.x);
+        }
+        if self.show_scroll_y {
+            self.scroll_bar_y.smooth_scroll_to(cx, pos.y);
+        }
+    }
+
     // all in one scrollbar api
 
     pub fn begin(&mut self, cx: &mut Cx2d, walk: Walk, layout: Layout) {
