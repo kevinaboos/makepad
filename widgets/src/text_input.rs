@@ -1370,7 +1370,13 @@ impl TextInput {
         if self.is_multiline {
             let max_scroll_y = (laidout_text_height - height).max(0.0);
             self.cached_max_scroll_y = max_scroll_y;
-            self.scroll_y = self.scroll_y.max(0.0).min(max_scroll_y);
+            // Text shorter than the box (e.g., from a `Fit` min height) sits where `align.y` puts it,
+            // through the same offset that single-line inputs center with.
+            self.scroll_y = if laidout_text_height < height {
+                (laidout_text_height - height) * self.layout.align.y
+            } else {
+                self.scroll_y.max(0.0).min(max_scroll_y)
+            };
         } else {
             // Single-line: nothing scrolls vertically, so the offset centres the
             // line box in the inner rect instead. Pinning to padding.top would
