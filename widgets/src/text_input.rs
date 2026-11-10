@@ -2883,8 +2883,9 @@ impl Widget for TextInput {
                     let Some(direction) = ScrollDirection::from_travel(travel) else { return };
                     // It can't focus us now, so whatever it scrolls decides if an input elsewhere keeps its keyboard.
                     cx.fingers.unmark_press_as_keeping_key_focus(fe.digit_id);
-                    let has_more_text_that_way =
-                        if travel.y > 0.0 { self.scroll_y > 0.0 } else { self.scroll_y < self.cached_max_scroll_y };
+                    // Text shorter than the box has a negative `scroll_y` from `align.y`, but nothing to scroll.
+                    let has_more_text_that_way = self.cached_max_scroll_y > 0.0
+                        && if travel.y > 0.0 { self.scroll_y > 0.0 } else { self.scroll_y < self.cached_max_scroll_y };
                     *press = if self.is_multiline
                         && direction.allows(Vec2Index::Y)
                         && has_more_text_that_way
