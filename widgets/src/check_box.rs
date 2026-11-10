@@ -74,6 +74,8 @@ script_mod! {
             focus: instance(0.0)
             /** checked mix 0..1 step 0.01 */
             active: instance(0.0)
+            /** the mark box's offset down from our middle, which lines it up with the label's first line */
+            mark_box_offset_y: instance(0.0)
 
             /** mark box side length in pixels 8..32 step 1 */
             size: uniform(15.0)
@@ -111,7 +113,7 @@ script_mod! {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
 
                 let sz_px = self.size
-                let center_px = vec2(sz_px * 0.5, self.rect_size.y * 0.5)
+                let center_px = vec2(sz_px * 0.5, self.rect_size.y * 0.5 + self.mark_box_offset_y)
                 let offset_px = vec2(0., center_px.y - sz_px * 0.5)
 
                 //match self.check_type {
@@ -277,7 +279,7 @@ script_mod! {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
 
                 let sz_px = vec2(self.size * /** pill aspect 1..2.5 step 0.05 */ 1.6, self.size)
-                let center_px = vec2(sz_px.x * 0.5, self.rect_size.y * 0.5)
+                let center_px = vec2(sz_px.x * 0.5, self.rect_size.y * 0.5 + self.mark_box_offset_y)
                 let offset_px = vec2(0., center_px.y - sz_px.y * 0.5)
 
                 // Draw background pill
@@ -470,7 +472,7 @@ impl CheckBox {
             let label_x = turtle.pos().x + cx.turtle_next_walk_offset().x + self.label_walk.margin.left;
             Some(turtle.origin().x + width - turtle.padding().right - label_x - self.label_walk.margin.right)
         }).flatten();
-        if let Some(label_room) = label_room {
+        let laid_out_label = if let Some(label_room) = label_room {
             let wrap = matches!(cx.turtle().layout().flow, Flow::Right { wrap: true, .. });
             let max_width_in_lpxs = label_room.max(0.0) as f32 / self.draw_text.font_scale.max(0.0001);
             let text = self.draw_text.layout(
@@ -482,12 +484,23 @@ impl CheckBox {
                 self.label_align,
                 self.text.as_ref(),
             );
-            self.draw_text.draw_walk_laidout(cx, self.label_walk, &text);
+            let label_rect = self.draw_text.draw_walk_laidout(cx, self.label_walk, &text);
+            Some((text, label_rect))
         } else {
             self.draw_text
                 .draw_walk(cx, self.label_walk, self.label_align, self.text.as_ref());
-        }
+            None
+        };
         self.draw_bg.end(cx);
+        // We line the mark box up with the label's first line, not the middle of a wrapped label.
+        if let Some((text, label_rect)) = laid_out_label {
+            if let Some(first_row) = text.rows.first() {
+                let first_row_height = (first_row.ascender_in_lpxs - first_row.descender_in_lpxs) * self.draw_text.font_scale;
+                let rect = self.draw_bg.area().rect(cx);
+                let mark_box_offset_y = label_rect.pos.y + first_row_height as f64 * 0.5 - (rect.pos.y + rect.size.y * 0.5);
+                self.draw_bg.set_instance_on_area(cx, live_id!(mark_box_offset_y), &[mark_box_offset_y as f32]);
+            }
+        }
         cx.add_nav_stop(self.draw_bg.area(), NavRole::TextInput, Inset::default());
         DrawStep::done()
     }
