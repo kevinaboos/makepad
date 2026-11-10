@@ -14,6 +14,7 @@ use makepad_zune_png::PngDecoder;
 pub struct GlyphRasterImage<'a> {
     origin_in_dpxs: Point<f32>,
     dpxs_per_em: f32,
+    metrics_size: Size<usize>,
     #[allow(dead_code)]
     format: Format,
     data: &'a [u8],
@@ -24,6 +25,7 @@ impl<'a> GlyphRasterImage<'a> {
         Some(Self {
             origin_in_dpxs: Point::new(image.x as f32, image.y as f32),
             dpxs_per_em: image.pixels_per_em as f32,
+            metrics_size: Size::new(image.width as usize, image.height as usize),
             format: Format::from_raster_image_format(image.format)?,
             data: image.data,
         })
@@ -47,6 +49,9 @@ impl<'a> GlyphRasterImage<'a> {
     }
 
     pub fn decode_size(&self) -> Size<usize> {
+        if self.metrics_size.width > 0 && self.metrics_size.height > 0 {
+            return self.metrics_size;
+        }
         match self.format {
             Format::Png => self.decode_size_png(),
         }

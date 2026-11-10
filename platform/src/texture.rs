@@ -500,6 +500,9 @@ pub(crate) struct TextureLifetime {
     pub(crate) readbacks: TextureReadbacks,
     #[cfg(all(not(gpusim), any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     pub(crate) metal_readbacks: crate::os::apple::metal::MetalReadbacks,
+    /// A released texture's upload left a staging buffer its size in the pool.
+    #[cfg(all(not(gpusim), any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    pub(crate) has_stale_metal_staging: bool,
     #[cfg(all(not(gpusim), not(any(linux_direct, target_env = "ohos", all(use_vulkan, not(target_os = "linux")))), any(target_os = "linux", target_os = "android")))]
     pub(crate) gl_readbacks: crate::os::linux::opengl::GlReadbacks,
     #[cfg(all(not(gpusim), target_os = "windows"))]
@@ -1042,9 +1045,34 @@ impl CxTexture {
 
     #[allow(unused)]
     pub(crate) fn take_updated(&mut self) -> TextureUpdated {
-        let updated = self.updated();
+        let mut updated = self.updated();
+        if self.can_change_drawn_texels(updated) {
+            self.texel_generation += 1;
+            // A rebuild leaves nothing of the old rows, so every copy a backend keeps needs all of it.
+            if self.is_append_only {
+                updated = TextureUpdated::Full;
+            }
+        }
+        if !updated.is_empty() {
+            self.uploaded_height = self.format.vec_width_height().map_or(0, |(_, height)| height);
+            self.uploaded_epoch = self.content_epoch;
+        }
         self.set_updated(TextureUpdated::Empty);
         updated
+    }
+
+    /// Returns whether uploading `updated` can change texels that a draw already samples.
+    #[allow(unused)]
+    pub(crate) fn can_change_drawn_texels(&self, updated: TextureUpdated) -> bool {
+        match updated {
+            TextureUpdated::Empty => false,
+            // An append starts in or after the last row we uploaded, so a rect that starts earlier rebuilt it.
+            TextureUpdated::Partial(rect) if self.is_append_only || self.content_epoch.is_some() => {
+                (self.is_append_only && rect.origin.y + 1 < self.uploaded_height)
+                    || self.uploaded_epoch.is_some_and(|epoch| self.content_epoch != Some(epoch))
+            }
+            _ => true,
+        }
     }
     #[allow(unused)]
     pub(crate) fn take_initial(&mut self) -> bool {
@@ -1062,6 +1090,14 @@ impl CxTexture {
             }
         }
         false
+    }
+
+    /// Returns how many rows to allocate for an append-only texture that's `height` rows tall.
+    ///
+    /// Its storage doubles as it grows, so most appends fit into the rows it already has.
+    #[allow(unused)]
+    pub(crate) fn get_append_only_capacity(height: usize) -> usize {
+        height.next_power_of_two()
     }
 
     #[allow(unused)]
@@ -1477,6 +1513,18 @@ impl Texture {
         cx.textures[self.texture_id()].retained_render_target = retained;
     }
 
+    /// Mark a Vec texture as one that only grows by appending rows (see
+    /// `CxTexture::is_append_only`).
+    pub fn mark_as_append_only(&self, cx: &mut Cx) {
+        cx.textures[self.texture_id()].is_append_only = true;
+    }
+
+    /// Says that texels a draw already samples only change when `epoch` does,
+    /// like in a glyph atlas that only reuses its slots after a reset.
+    pub fn set_content_epoch(&self, cx: &mut Cx, epoch: u64) {
+        cx.textures[self.texture_id()].content_epoch = Some(epoch);
+    }
+
     pub fn animation<'a>(&self, cx: &'a mut Cx) -> &'a Option<TextureAnimation> {
         &cx.textures[self.texture_id()].animation
     }
@@ -1608,12 +1656,21 @@ pub struct CxTexture {
     pub(crate) alloc: Option<TextureAlloc>,
     pub(crate) allocation_generation: u64,
     pub(crate) producer_serial: u64,
+    /// Goes up with each upload that `can_change_drawn_texels`.
+    pub(crate) texel_generation: u64,
+    pub(crate) uploaded_height: usize,
+    /// Set by `Texture::set_content_epoch`, and `None` when any upload can change drawn texels.
+    pub(crate) content_epoch: Option<u64>,
+    pub(crate) uploaded_epoch: Option<u64>,
     pub(crate) animation: Option<TextureAnimation>,
     pub(crate) natural_size: Option<(usize, usize)>,
     /// A render target the application keeps as a cache: a software backend
     /// never releases its framebuffer for idleness or budget while the
     /// handle lives (GPU backends keep every target anyway).
     pub(crate) retained_render_target: bool,
+    /// This texture only grows by appending rows, and its shaders find texels by the texture's
+    /// own size, so a backend can give it spare rows and upload just the new ones.
+    pub(crate) is_append_only: bool,
     pub os: CxOsTexture,
     pub previous_platform_resource: Option<CxOsTexture>,
 }

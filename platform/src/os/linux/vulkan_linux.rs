@@ -331,6 +331,7 @@ impl DesktopInit {
             offscreen_render_passes: HashMap::new(),
             geometries: HashMap::new(),
             textures: HashMap::new(),
+            max_image_dimension_2d: props.limits.max_image_dimension2_d,
             frame_resources: FrameResources::default(),
             command_pool: vk::CommandPool::null(),
             command_buffer: vk::CommandBuffer::null(),

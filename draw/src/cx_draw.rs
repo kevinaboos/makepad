@@ -56,8 +56,13 @@ impl<'a> DerefMut for CxDraw<'a> {
 
 impl<'a> Drop for CxDraw<'a> {
     fn drop(&mut self) {
+        self.cx.is_in_draw_walk = false;
+        let was_redrawing_all = self.cx.new_draw_event.redraw_all;
         if !self.fonts.borrow_mut().prepare_textures(self.cx) {
             self.cx.redraw_all();
+        }
+        if self.cx.new_draw_event.redraw_all && !was_redrawing_all {
+            self.fonts.borrow_mut().counters.redraw_all_requests += 1;
         }
         self.pass_stack.clear();
         self.draw_list_stack.clear();
@@ -71,6 +76,7 @@ impl<'a> Drop for CxDraw<'a> {
 
 impl<'a> CxDraw<'a> {
     pub fn new(cx: &'a mut Cx, draw_event: &'a DrawEvent) -> Self {
+        cx.is_in_draw_walk = true;
         Self::lazy_construct_fonts(cx);
         Self::lazy_construct_nav_tree(cx);
         cx.redraw_id += 1;

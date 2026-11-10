@@ -16,12 +16,22 @@ pub struct CxKeyboard {
     #[allow(dead_code)]
     pub(crate) keys_down: Vec<KeyEvent>,
     pub(crate) text_ime_dismissed: bool,
+    /// Whether a hide of the soft keyboard is waiting for the last finger to lift.
+    pub(crate) is_text_ime_hide_deferred: bool,
+    /// Whether that hide was cancelled while the key focus was changing, see `Cx::cancel_text_ime_hide`.
+    pub(crate) is_text_ime_hide_cancelled: bool,
     pub(crate) has_physical_keyboard: bool,
+    /// The soft keyboard's height from the latest `VirtualKeyboard` event, or 0 once it's hiding.
+    pub(crate) virtual_keyboard_height: f64,
 }
 
 impl CxKeyboard {
     pub fn has_physical_keyboard(&self) -> bool {
         self.has_physical_keyboard
+    }
+
+    pub fn virtual_keyboard_height(&self) -> f64 {
+        self.virtual_keyboard_height
     }
 
     pub fn modifiers(&self) -> KeyModifiers {

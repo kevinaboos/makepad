@@ -7,7 +7,8 @@ use {
         os::{
             cx_native::EventFlow,
             windows::{
-                dataobject::DragItemWindows, dropsource::*, win32_event::Win32Event,
+                dataobject::DragItemWindows, dropsource::*,
+                win32_appearance::AppearanceFunctions, win32_event::Win32Event,
                 win32_window::Win32Window,
             },
         },
@@ -223,11 +224,15 @@ unsafe fn coalesce_mouse_wheel(mut msg: MSG) -> MSG {
 const QS_ALLINPUT: u32 = 0x04FF;
 const MWMO_INPUTAVAILABLE: u32 = 0x0004;
 const WAIT_FAILED_U32: u32 = 0xFFFF_FFFF;
+const INFINITE: u32 = 0xFFFF_FFFF;
+const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
 
 /// Wait until either one of `handles` is signaled (a window's DXGI frame-latency
-/// waitable, i.e. "the compositor is ready for that window's next frame") or the
-/// thread has queued input. Returns `WAIT_OBJECT_0 + k` for handle `k`,
-/// `WAIT_OBJECT_0 + handles.len()` for input, `WAIT_TIMEOUT_U32` on timeout.
+/// waitable, i.e. "the compositor is ready for that window's next frame", or the
+/// timer a `time_fps` frame waits on) or the thread has queued input. Returns
+/// `WAIT_OBJECT_0 + k` for handle `k`, `WAIT_OBJECT_0 + handles.len()` for input,
+/// `WAIT_TIMEOUT_U32` on timeout.
 ///
 /// `MWMO_INPUTAVAILABLE` matters: without it the call only wakes on input that
 /// arrived *after* the wait started, so a message already sitting in the queue
@@ -278,6 +283,21 @@ unsafe fn drain_messages() -> bool {
     !matches!(with_win32_app(|app| app.event_flow.clone()), EventFlow::Exit)
 }
 
+/// Hands a message the Wait flow took to its window, then paints unless it was the signal poll.
+unsafe fn dispatch_waited_message(msg: MSG) {
+    let msg = coalesce_mouse_move(msg);
+    let msg = coalesce_mouse_wheel(msg);
+    let _ = TranslateMessage(&msg);
+    DispatchMessageW(&msg);
+    if !with_win32_app(|app| app.was_signal_poll()) {
+        with_win32_app(|app| {
+            let now = app.time_now();
+            app.frame_trace.tick(TickSource::Message, now, None);
+        });
+        Win32App::do_callback(Win32Event::Paint);
+    }
+}
+
 pub struct Win32App {
     event_callback: Option<Box<dyn FnMut(Win32Event) -> EventFlow>>,
     /// Events queued by re-entrant `do_callback` calls; drained FIFO by the outer
@@ -290,6 +310,8 @@ pub struct Win32App {
     pub was_signal_poll: bool,
     pub event_flow: EventFlow,
     pub dpi_functions: DpiFunctions,
+    /// `None` until the app first sets a native appearance.
+    pub appearance_functions: Option<AppearanceFunctions>,
     pub current_cursor: Option<MouseCursor>,
     /// The cursor WM_SETCURSOR re-applies over the client area.
     pub requested_cursor: MouseCursor,
@@ -315,6 +337,10 @@ pub struct Win32App {
     pub beat_timeout_ms: u32,
     /// The frame clock, measured (`MAKEPAD_TRACE=frames`).
     pub frame_trace: crate::frame_trace::FrameTrace,
+    /// When the Wait flow wakes for the beat that paints the next `time_fps` frame, in app time.
+    pub time_fps_wake: Option<f64>,
+    /// The high resolution timer that wake sleeps on, made the first time we need it.
+    time_fps_timer: Option<HANDLE>,
 }
 
 /// One window's frame clock.
@@ -434,6 +460,7 @@ impl Win32App {
             all_windows: Vec::new(),
             timers: Vec::new(),
             dpi_functions: DpiFunctions::new(),
+            appearance_functions: None,
             current_cursor: None,
             requested_cursor: MouseCursor::Default,
             requested_hcursor: Self::load_cursor(MouseCursor::Default),
@@ -443,6 +470,8 @@ impl Win32App {
             beat_handles: Vec::new(),
             beat_timeout_ms: BEAT_TIMEOUT_PRESENTED_MS,
             frame_trace: crate::frame_trace::FrameTrace::new(),
+            time_fps_wake: None,
+            time_fps_timer: None,
         };
         win32_app.dpi_functions.become_dpi_aware();
 
@@ -540,24 +569,107 @@ impl Win32App {
                 let event_flow = with_win32_app(|app| app.event_flow.clone());
                 match event_flow {
                     EventFlow::Wait => {
-                        let mut msg = std::mem::MaybeUninit::uninit();
-                        let ret = GetMessageW(msg.as_mut_ptr(), None, 0, 0);
-                        let msg = msg.assume_init();
-                        if ret == FALSE {
-                            // Only happens if the message is `WM_QUIT`.
-                            debug_assert_eq!(msg.message, WM_QUIT);
-                            with_win32_app(|app| app.event_flow = EventFlow::Exit);
-                        } else {
-                            let msg = coalesce_mouse_move(msg);
-                            let msg = coalesce_mouse_wheel(msg);
-                            let _ = TranslateMessage(&msg);
-                            DispatchMessageW(&msg);
-                            if !with_win32_app(|app| app.was_signal_poll()) {
-                                with_win32_app(|app| {
-                                    let now = app.time_now();
-                                    app.frame_trace.tick(TickSource::Message, now, None);
+                        if let Some(wake) = with_win32_app(|app| app.time_fps_wake) {
+                            windows_core::link!("kernel32.dll" "system" fn CreateWaitableTimerExW(
+                                attributes: *const core::ffi::c_void,
+                                name: PCWSTR,
+                                flags: u32,
+                                access: u32
+                            ) -> HANDLE);
+                            windows_core::link!("kernel32.dll" "system" fn SetWaitableTimer(
+                                timer: HANDLE,
+                                due_time: *const i64,
+                                period: i32,
+                                completion: *const core::ffi::c_void,
+                                completion_arg: *const core::ffi::c_void,
+                                resume: BOOL
+                            ) -> BOOL);
+                            // We sleep till the `time_fps` frame's beat on a high resolution timer, or on
+                            // the plain timeout before Windows 10 1803, and any message ends it early.
+                            let (timer, now) = with_win32_app(|app| {
+                                let timer = *app.time_fps_timer.get_or_insert_with(|| {
+                                    CreateWaitableTimerExW(
+                                        std::ptr::null(),
+                                        PCWSTR::null(),
+                                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                        TIMER_ALL_ACCESS,
+                                    )
                                 });
-                                Win32App::do_callback(Win32Event::Paint);
+                                ((!timer.is_invalid()).then_some(timer), app.time_now())
+                            });
+                            let mut is_due = wake <= now;
+                            if !is_due {
+                                // A relative due time is negative, in 100ns units.
+                                let due_time = -(((wake - now) * 1e7).ceil() as i64);
+                                let timer = timer.filter(|timer| {
+                                    SetWaitableTimer(
+                                        *timer,
+                                        &due_time,
+                                        0,
+                                        std::ptr::null(),
+                                        std::ptr::null(),
+                                        FALSE,
+                                    ) != FALSE
+                                });
+                                let timeout_ms = match timer {
+                                    Some(_) => INFINITE,
+                                    None => ((wake - now) * 1000.0).ceil() as u32,
+                                };
+                                let handles = timer.as_slice();
+                                let ret = msg_wait_for_beat_or_input(handles, timeout_ms);
+                                if ret == handles.len() as u32 {
+                                    let mut msg = std::mem::MaybeUninit::uninit();
+                                    // A sent message gets handled in here, which leaves nothing to take.
+                                    if PeekMessageW(msg.as_mut_ptr(), None, 0, 0, PM_REMOVE) != FALSE {
+                                        let msg = msg.assume_init();
+                                        if msg.message == WM_QUIT {
+                                            with_win32_app(|app| app.event_flow = EventFlow::Exit);
+                                        } else {
+                                            dispatch_waited_message(msg);
+                                        }
+                                    }
+                                } else if ret == WAIT_FAILED_U32 {
+                                    // We'd spin on a timer we can't wait on, so the plain timeout takes over.
+                                    with_win32_app(|app| app.time_fps_timer = Some(HANDLE::default()));
+                                } else {
+                                    is_due = with_win32_app(|app| app.time_now()) >= wake;
+                                }
+                            }
+                            if is_due {
+                                with_win32_app(|app| app.time_fps_wake = None);
+                                // Poll takes the primary's beat, which is ready by now, but one that painted
+                                // nothing kept its credit and dropped out of that wait, so we run it here.
+                                match with_win32_app(|app| {
+                                    app.beat_handles.first().map(|beat| (beat.window_id, beat.credit_held))
+                                }) {
+                                    Some((_, false)) => {
+                                        with_win32_app(|app| app.event_flow = EventFlow::Poll)
+                                    }
+                                    primary => {
+                                        let time = with_win32_app(|app| {
+                                            let now = app.time_now();
+                                            app.frame_trace.tick(TickSource::Timer, now, None);
+                                            now
+                                        });
+                                        Win32App::do_callback(match primary {
+                                            Some((window_id, _)) => {
+                                                Win32Event::Beat { window_id, time, primary: true }
+                                            }
+                                            None => Win32Event::Paint,
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut msg = std::mem::MaybeUninit::uninit();
+                            let ret = GetMessageW(msg.as_mut_ptr(), None, 0, 0);
+                            let msg = msg.assume_init();
+                            if ret == FALSE {
+                                // Only happens if the message is `WM_QUIT`.
+                                debug_assert_eq!(msg.message, WM_QUIT);
+                                with_win32_app(|app| app.event_flow = EventFlow::Exit);
+                            } else {
+                                dispatch_waited_message(msg);
                             }
                         }
                     }

@@ -657,8 +657,14 @@ fn rust_build(
 
         let target_arch_str = android_target.to_str();
         let cfg_flag = format!("--cfg android_target=\"{}\"", target_arch_str);
+        // Android's armeabi-v7a ABI includes NEON (CDD 3.3.1) and the NDK's clang turns it on,
+        // but Rust's armv7 target leaves it off. User RUSTFLAGS come after it, so they still win.
+        let mut existing_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+        if let AndroidTarget::armv7 = android_target {
+            existing_rustflags.insert_str(0, "-C target-feature=+neon ");
+        }
         let rustflags = compose_android_rustflags(
-            std::env::var("RUSTFLAGS").ok().as_deref(),
+            Some(&existing_rustflags),
             &cfg_flag,
             prefer_dynamic,
         );
@@ -2271,6 +2277,7 @@ fn aapt2_link_proto_apk(
     compiled_res_zip: &Path,
     assets_dir: &Path,
     out_apk: &Path,
+    r_java_dir: &Path,
     urls: &AndroidSDKUrls,
 ) -> Result<(), String> {
     let cwd = std::env::current_dir().unwrap();
@@ -2278,6 +2285,7 @@ fn aapt2_link_proto_apk(
     let android_jar_str = android_jar.to_str().unwrap().to_string();
     let manifest_str = manifest_xml.to_str().unwrap().to_string();
     let out_str = out_apk.to_str().unwrap().to_string();
+    let r_java_dir_str = r_java_dir.to_str().unwrap().to_string();
     let res_zip_str = compiled_res_zip.to_str().unwrap().to_string();
     let assets_str = assets_dir.to_str().unwrap().to_string();
 
@@ -2293,6 +2301,10 @@ fn aapt2_link_proto_apk(
         &manifest_str,
         "-o",
         &out_str,
+        "--java",
+        &r_java_dir_str,
+        "--custom-package",
+        "dev.makepad.android",
     ];
     if has_assets {
         args.push("-A");
@@ -2565,19 +2577,6 @@ pub fn build_aab(
         resolved.java_url, resolved.app_label, resolved.version_code, resolved.version_name
     );
 
-    // Reuse the existing R-class / javac / d8 pipeline; outputs `classes.dex`
-    // into `build_paths.out_dir`.
-    build_r_class(sdk_dir, &build_paths, urls)?;
-    compile_java(sdk_dir, &build_paths, urls)?;
-    build_dex(sdk_dir, &build_paths, urls)?;
-    let classes_dex = build_paths.out_dir.join("classes.dex");
-    if !classes_dex.is_file() {
-        return Err(format!(
-            "d8 did not produce classes.dex at {:?}",
-            classes_dex
-        ));
-    }
-
     // Stage native libs.
     let build_dir = stage_aab_native_libs(
         sdk_dir,
@@ -2600,7 +2599,8 @@ pub fn build_aab(
         &font_manifest,
     )?;
 
-    // aapt2 compile + link --proto-format. Assets are picked up via -A.
+    // aapt2 compile + link --proto-format. Assets are picked up via -A. The link
+    // also writes R.java, so the IDs javac bakes in match the bundle's resources.
     aapt2_compile_resources(
         sdk_dir,
         &build_paths.res_dir,
@@ -2613,8 +2613,21 @@ pub fn build_aab(
         &aab_paths.compiled_res_zip,
         &aab_paths.staged_assets_dir,
         &aab_paths.proto_apk,
+        &build_paths.tmp_dir,
         urls,
     )?;
+
+    // Reuse the existing javac / d8 pipeline; outputs `classes.dex` into
+    // `build_paths.out_dir`.
+    compile_java(sdk_dir, &build_paths, urls)?;
+    build_dex(sdk_dir, &build_paths, urls)?;
+    let classes_dex = build_paths.out_dir.join("classes.dex");
+    if !classes_dex.is_file() {
+        return Err(format!(
+            "d8 did not produce classes.dex at {:?}",
+            classes_dex
+        ));
+    }
 
     // Repackage proto APK into the bundle module layout, then zip it.
     assemble_aab_base_module(

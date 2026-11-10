@@ -155,7 +155,7 @@ extern "C" fn on_vsync_cb(_timestamp: ::core::ffi::c_longlong, data: *mut c_void
     unsafe {
         let _ = (*(data as *mut VSyncParams))
             .tx
-            .send(FromOhosMessage::VSync);
+            .send(FromOhosMessage::VSync(Some(std::time::Instant::now())));
     }
     let res = unsafe {
         OH_NativeVSync_RequestFrame((*(data as *mut VSyncParams)).vsync, on_vsync_cb, data)
@@ -172,7 +172,7 @@ extern "C" fn on_frame_cb(
     _timestamp: u64,
     _target_timestamp: u64,
 ) {
-    send_from_ohos_message(FromOhosMessage::VSync);
+    send_from_ohos_message(FromOhosMessage::VSync(None));
 }
 
 pub fn init_globals(from_ohos_tx: mpsc::Sender<FromOhosMessage>) {
@@ -265,7 +265,8 @@ pub enum FromOhosMessage {
         height: i32,
     },
     SurfaceDestroyed,
-    VSync,
+    /// A display vsync with when its callback ran, or `None` for any other wake.
+    VSync(Option<std::time::Instant>),
     Touch(Vec<TouchPoint>),
     TextInput(TextInputEvent),
     DeleteLeft(i32),

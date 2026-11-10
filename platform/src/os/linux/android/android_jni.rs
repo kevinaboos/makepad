@@ -6,6 +6,7 @@ use {
     crate::{
         area::Area,
         cx::AndroidParams,
+        display_context::NativeAppearance,
         event::{
             BackGestureEdge, BackGestureState, SelectionHandleKind, SelectionHandlePhase,
             TouchPoint, TouchState, VideoSource,
@@ -583,7 +584,15 @@ static CHOREOGRAPHER: std::sync::atomic::AtomicPtr<ndk_sys::AChoreographer> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 #[cfg(not(no_android_choreographer))]
-static CHOREOGRAPHER_POST_CALLBACK_FN: std::sync::OnceLock<ndk_sys::AChoreographerPostCallbackFn> =
+enum ChoreographerPostFn {
+    /// `AChoreographer_postVsyncCallback` (API 33).
+    Vsync(ndk_sys::AChoreographerPostCallbackFn),
+    Frame64(ndk_sys::AChoreographerPostFrameCallback64Fn),
+    Frame(ndk_sys::AChoreographerPostFrameCallbackFn),
+}
+
+#[cfg(not(no_android_choreographer))]
+static CHOREOGRAPHER_POST_CALLBACK_FN: std::sync::OnceLock<ChoreographerPostFn> =
     std::sync::OnceLock::new();
 
 static IS_RENDER_LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -623,11 +632,9 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_initChoreographe
         CHOREOGRAPHER.store(ndk_sys::AChoreographer_getInstance(), Ordering::Release);
         // AChoreographer_postFrameCallback64 (API 29) and
         // AChoreographer_postVsyncCallback (API 33) must be resolved via dlsym,
-        // never declared as `extern "C"` — see the note in ndk_sys.rs. On API
-        // 26-28 neither symbol exists, so the callback fn stays None and we
-        // fall back to the manual frame loop below.
-        if sdk_version >= 29 {
-            if let Ok(lib) = ModuleLoader::load("libandroid.so") {
+        // never declared as `extern "C"`, see the note in ndk_sys.rs.
+        if let Ok(lib) = ModuleLoader::load("libandroid.so") {
+            let post_fn = if sdk_version >= 29 {
                 // Prefer the newer vsync callback (API 33+); fall back to the
                 // API 29 frame callback when it isn't available.
                 let vsync: Option<ndk_sys::AChoreographerPostCallbackFn> = if sdk_version >= 33 {
@@ -635,15 +642,24 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_initChoreographe
                 } else {
                     None
                 };
-                let frame_callback_64: Option<ndk_sys::AChoreographerPostCallbackFn> =
+                let frame_callback_64: Option<ndk_sys::AChoreographerPostFrameCallback64Fn> =
                     lib.get_symbol("AChoreographer_postFrameCallback64").ok();
-                if let Some(post_callback) = vsync.or(frame_callback_64) {
-                    let _ = CHOREOGRAPHER_POST_CALLBACK_FN.set(post_callback);
-                }
+                vsync.map(ChoreographerPostFn::Vsync)
+                    .or(frame_callback_64.map(ChoreographerPostFn::Frame64))
+            } else {
+                // Older Android only has the frame callback that API 29 deprecated.
+                let post_frame_callback: Option<ndk_sys::AChoreographerPostFrameCallbackFn> =
+                    lib.get_symbol("AChoreographer_postFrameCallback").ok();
+                post_frame_callback.map(ChoreographerPostFn::Frame)
+            };
+            if let Some(post_fn) = post_fn {
+                let _ = CHOREOGRAPHER_POST_CALLBACK_FN.set(post_fn);
             }
         }
         match CHOREOGRAPHER_POST_CALLBACK_FN.get() {
-            Some(_) => post_vsync_callback(),
+            Some(_) => {
+                post_vsync_callback();
+            }
             None => init_simple_render_loop(device_refresh_rate),
         }
     }
@@ -654,53 +670,84 @@ unsafe extern "C" fn vsync_callback(
     _data: *mut ndk_sys::AChoreographerFrameCallbackData,
     _user_data: *mut std::ffi::c_void,
 ) {
-    send_from_java_message(FromJavaMessage::RenderLoop(std::time::Instant::now()));
+    // Cleared before the tick goes out, so a post the render thread makes after handling it never
+    // fails on this callback, which won't post another while ticks aren't wanted.
     IS_VSYNC_CALLBACK_POSTED.store(false, Ordering::SeqCst);
+    send_from_java_message(FromJavaMessage::RenderLoop(std::time::Instant::now()));
     if IS_RENDER_LOOP_WANTED.load(Ordering::SeqCst) {
         post_vsync_callback();
     }
 }
 
-/// Posts the vsync callback, unless one is already waiting to run.
+#[cfg(not(no_android_choreographer))]
+unsafe extern "C" fn frame_callback_64(_frame_time_nanos: i64, user_data: *mut std::ffi::c_void) {
+    vsync_callback(std::ptr::null_mut(), user_data);
+}
+
+#[cfg(not(no_android_choreographer))]
+unsafe extern "C" fn frame_callback(
+    _frame_time_nanos: std::ffi::c_long,
+    user_data: *mut std::ffi::c_void,
+) {
+    vsync_callback(std::ptr::null_mut(), user_data);
+}
+
+/// Posts the vsync callback, unless one is already waiting to run, and returns whether it posted one.
 ///
 /// Any thread can call this, since the Choreographer hands posts from other threads to its own looper.
 #[cfg(not(no_android_choreographer))]
-pub unsafe fn post_vsync_callback() {
+pub unsafe fn post_vsync_callback() -> bool {
     let choreographer = CHOREOGRAPHER.load(Ordering::Acquire);
-    let Some(post_callback) = CHOREOGRAPHER_POST_CALLBACK_FN.get() else { return };
+    let Some(post_fn) = CHOREOGRAPHER_POST_CALLBACK_FN.get() else { return false };
     if choreographer.is_null() || IS_VSYNC_CALLBACK_POSTED.swap(true, Ordering::SeqCst) {
-        return;
+        return false;
     }
     if from_java_messages_already_set() {
-        post_callback(choreographer, Some(vsync_callback), std::ptr::null_mut());
+        match post_fn {
+            ChoreographerPostFn::Vsync(post_callback) => {
+                post_callback(choreographer, Some(vsync_callback), std::ptr::null_mut());
+            }
+            ChoreographerPostFn::Frame64(post_callback) => {
+                post_callback(choreographer, Some(frame_callback_64), std::ptr::null_mut());
+            }
+            ChoreographerPostFn::Frame(post_callback) => {
+                post_callback(choreographer, Some(frame_callback), std::ptr::null_mut());
+            }
+        }
+        true
     } else {
         IS_VSYNC_CALLBACK_POSTED.store(false, Ordering::SeqCst);
         IS_RENDER_LOOP_RUNNING.store(false, Ordering::SeqCst);
+        false
     }
 }
 
-/// Tells the vsync callback whether the render thread needs more ticks.
+/// Tells the vsync callback whether the render thread needs more ticks, and returns whether ticks start again.
 ///
 /// Once ticks aren't wanted, the callback stops posting itself, and wanting them again posts it right away.
 /// Without a Choreographer, the fallback loop ticks regardless.
 #[cfg_attr(no_android_choreographer, allow(unused_variables))]
-pub fn set_render_loop_wanted(is_wanted: bool) {
+pub fn set_render_loop_wanted(is_wanted: bool) -> bool {
     #[cfg(not(no_android_choreographer))]
     {
         IS_RENDER_LOOP_WANTED.store(is_wanted, Ordering::SeqCst);
         if is_wanted {
-            unsafe { post_vsync_callback() };
+            return unsafe { post_vsync_callback() };
         }
     }
+    false
 }
 
 /// Fallback render loop used when the Android Choreographer isn't available
-/// (API < 29, and `no_android_choreographer` builds such as OHOS). A dedicated
+/// (libandroid.so has no post function, and `no_android_choreographer` builds such as OHOS). A dedicated
 /// thread paces frames manually, since there is no system vsync callback.
 fn init_simple_render_loop(device_refresh_rate: f32) {
     std::thread::spawn(move || {
         let mut last_frame_time = std::time::Instant::now();
-        let target_frame_time = std::time::Duration::from_secs_f32(1.0 / device_refresh_rate);
+        let target_frame_time = std::time::Duration::try_from_secs_f32(1.0 / device_refresh_rate)
+            .ok()
+            .filter(|frame_time| !frame_time.is_zero())
+            .unwrap_or(std::time::Duration::from_secs_f32(1.0 / 60.0));
         loop {
             // Exit the thread once the app has shut down and the Java->native
             // message channel has been torn down by `from_java_messages_clear()`
@@ -1576,6 +1623,31 @@ pub unsafe fn to_java_set_system_bar_appearance(env: *mut jni_sys::JNIEnv, dark_
     );
 }
 
+pub unsafe fn to_java_set_native_appearance(env: *mut jni_sys::JNIEnv, appearance: NativeAppearance) {
+    let appearance = match appearance {
+        NativeAppearance::System => 0,
+        NativeAppearance::Light => 1,
+        NativeAppearance::Dark => 2,
+    };
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "setNativeAppearance",
+        "(I)V",
+        appearance as jni_sys::jint
+    );
+}
+
+pub unsafe fn to_java_set_app_background_color(env: *mut jni_sys::JNIEnv, argb: u32) {
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "setAppBackgroundColor",
+        "(I)V",
+        argb as jni_sys::jint
+    );
+}
+
 pub unsafe fn to_java_set_surface_cover_visible(visible: bool) {
     let env = attach_jni_env();
     ndk_utils::call_void_method!(
@@ -1590,6 +1662,11 @@ pub unsafe fn to_java_set_surface_cover_visible(visible: bool) {
 pub unsafe fn to_java_request_surface_snapshot_refresh() {
     let env = attach_jni_env();
     ndk_utils::call_void_method!(env, get_activity(), "requestSurfaceSnapshotRefresh", "()V");
+}
+
+pub unsafe fn to_java_show_shader_compile_screen() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "showShaderCompileScreen", "()V");
 }
 
 pub unsafe fn to_java_switch_activity(env: *mut jni_sys::JNIEnv) {

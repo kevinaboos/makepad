@@ -1,5 +1,6 @@
 use crate::{
     cx::Cx,
+    display_context::NativeAppearance,
     draw_list::DrawListId,
     draw_pass::{DrawPassClearColor, DrawPassClearDepth, DrawPassId},
     draw_shader::{
@@ -374,8 +375,8 @@ impl Cx {
                     continue;
                 }
                 if sh.mapping.uses_time {
-                    self.demo_time_repaint = true;
-                    self.passes[pass_id].repaint_next = true;
+                    self.demo_time_repaint |= self.passes[pass_id]
+                        .request_time_repaint(draw_call.options.time_fps, &mut self.time_fps_clock);
                 }
 
                 if sh.mapping.flags.debug_draw {
@@ -1384,6 +1385,10 @@ impl Cx {
             .os_shader_id
             .is_some()
     }
+
+    pub fn can_draw_shader_window_become_ready(&self, _shader_id: DrawShaderId) -> bool {
+        true
+    }
 }
 
 fn texture_pixel_to_dx11_pixel(pix: &TexturePixel) -> DXGI_FORMAT {
@@ -1892,11 +1897,17 @@ impl D3d11Window {
         position: Option<Vec2d>,
         title: &str,
         is_fullscreen: bool,
+        native_appearance: Option<NativeAppearance>,
     ) -> D3d11Window {
         // create window, and then initialize it; this is needed because
         // GWLP_USERDATA needs to reference a stable and existing window
-        let mut win32_window =
-            Box::new(Win32Window::new(window_id, title, position, is_fullscreen));
+        let mut win32_window = Box::new(Win32Window::new(
+            window_id,
+            title,
+            position,
+            is_fullscreen,
+            native_appearance,
+        ));
         win32_window.init(inner_size);
         win32_window.set_ime_active(false);
         let wg = win32_window.get_window_geom();
@@ -1931,8 +1942,14 @@ impl D3d11Window {
         d3d11_cx: &D3d11Cx,
         size: Vec2d,
         position: Vec2d,
+        native_appearance: Option<NativeAppearance>,
     ) -> D3d11Window {
-        let mut win32_window = Box::new(Win32Window::new_popup(window_id, position, size));
+        let mut win32_window = Box::new(Win32Window::new_popup(
+            window_id,
+            position,
+            size,
+            native_appearance,
+        ));
         win32_window.init(size);
 
         let wg = win32_window.get_window_geom();
@@ -2396,7 +2413,6 @@ impl CxOsTexture {
         self.vec_alloc_width = 0;
         self.vec_alloc_height = 0;
         self.vec_alloc_dxgi = 0;
-        self.vec_uploaded_height = 0;
     }
 }
 
@@ -2984,10 +3000,6 @@ pub struct CxOsTexture {
     vec_alloc_width: usize,
     vec_alloc_height: usize,
     vec_alloc_dxgi: i32,
-    /// Number of rows already uploaded into `texture`. In-place `UpdateSubresource` reuse is only
-    /// allowed for pure appends (rows at/after this), never overwriting rows an in-flight frame
-    /// may still be sampling — overwriting them can tear the SDF data and hang the GPU.
-    vec_uploaded_height: usize,
 }
 
 impl CxTexture {
@@ -3154,9 +3166,8 @@ impl CxTexture {
 
             if width == 0 || height == 0 || data_ptr.is_null() {
                 // The pixel buffer is out on loan: `Texture::take_vec_*` leaves `data` as
-                // `None` until the matching `put_back_*`, which is the glyph atlas's normal
-                // state for a whole frame whenever `Fonts::prepare_textures` takes an early
-                // return. `take_updated` above already consumed the dirty flag, so re-arm it —
+                // `None` until the matching `put_back_*`.
+                // `take_updated` above already consumed the dirty flag, so re-arm it —
                 // dropping it here would mean this texture is never uploaded again and all
                 // text disappears permanently. The Metal backend guards the same case.
                 self.set_updated(updated);
@@ -3191,14 +3202,11 @@ impl CxTexture {
             // (a multi-second TDR). For it, only reuse pure appends (new rows never sampled yet);
             // rebuilds/resets recreate a fresh texture. Bitmap atlases (the color-glyph/emoji atlas,
             // images — sampled by normalized UV) are safe to update in place anywhere.
-            let is_sdf = matches!(dxgi_format, DXGI_FORMAT_R32G32B32A32_FLOAT);
-            let safe_to_reuse = matches!(updated, TextureUpdated::Partial(_))
-                && (!is_sdf || by + 1 >= self.os.vec_uploaded_height);
             let can_reuse = self.os.texture.is_some()
                 && self.os.vec_alloc_width == width
                 && self.os.vec_alloc_dxgi == dxgi_format.0
                 && self.os.vec_alloc_height >= height
-                && safe_to_reuse;
+                && matches!(updated, TextureUpdated::Partial(_));
 
             if can_reuse {
                 if bw != 0 && bh != 0 {
@@ -3224,21 +3232,14 @@ impl CxTexture {
                             0,
                         );
                     }
-                    self.os.vec_uploaded_height = (by + bh).max(self.os.vec_uploaded_height);
                 }
                 return;
             }
 
-            // (Re)allocate. For the append-only glyph atlases (RGBAf32), add ~1.5x height headroom
-            // (rounded up) so subsequent growth reuses the texture instead of recreating it. Other
-            // formats (images/data) are sampled by normalized UV, so they MUST be exact-sized.
-            let cap_height = if matches!(dxgi_format, DXGI_FORMAT_R32G32B32A32_FLOAT) {
-                // Generous headroom for the append-only glyph atlas: 3x the needed height with a
-                // sizable minimum, rounded up. This makes the texture large enough to hold a
-                // typical room's full glyph set after the first allocation, so growth-driven
-                // recreations (each a full texture realloc) become rare during long flick-scrolls.
-                let want = (height * 3).max(512);
-                ((want + 127) / 128) * 128
+            // (Re)allocate. Append-only textures get spare rows so growth reuses the texture instead
+            // of recreating it. Other formats are sampled by normalized UV, so they MUST be exact-sized.
+            let cap_height = if self.is_append_only {
+                Self::get_append_only_capacity(height)
             } else {
                 height
             };
@@ -3317,8 +3318,6 @@ impl CxTexture {
             self.os.vec_alloc_width = width;
             self.os.vec_alloc_height = cap_height;
             self.os.vec_alloc_dxgi = dxgi_format.0;
-            // The full logical data (rows 0..height) was just uploaded into the fresh texture.
-            self.os.vec_uploaded_height = height;
         }
     }
 

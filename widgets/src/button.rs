@@ -173,11 +173,13 @@ script_mod! {
                     self.border_radius
                 )
 
-                let mut color_fill = self.color
-                let mut color_fill_hover = self.color_hover
-                let mut color_fill_down = self.color_down
-                let mut color_fill_focus = self.color_focus
-                let mut color_fill_disabled = self.color_disabled
+                // We premultiply every color before mixing, so a fade to or from a transparent color
+                // doesn't pass through a darker, half-transparent version of the other one.
+                let mut color_fill = Pal.premul(self.color)
+                let mut color_fill_hover = Pal.premul(self.color_hover)
+                let mut color_fill_down = Pal.premul(self.color_down)
+                let mut color_fill_focus = Pal.premul(self.color_focus)
+                let mut color_fill_disabled = Pal.premul(self.color_disabled)
 
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * /** dither grain 0..0.5 step 0.01 */ 0.04 * self.color_dither
@@ -186,18 +188,18 @@ script_mod! {
                         self.pos.y * scale_factor_fill.y - border_sz_uv.y * 2. + dither
                     )
                     let dir = if self.gradient_fill_horizontal > 0.5 gradient_fill.x else gradient_fill.y
-                    color_fill = mix(self.color, self.color_2, dir)
-                    color_fill_hover = mix(self.color_hover, self.color_2_hover, dir)
-                    color_fill_down = mix(self.color_down, self.color_2_down, dir)
-                    color_fill_focus = mix(self.color_focus, self.color_2_focus, dir)
-                    color_fill_disabled = mix(self.color_disabled, self.color_2_disabled, dir)
+                    color_fill = mix(Pal.premul(self.color), Pal.premul(self.color_2), dir)
+                    color_fill_hover = mix(Pal.premul(self.color_hover), Pal.premul(self.color_2_hover), dir)
+                    color_fill_down = mix(Pal.premul(self.color_down), Pal.premul(self.color_2_down), dir)
+                    color_fill_focus = mix(Pal.premul(self.color_focus), Pal.premul(self.color_2_focus), dir)
+                    color_fill_disabled = mix(Pal.premul(self.color_disabled), Pal.premul(self.color_2_disabled), dir)
                 }
 
-                let mut color_stroke = self.border_color
-                let mut color_stroke_hover = self.border_color_hover
-                let mut color_stroke_down = self.border_color_down
-                let mut color_stroke_focus = self.border_color_focus
-                let mut color_stroke_disabled = self.border_color_disabled
+                let mut color_stroke = Pal.premul(self.border_color)
+                let mut color_stroke_hover = Pal.premul(self.border_color_hover)
+                let mut color_stroke_down = Pal.premul(self.border_color_down)
+                let mut color_stroke_focus = Pal.premul(self.border_color_focus)
+                let mut color_stroke_disabled = Pal.premul(self.border_color_disabled)
 
                 if self.border_color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * /** dither grain 0..0.5 step 0.01 */ 0.04 * self.color_dither
@@ -206,11 +208,11 @@ script_mod! {
                         self.pos.y + dither
                     )
                     let dir = if self.gradient_border_horizontal > 0.5 gradient_border.x else gradient_border.y
-                    color_stroke = mix(self.border_color, self.border_color_2, dir)
-                    color_stroke_hover = mix(self.border_color_hover, self.border_color_2_hover, dir)
-                    color_stroke_down = mix(self.border_color_down, self.border_color_2_down, dir)
-                    color_stroke_focus = mix(self.border_color_focus, self.border_color_2_focus, dir)
-                    color_stroke_disabled = mix(self.border_color_disabled, self.border_color_2_disabled, dir)
+                    color_stroke = mix(Pal.premul(self.border_color), Pal.premul(self.border_color_2), dir)
+                    color_stroke_hover = mix(Pal.premul(self.border_color_hover), Pal.premul(self.border_color_2_hover), dir)
+                    color_stroke_down = mix(Pal.premul(self.border_color_down), Pal.premul(self.border_color_2_down), dir)
+                    color_stroke_focus = mix(Pal.premul(self.border_color_focus), Pal.premul(self.border_color_2_focus), dir)
+                    color_stroke_disabled = mix(Pal.premul(self.border_color_disabled), Pal.premul(self.border_color_2_disabled), dir)
                 }
 
                 let fill = color_fill
@@ -225,8 +227,8 @@ script_mod! {
                     .mix(color_stroke_down, self.down)
                     .mix(color_stroke_disabled, self.disabled)
 
-                sdf.fill_keep(fill)
-                sdf.stroke(stroke, self.border_size)
+                sdf.fill_keep_premul(fill)
+                sdf.stroke_premul(stroke, self.border_size)
                 return sdf.result
             }
         }
@@ -493,6 +495,11 @@ pub struct Button {
     #[live(true)]
     grab_key_focus: bool,
 
+    /// Whether a tap on this button hides the soft keyboard (the focused text input loses its focus),
+    /// even while it's disabled. Turn it off for, e.g., a chat's send button.
+    #[live(true)]
+    hide_keyboard_on_tap: bool,
+
     #[live(true)]
     enabled: bool,
 
@@ -613,10 +620,18 @@ impl Widget for Button {
             self.animator_cut(cx, ids!(hover.off));
         }
 
+        let hit = event.hits(cx, self.draw_bg.area());
+        if let Hit::FingerDown(fe) = &hit {
+            // We also get every other finger that lands while we hold one, so only one that lands on us is a tap on us.
+            if !self.hide_keyboard_on_tap && fe.device.is_touch() && fe.rect.contains(fe.abs) {
+                cx.fingers.mark_press_as_keeping_key_focus(fe.digit_id);
+            }
+        }
+
         // The button only handles hits when it's visible and enabled.
         // If it's not enabled, we still show the button, but we set
         // the NotAllowed mouse cursor upon hover instead of the Hand cursor.
-        match event.hits(cx, self.draw_bg.area()) {
+        match hit {
             Hit::KeyFocus(_) => {
                 self.animator_play(cx, ids!(focus.on));
             }
@@ -662,7 +677,8 @@ impl Widget for Button {
                 self.animator_play(cx, ids!(hover.off));
             }
             Hit::FingerDown(fe) if self.enabled && fe.is_primary_hit() => {
-                if self.grab_key_focus {
+                // A touch waits until it clicks us, so a drag that scrolls from here keeps the keyboard up.
+                if self.grab_key_focus && !fe.device.is_touch() {
                     cx.set_key_focus(self.draw_bg.area());
                 }
                 cx.widget_action_with_data(
@@ -704,6 +720,9 @@ impl Widget for Button {
                         true
                     };
                 if was_clicked {
+                    if self.grab_key_focus && self.hide_keyboard_on_tap && fe.device.is_touch() {
+                        cx.set_key_focus(self.draw_bg.area());
+                    }
                     cx.widget_action_with_data(
                         &self.action_data,
                         uid,

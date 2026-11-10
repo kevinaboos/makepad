@@ -800,6 +800,10 @@ pub struct TextFlow {
     /// Where the last run ended and how it was laid out, while `max_lines` is set.
     #[rust]
     last_run_end: Option<(DVec2, Rc<LaidoutText>)>,
+    /// The empty space after our content on its last line, which is absolute while we draw
+    /// and relative to our area once we've ended.
+    #[rust]
+    last_line_free_space: Option<Rect>,
 
     #[rust]
     pub areas_tracker: RectAreasTracker,
@@ -1080,6 +1084,9 @@ impl TextFlow {
     /// Counts a drawn inline widget as content on its line. If it drew nothing, the block
     /// start (and pending margin) that `begin_inline_content` used up are put back.
     pub(crate) fn end_inline_widget(&mut self, cx: &Cx2d, block_start_state: (bool, f64)) {
+        if cx.turtle().pos() != self.inline_content_start_pos {
+            self.track_last_line_end(cx);
+        }
         if !self.collapse_block_margins {
             return;
         }
@@ -1556,6 +1563,7 @@ impl TextFlow {
         self.skipped_block_depth = 0;
         self.last_row_y = f64::NAN;
         self.last_run_end = None;
+        self.last_line_free_space = None;
         self.is_holding_inline_content = false;
         self.is_wrap_off_for_inline_content = false;
         self.overrun_start_x = None;
@@ -1742,6 +1750,26 @@ impl TextFlow {
         ((line_asc + line_desc) * line_size * LPXS_PER_PT, line_asc * line_size * LPXS_PER_PT)
     }
 
+    /// Makes the current line at least as tall as a line of text, even with no text on it.
+    fn make_line_as_tall_as_text(&mut self, cx: &mut Cx2d) {
+        let (height_in_lpxs, baseline_in_lpxs) = self.get_line_height_and_baseline_in_lpxs(cx);
+        let font_scale = self.draw_text.font_scale as f64;
+        let height = height_in_lpxs as f64 * font_scale;
+        let align_list_start = cx.align_list_len();
+        let pos = cx.turtle().pos();
+        let turtle = cx.turtle_mut();
+        turtle.allocate_height(height);
+        turtle.set_wrap_spacing((baseline_in_lpxs * (self.text_style_normal.line_spacing - 1.0)) as f64);
+        cx.emit_turtle_walk_with_role(
+            Rect { pos, size: dvec2(0.0, height) },
+            align_list_start,
+            Metrics::default(),
+            Some(height),
+            Some(baseline_in_lpxs as f64 * font_scale),
+            RowAlignRole::Shiftable,
+        );
+    }
+
     /// Lays out a probe in the current line's own style (the normal style at the
     /// line's size), so an inline widget can read the metrics it has to line up with.
     pub fn line_probe(&mut self, cx: &mut Cx2d) -> Rc<LaidoutText> {
@@ -1834,6 +1862,10 @@ impl TextFlow {
 
         cx.end_turtle_with_area(&mut self.area);
         self.items.as_mut().unwrap().retain_visible();
+        let origin = self.area.rect(cx).pos;
+        if let Some(free_space) = &mut self.last_line_free_space {
+            free_space.pos -= origin;
+        }
 
         // Update streaming animation state after drawing (also while fading out)
         let is_idle = self.is_animation_idle();
@@ -1842,6 +1874,23 @@ impl TextFlow {
             self.draw_text.set_total_chars(cx, self.animated_chars);
             self.next_frame = cx.new_next_frame();
         }
+    }
+
+    /// Returns the empty space after our content on its last line (relative to our area), where a widget drawn
+    /// after us can sit, or `None` if the content ends in a box like a quote or a code block.
+    pub fn last_line_free_space(&self) -> Option<Rect> {
+        self.last_line_free_space
+    }
+
+    /// Notes that our content so far ends where the turtle is.
+    fn track_last_line_end(&mut self, cx: &Cx2d) {
+        let turtle = cx.turtle();
+        let pos = turtle.pos();
+        let inner = turtle.inner_rect();
+        self.last_line_free_space = Some(Rect {
+            pos,
+            size: dvec2(inner.pos.x + inner.size.x - pos.x, turtle.row_height()),
+        });
     }
 
     /// Start streaming text animation with fade-in effect on new characters.
@@ -2061,6 +2110,7 @@ impl TextFlow {
         self.draw_block.draw_vars.area = area;
         self.draw_block.end(cx);
         self.end_block_box(cx, self.code_walk);
+        self.last_line_free_space = None;
         if self.selectable {
             self.selection_tracker.push_newline();
         }
@@ -2234,7 +2284,20 @@ impl TextFlow {
         if self.content_truncated {
             return;
         }
+        // Like in a browser, a line break on an empty line leaves a blank line as tall as text.
+        let is_blank_line = self.first_thing_on_a_line && Self::is_at_row_start(cx);
+        // A blank line past the `max_lines` budget cuts what follows, just like a run would.
+        if is_blank_line && self.max_lines > 0 && self.lines_drawn >= self.max_lines && self.is_on_new_row(cx) {
+            self.content_truncated = true;
+            return;
+        }
         self.flush_block_margin(cx);
+        if is_blank_line {
+            self.make_line_as_tall_as_text(cx);
+            if self.max_lines > 0 {
+                self.charge_inline_content(cx, false);
+            }
+        }
         let spacing = cx.turtle().wrap_spacing();
         cx.turtle_new_line_with_spacing(spacing);
         self.mark_as_line_start();
@@ -2264,6 +2327,7 @@ impl TextFlow {
         let walk = self.begin_block_box(cx, self.sep_walk);
         self.draw_block.draw_walk(cx, walk);
         self.end_block_box(cx, self.sep_walk);
+        self.last_line_free_space = None;
     }
 
     pub fn begin_quote(&mut self, cx: &mut Cx2d) {
@@ -2290,6 +2354,7 @@ impl TextFlow {
         self.draw_block.draw_vars.area = area;
         self.draw_block.end(cx);
         self.end_block_box(cx, self.quote_walk);
+        self.last_line_free_space = None;
         if self.selectable {
             self.selection_tracker.push_newline();
         }
@@ -2319,6 +2384,7 @@ impl TextFlow {
         self.table_num_columns = 0;
         self.in_table_header = false;
         self.end_block_box(cx, self.table_walk);
+        self.last_line_free_space = None;
         if self.selectable {
             self.selection_tracker.push_newline();
         }
@@ -2681,22 +2747,7 @@ impl TextFlow {
             if text.is_empty() {
                 // An empty run past the line's start still makes a line of widgets as tall as text.
                 if !is_at_line_start {
-                    let (height_in_lpxs, baseline_in_lpxs) = self.get_line_height_and_baseline_in_lpxs(cx);
-                    let font_scale = self.draw_text.font_scale as f64;
-                    let height = height_in_lpxs as f64 * font_scale;
-                    let align_list_start = cx.align_list_len();
-                    let pos = cx.turtle().pos();
-                    let turtle = cx.turtle_mut();
-                    turtle.allocate_height(height);
-                    turtle.set_wrap_spacing((baseline_in_lpxs * (self.text_style_normal.line_spacing - 1.0)) as f64);
-                    cx.emit_turtle_walk_with_role(
-                        Rect { pos, size: dvec2(0.0, height) },
-                        align_list_start,
-                        Metrics::default(),
-                        Some(height),
-                        Some(baseline_in_lpxs as f64 * font_scale),
-                        RowAlignRole::Shiftable,
-                    );
+                    self.make_line_as_tall_as_text(cx);
                 }
                 return;
             }
@@ -3090,6 +3141,7 @@ impl TextFlow {
             // whether it is joining this same visual line or one that inline
             // content opened in between.
             self.last_row_y = cx.turtle().pos().y;
+            self.track_last_line_end(cx);
         }
         self.first_thing_on_a_line = false;
     }
@@ -3283,7 +3335,8 @@ impl Widget for TextFlowLink {
             let area = self.drawn_areas[i];
             match event.hits(cx, area) {
                 Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                    if self.grab_key_focus {
+                    // A touch waits until it's a tap, so a drag that scrolls from here keeps the keyboard up.
+                    if self.grab_key_focus && !fe.device.is_touch() {
                         cx.set_key_focus(self.area());
                     }
                     self.animator_play(cx, ids!(hover.down));
@@ -3305,6 +3358,9 @@ impl Widget for TextFlowLink {
                     self.animator_play(cx, ids!(hover.off));
                 }
                 Hit::FingerUp(fe) if fe.is_primary_hit() => {
+                    if self.grab_key_focus && fe.device.is_touch() && fe.is_over && fe.was_tap() {
+                        cx.set_key_focus(self.area());
+                    }
                     if fe.is_over {
                         if !self.click_on_down {
                             cx.widget_action_with_data(

@@ -637,7 +637,7 @@ impl Image {
         else {
             return;
         };
-        if num_frames < 2 || !is_area_on_screen(cx, self.draw_bg.area()) {
+        if num_frames < 2 || !self.draw_bg.area().is_on_screen(cx) {
             return;
         }
         let frame = (self.animation_frame as usize + 1) % num_frames;
@@ -869,6 +869,13 @@ impl Image {
         } else {
             rect.size.y.min(height_cap)
         };
+        // A Fit width peeks as NaN too, so it's bounded by its max the same way.
+        let width_cap = cx.walk_max_width(walk).unwrap_or(f64::INFINITY);
+        let avail_width = if rect.size.x.is_nan() {
+            width_cap
+        } else {
+            rect.size.x.min(width_cap)
+        };
         self.draw_bg.fit_scale = vec2(1.0, 1.0);
         self.draw_bg.fit_pan = vec2(0.0, 0.0);
         match self.fit {
@@ -893,11 +900,14 @@ impl Image {
                 walk.height = Size::Fixed(avail_height);
             }
             ImageFit::Smallest => {
-                let walk_height = rect.size.x / aspect;
+                let walk_height = avail_width / aspect;
                 if walk_height > avail_height {
                     walk.width = Size::Fixed(avail_height * aspect);
                     walk.height = Size::Fixed(avail_height);
                 } else {
+                    if rect.size.x.is_nan() {
+                        walk.width = Size::Fixed(avail_width);
+                    }
                     walk.height = Size::Fixed(walk_height);
                 }
             }
@@ -1199,15 +1209,6 @@ fn get_frame_delay(animation: &TextureAnimation, frame: usize) -> f64 {
         .copied()
         .filter(|&delay| delay > 0.0101)
         .unwrap_or(DEFAULT_FRAME_DELAY_SECS)
-}
-
-/// Returns whether the given area is on screen right now, unlike one in a hidden
-/// dock tab or one whose draw list has since been redrawn without it.
-fn is_area_on_screen(cx: &Cx, area: Area) -> bool {
-    area.is_valid(cx) && area.draw_list_id()
-        .and_then(|draw_list_id| cx.draw_lists[draw_list_id].draw_pass_id)
-        .is_some_and(|pass_id| !cx.pass_attachment_is_stale(pass_id)
-            && area.is_attached(cx, &cx.attached_draw_lists(pass_id)))
 }
 
 pub enum AsyncLoad {

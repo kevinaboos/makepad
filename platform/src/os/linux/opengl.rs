@@ -391,6 +391,9 @@ impl Cx {
         step: f32,
     ) {
         if !self.draw_lists.1.allocations.has_device_limit() {
+            let mut max_texture_size = 0;
+            unsafe { (self.os.gl().glGetIntegerv)(gl_sys::MAX_TEXTURE_SIZE, &mut max_texture_size) };
+            self.gpu_info.max_texture_size = max_texture_size as usize;
             let reported = self.retained_adapter_bytes();
             let allowance = if reported != 0 {
                 reported as usize
@@ -555,8 +558,6 @@ impl Cx {
                     self.render_view_inner(draw_pass_id, sub_list_id, child_zbias, zbias_step);
                 }
             } else {
-                let gl = self.os.gl();
-
                 let (draw_list, upload_budget) =
                     self.draw_lists.list_and_upload_budget(draw_list_id);
                 let draw_item = &mut draw_list.draw_items[draw_item_id];
@@ -578,6 +579,22 @@ impl Cx {
 
                 let shader_variant = self.passes[draw_pass_id].os.shader_variant;
 
+                // After the first frame, a program that isn't built yet loads from the cache,
+                // or we skip its draw until the background worker delivers it.
+                #[cfg(all(target_os = "android", not(use_vulkan)))]
+                if shader_variant == SHADER_VARIANT_WINDOW
+                    && matches!(shp.gl_shader[shader_variant], None | Some(GlShaderState::Queued))
+                    && !self.os.load_shader_worker_program(
+                        shp,
+                        sh.os_shader_id.unwrap(),
+                        &sh.mapping,
+                        &self.os_type,
+                        draw_pass_id,
+                    )
+                {
+                    continue;
+                }
+
                 shp.ensure_gl_shader_started(
                     self.os.gl(),
                     shader_variant,
@@ -585,15 +602,26 @@ impl Cx {
                     &self.os_type,
                 );
                 shp.poll_gl_shader_ready(self.os.gl(), shader_variant, &sh.mapping, &self.os_type);
-                let Some(shgl) = shp.gl_shader[shader_variant]
-                    .as_ref()
-                    .and_then(GlShaderState::as_ready)
-                else {
-                    crate::trace!("gl.repaint", "shader not ready");
-                    self.demo_time_repaint = true;
-                    self.passes[draw_pass_id].repaint_next = true;
-                    continue;
+                let shgl = match &shp.gl_shader[shader_variant] {
+                    Some(GlShaderState::Ready(shgl)) => shgl,
+                    Some(GlShaderState::Queued | GlShaderState::Failed) => continue,
+                    Some(GlShaderState::Pending(_)) | None => {
+                        crate::trace!("gl.repaint", "shader not ready");
+                        self.demo_time_repaint = true;
+                        self.passes[draw_pass_id].repaint_next = true;
+                        continue;
+                    }
                 };
+                // A draw call that misses every rect we're repainting only takes its step of the depth counter.
+                let repaint_mask = self.draw_damage.get_repaint_mask(draw_pass_id, draw_list_id, draw_item_id);
+                if repaint_mask == Some(0) {
+                    if draw_call.resolve_zbias(*zbias, sploded, uniforms_gen) {
+                        draw_call.uniforms_dirty = true;
+                    }
+                    *zbias += zbias_step;
+                    continue;
+                }
+                let gl = self.os.gl();
                 let trace_draw = crate::makepad_error_log::trace_enabled("gl.draw");
 
                 // A refused retained allocation leaves this item without
@@ -724,8 +752,8 @@ impl Cx {
                 // shader) keep an OpenGL window presenting forever at rest.
                 if sh.mapping.uses_time {
                     crate::trace!("gl.repaint", "shader uses time");
-                    self.demo_time_repaint = true;
-                    self.passes[draw_pass_id].repaint_next = true;
+                    self.demo_time_repaint |= self.passes[draw_pass_id]
+                        .request_time_repaint(draw_call.options.time_fps, &mut self.time_fps_clock);
                 }
 
                 if sh.mapping.flags.debug_draw {
@@ -1101,7 +1129,16 @@ impl Cx {
                                 (gl.glBindTexture)(bind_target, 0);
                             }
                         } else {
-                            (gl.glBindTexture)(expected_target, 0);
+                            // GL's texture 0 samples as opaque black, so an empty slot (like a still-loading
+                            // image) gets the transparent null texture instead, matching the other backends.
+                            let null_texture_id = if expected_target == gl_sys::TEXTURE_CUBE_MAP {
+                                self.null_cube_texture.texture_id()
+                            } else {
+                                self.null_texture.texture_id()
+                            };
+                            let null_texture = &mut self.textures[null_texture_id];
+                            null_texture.update_vec_texture(gl, &self.os_type);
+                            (gl.glBindTexture)(expected_target, null_texture.os.gl_texture.unwrap_or(0));
                         }
                         // Each sampler uniform's unit is set once at link, and since we never create
                         // sampler objects (see `opengl_create_samplers`), every unit stays on sampler 0.
@@ -1118,13 +1155,18 @@ impl Cx {
                         );
                     }
 
-                    (gl.glDrawElementsInstanced)(
-                        gl_sys::TRIANGLES,
-                        indices as i32,
-                        index_gl_type,
-                        ptr::null(),
-                        instances as i32,
-                    );
+                    for scissor in self.draw_damage.get_scissors(repaint_mask) {
+                        if let Some([x, y, width, height]) = scissor {
+                            (gl.glScissor)(x, y, width, height);
+                        }
+                        (gl.glDrawElementsInstanced)(
+                            gl_sys::TRIANGLES,
+                            indices as i32,
+                            index_gl_type,
+                            ptr::null(),
+                            instances as i32,
+                        );
+                    }
                     draw_item.consumed_instance_id = draw_item.retained_instance_id;
                     draw_item.consumed_schema = draw_item.resident_schema;
                     draw_item.consumed_serial = self
@@ -1154,6 +1196,10 @@ impl Cx {
                     }
                 }
             }
+        }
+        // A handler can change what this pass draws after we worked out its damage.
+        if !to_dispatch.is_empty() {
+            self.draw_damage.invalidate_pass(draw_pass_id);
         }
         for event in to_dispatch.iter() {
             // Video-handle callbacks can call release/poll reentrantly. Give
@@ -1428,9 +1474,11 @@ impl Cx {
 
     pub fn opengl_compile_shaders(&mut self) {
         let compile_set = std::mem::take(&mut self.draw_shaders.compile_set);
+        // Without parallel compiles every program blocks this thread, so we leave each one
+        // to its first draw, or to Android's background worker once that's running.
+        let compile_ahead = GlShader::supports_parallel_compile(self.os.gl());
 
         for shader_index in compile_set {
-            let mapping = self.draw_shaders.shaders[shader_index].mapping.clone();
             let os_shader_id = {
                 let cx_shader = &mut self.draw_shaders.shaders[shader_index];
                 if cx_shader.os_shader_id.is_none() {
@@ -1455,13 +1503,23 @@ impl Cx {
                     if cx_shader.os_shader_id.is_none() {
                         let shp = CxOsDrawShader::new(self.os.gl(), &vertex, &pixel, &self.os_type);
                         cx_shader.os_shader_id = Some(self.draw_shaders.os_shaders.len());
+                        #[cfg(all(target_os = "android", not(use_vulkan)))]
+                        self.os.queue_shader_worker_build(
+                            self.draw_shaders.os_shaders.len(),
+                            &shp,
+                            &self.os_type,
+                        );
                         self.draw_shaders.os_shaders.push(shp);
                     }
                 }
                 cx_shader.os_shader_id
             };
 
+            if !compile_ahead {
+                continue;
+            }
             if let Some(os_shader_id) = os_shader_id {
+                let mapping = self.draw_shaders.shaders[shader_index].mapping.clone();
                 let os_shader = &mut self.draw_shaders.os_shaders[os_shader_id];
                 os_shader.ensure_gl_shader_started(
                     self.os.gl(),
@@ -1515,11 +1573,33 @@ impl Cx {
         }
     }
 
-    pub fn is_draw_shader_window_ready(&self, shader_id: DrawShaderId) -> bool {
-        let Some(os_shader_id) = self.draw_shaders.shaders[shader_id.index].os_shader_id else {
+    pub fn is_draw_shader_window_ready(&mut self, shader_id: DrawShaderId) -> bool {
+        // Vulkan has no GL context to compile with, so its shaders never count as ready here.
+        #[cfg(use_vulkan)]
+        if self.os.vulkan_active() {
+            return false;
+        }
+        let cx_shader = &self.draw_shaders.shaders[shader_id.index];
+        let Some(os_shader_id) = cx_shader.os_shader_id else {
             return false;
         };
-        self.draw_shaders.os_shaders[os_shader_id].is_window_gl_shader_ready()
+        // A shader may be waiting for its first draw to compile, so asking about it starts that.
+        let os_shader = &mut self.draw_shaders.os_shaders[os_shader_id];
+        os_shader.ensure_gl_shader_started(self.os.gl(), SHADER_VARIANT_WINDOW, &cx_shader.mapping, &self.os_type);
+        os_shader.poll_gl_shader_ready(self.os.gl(), SHADER_VARIANT_WINDOW, &cx_shader.mapping, &self.os_type);
+        os_shader.is_window_gl_shader_ready()
+    }
+
+    /// Whether this shader might still become ready, which it can't once the driver rejects it or while Vulkan renders.
+    pub fn can_draw_shader_window_become_ready(&self, shader_id: DrawShaderId) -> bool {
+        #[cfg(use_vulkan)]
+        if self.os.vulkan_active() {
+            return false;
+        }
+        self.draw_shaders.shaders[shader_id.index].os_shader_id.is_none_or(|os_shader_id| !matches!(
+            self.draw_shaders.os_shaders[os_shader_id].gl_shader[SHADER_VARIANT_WINDOW],
+            Some(GlShaderState::Failed)
+        ))
     }
     /*
     pub fn maybe_warn_hardware_support(&self) {
@@ -1580,20 +1660,18 @@ pub struct GlShaderUniforms {
 pub enum GlShaderState {
     Ready(GlShader),
     Pending(PendingGlShader),
+    /// Android's background worker is building it, so we skip its draws until it arrives.
+    Queued,
+    /// The driver rejected this shader, so its draws are skipped.
+    Failed,
 }
 
 impl GlShaderState {
-    fn as_ready(&self) -> Option<&GlShader> {
-        match self {
-            Self::Ready(shader) => Some(shader),
-            Self::Pending(_) => None,
-        }
-    }
-
     fn free_resources(self, gl: &LibGl) {
         match self {
             Self::Ready(shader) => shader.free_resources(gl),
             Self::Pending(shader) => shader.free_resources(gl),
+            Self::Queued | Self::Failed => {}
         }
     }
 }
@@ -1613,7 +1691,7 @@ impl PendingGlShader {
         }
     }
 
-    fn free_resources(self, gl: &LibGl) {
+    pub(crate) fn free_resources(self, gl: &LibGl) {
         unsafe {
             (gl.glDeleteShader)(self.vertex_shader);
             (gl.glDeleteShader)(self.fragment_shader);
@@ -1701,7 +1779,7 @@ impl GlShader {
             .collect()
     }
 
-    fn supports_parallel_compile(gl: &LibGl) -> bool {
+    pub(crate) fn supports_parallel_compile(gl: &LibGl) -> bool {
         *gl.parallel_compile.get_or_init(|| {
             let supported = get_gl_string(gl, gl_sys::EXTENSIONS)
                 .split_whitespace()
@@ -1720,7 +1798,7 @@ impl GlShader {
     }
 
     #[cfg(not(ohos_sim))]
-    fn program_cache_path(
+    pub(crate) fn program_cache_path(
         gl: &LibGl,
         cache_dir: &str,
         vertex: &str,
@@ -1762,65 +1840,72 @@ impl GlShader {
     }
 
     #[cfg(not(ohos_sim))]
-    fn read_program_cache(gl: &LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Option<u32> {
-        if let Some(cache_dir) = os_type.get_cache_dir() {
-            let filename = Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
-
-            if let Ok(mut cache_file) = File::open(&filename) {
-                let mut binary = Vec::new();
-                let mut format_bytes = [0u8; 4];
-                match cache_file.read(&mut format_bytes) {
-                    Ok(_bytes_read) => {
-                        let binary_format = u32::from_be_bytes(format_bytes);
-                        match cache_file.read_to_end(&mut binary) {
-                            Ok(_full_bytes) => unsafe {
-                                let program = (gl.glCreateProgram)();
-                                (gl.glProgramBinary)(
-                                    program,
-                                    binary_format,
-                                    binary.as_ptr() as *const _,
-                                    binary.len() as i32,
-                                );
-                                if let Some(error) = GlShader::opengl_has_shader_error(
-                                    gl,
-                                    false,
-                                    program as usize,
-                                    "",
-                                ) {
-                                    // A cached program binary that no longer loads is
-                                    // expected and recoverable (e.g. after a GPU driver
-                                    // update changes the binary format). The caller falls
-                                    // back to compiling from source and overwrites this
-                                    // stale entry, so warn rather than error.
-                                    crate::warning!(
-                                        "Ignoring stale shader cache entry (will recompile): SHADER::CACHE::PROGRAM_BINARY_FAILED\n{}",
-                                        error
-                                    );
-                                    (gl.glDeleteProgram)(program);
-                                    let _ = remove_file(&filename);
-                                    return None;
-                                }
-                                return Some(program);
-                            },
-                            Err(e) => {
-                                crate::warning!(
-                                    "Failed to read the full shader cache file {filename}, error: {e}"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        crate::warning!(
-                            "Failed to read format bytes from shader cache file {filename}, error: {e}"
-                        );
-                    }
-                }
+    pub(crate) fn read_program_cache(
+        gl: &LibGl,
+        vertex: &str,
+        pixel: &str,
+        os_type: &OsType,
+    ) -> Option<u32> {
+        let cache_dir = os_type.get_cache_dir()?;
+        let filename = Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
+        let mut cache_file = File::open(&filename).ok()?;
+        let mut format_bytes = [0u8; 4];
+        if let Err(e) = cache_file.read(&mut format_bytes) {
+            crate::warning!(
+                "Failed to read format bytes from shader cache file {filename}, error: {e}"
+            );
+            return None;
+        }
+        let mut binary = Vec::new();
+        if let Err(e) = cache_file.read_to_end(&mut binary) {
+            crate::warning!("Failed to read the full shader cache file {filename}, error: {e}");
+            return None;
+        }
+        match Self::load_program_binary(gl, u32::from_be_bytes(format_bytes), &binary) {
+            Ok(program) => Some(program),
+            Err(error) => {
+                // A cached program binary that no longer loads is
+                // expected and recoverable (e.g. after a GPU driver
+                // update changes the binary format). The caller falls
+                // back to compiling from source and overwrites this
+                // stale entry, so warn rather than error.
+                crate::warning!(
+                    "Ignoring stale shader cache entry (will recompile): SHADER::CACHE::PROGRAM_BINARY_FAILED\n{}",
+                    error
+                );
+                let _ = remove_file(&filename);
+                None
             }
         }
-        None
     }
 
-    fn start_pending_program_compile(
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn load_program_binary(
+        gl: &LibGl,
+        binary_format: u32,
+        binary: &[u8],
+    ) -> Result<u32, String> {
+        unsafe {
+            let program = (gl.glCreateProgram)();
+            // Without a current context we'd get 0 back, and its error check would still pass.
+            if program == 0 {
+                return Err("no GL context is current".to_string());
+            }
+            (gl.glProgramBinary)(
+                program,
+                binary_format,
+                binary.as_ptr() as *const _,
+                binary.len() as i32,
+            );
+            if let Some(error) = GlShader::opengl_has_shader_error(gl, false, program as usize, "") {
+                (gl.glDeleteProgram)(program);
+                return Err(error);
+            }
+            Ok(program)
+        }
+    }
+
+    pub(crate) fn start_pending_program_compile(
         gl: &LibGl,
         vertex: &str,
         pixel: &str,
@@ -1910,6 +1995,14 @@ impl GlShader {
             let program = (gl.glCreateProgram)();
             (gl.glAttachShader)(program, vs);
             (gl.glAttachShader)(program, fs);
+            // A driver may only hand back a binary for our cache if we ask before linking.
+            if let Some(set_program_parameter) = gl.glProgramParameteri {
+                set_program_parameter(
+                    program,
+                    gl_sys::PROGRAM_BINARY_RETRIEVABLE_HINT,
+                    gl_sys::TRUE as i32,
+                );
+            }
             (gl.glLinkProgram)(program);
 
             PendingGlShader {
@@ -1922,65 +2015,99 @@ impl GlShader {
 
     #[cfg(not(ohos_sim))]
     fn write_program_cache(gl: &LibGl, program: u32, vertex: &str, pixel: &str, os_type: &OsType) {
-        if let Some(cache_dir) = os_type.get_cache_dir() {
-            unsafe {
-                let mut binary = Vec::new();
-                let mut binary_len = 0;
-                (gl.glGetProgramiv)(program, gl_sys::PROGRAM_BINARY_LENGTH, &mut binary_len);
-                if binary_len != 0 {
-                    binary.resize(binary_len as usize, 0u8);
-                    let mut return_size = 0i32;
-                    let mut binary_format = 0u32;
-                    (gl.glGetProgramBinary)(
-                        program,
-                        binary.len() as i32,
-                        &mut return_size as *mut _,
-                        &mut binary_format as *mut _,
-                        binary.as_mut_ptr() as *mut _,
-                    );
-                    if return_size != 0 {
-                        let filename =
-                            Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
-                        binary.resize(return_size as usize, 0u8);
-                        match File::create(&filename) {
-                            Ok(mut cache) => {
-                                let res1 = cache.write_all(&binary_format.to_be_bytes());
-                                let res2 = cache.write_all(&binary);
-                                if res1.is_err() || res2.is_err() {
-                                    crate::error!(
-                                        "Failed to write shader binary to shader cache {filename}"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                crate::error!(
-                                    "Failed to write shader cache to {filename}, error: {e}"
-                                );
-                            }
-                        }
-                        // On Android, the first write in a context deletes the binaries an
-                        // older OS build, GL driver or key hasher left behind.
-                        if let Some(suffix) = gl.android_cache_suffix.get() {
-                            gl.stale_cache_sweep.call_once(|| {
-                                let Ok(entries) = std::fs::read_dir(&cache_dir) else {
-                                    return;
-                                };
-                                for entry in entries.flatten() {
-                                    let name = entry.file_name();
-                                    let name = name.to_string_lossy();
-                                    if name.starts_with("shader_")
-                                        && name.ends_with(".bin")
-                                        && !name.ends_with(suffix.as_str())
-                                    {
-                                        let _ = remove_file(entry.path());
-                                    }
-                                }
-                            });
-                        }
-                    }
+        let Some(cache_dir) = os_type.get_cache_dir() else {
+            return;
+        };
+        let Some((binary_format, binary)) = Self::get_program_binary(gl, program) else {
+            return;
+        };
+        let filename = Self::program_cache_path(gl, &cache_dir, vertex, pixel, os_type);
+        if let Err(e) = Self::write_cache_file(&filename, binary_format, &binary) {
+            crate::error!("Failed to write shader cache to {filename}, error: {e}");
+        }
+        // On Android, the first write in a context deletes the binaries an
+        // older OS build, GL driver or key hasher left behind.
+        gl.stale_cache_sweep.call_once(|| {
+            let android_suffix = gl.android_cache_suffix.get().map(String::as_str);
+            Self::remove_stale_cache_files(&cache_dir, android_suffix);
+        });
+    }
+
+    /// Also deletes the temp files a process left behind when it got killed mid-write. Desktop apps
+    /// share one cache dir, so we only take those whose process is gone.
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn remove_stale_cache_files(cache_dir: &str, android_suffix: Option<&str>) {
+        let Ok(entries) = std::fs::read_dir(cache_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_stale = match name.rsplit_once(".bin.") {
+                Some((_, temp)) => {
+                    temp.ends_with(".tmp")
+                        && temp.split_once('-').is_none_or(|(pid, _)| {
+                            !std::path::Path::new(&format!("/proc/{pid}")).exists()
+                        })
                 }
+                None => android_suffix
+                    .is_some_and(|suffix| name.ends_with(".bin") && !name.ends_with(suffix)),
+            };
+            if name.starts_with("shader_") && is_stale {
+                let _ = remove_file(entry.path());
             }
         }
+    }
+
+    /// The driver's binary for a linked program, if it hands one back.
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn get_program_binary(gl: &LibGl, program: u32) -> Option<(u32, Vec<u8>)> {
+        unsafe {
+            let mut binary_len = 0;
+            (gl.glGetProgramiv)(program, gl_sys::PROGRAM_BINARY_LENGTH, &mut binary_len);
+            if binary_len == 0 {
+                return None;
+            }
+            let mut binary = vec![0u8; binary_len as usize];
+            let mut return_size = 0i32;
+            let mut binary_format = 0u32;
+            (gl.glGetProgramBinary)(
+                program,
+                binary.len() as i32,
+                &mut return_size as *mut _,
+                &mut binary_format as *mut _,
+                binary.as_mut_ptr() as *mut _,
+            );
+            if return_size == 0 {
+                return None;
+            }
+            binary.truncate(return_size as usize);
+            Some((binary_format, binary))
+        }
+    }
+
+    /// Writes through a temp file, so a reader never sees half of a cache file.
+    #[cfg(not(ohos_sim))]
+    pub(crate) fn write_cache_file(
+        filename: &str,
+        binary_format: u32,
+        binary: &[u8],
+    ) -> std::io::Result<()> {
+        let temp_filename = format!(
+            "{filename}.{}-{:?}.tmp",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let result = File::create(&temp_filename)
+            .and_then(|mut cache| {
+                cache.write_all(&binary_format.to_be_bytes())?;
+                cache.write_all(binary)
+            })
+            .and_then(|()| std::fs::rename(&temp_filename, filename));
+        if result.is_err() {
+            let _ = remove_file(&temp_filename);
+        }
+        result
     }
 
     #[cfg(ohos_sim)]
@@ -1998,32 +2125,13 @@ impl GlShader {
         pending: PendingGlShader,
         vertex: &str,
         pixel: &str,
+        mapping: &CxDrawShaderMapping,
         os_type: &OsType,
-    ) -> u32 {
-        Self::opengl_log_shader_info(gl, true, pending.vertex_shader as usize, "vertex", vertex);
-        if let Some(error) =
-            Self::opengl_has_shader_error(gl, true, pending.vertex_shader as usize, vertex)
-        {
-            panic!("ERROR::SHADER::VERTEX::COMPILATION_FAILED\n{}", error);
-        }
-
-        Self::opengl_log_shader_info(
-            gl,
-            true,
-            pending.fragment_shader as usize,
-            "fragment",
-            pixel,
-        );
-        if let Some(error) =
-            Self::opengl_has_shader_error(gl, true, pending.fragment_shader as usize, pixel)
-        {
-            panic!("ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n{}", error);
-        }
-
-        Self::opengl_log_shader_info(gl, false, pending.program as usize, "program", "");
-        if let Some(error) = Self::opengl_has_shader_error(gl, false, pending.program as usize, "")
-        {
-            panic!("ERROR::SHADER::LINK::COMPILATION_FAILED\n{}", error);
+    ) -> GlShaderState {
+        if let Some(error) = Self::get_pending_program_error(gl, &pending, vertex, pixel) {
+            crate::error!("{}", error);
+            pending.free_resources(gl);
+            return GlShaderState::Failed;
         }
 
         unsafe {
@@ -2031,10 +2139,38 @@ impl GlShader {
             (gl.glDeleteShader)(pending.fragment_shader);
         }
         Self::write_program_cache(gl, pending.program, vertex, pixel, os_type);
-        pending.program
+        GlShaderState::Ready(Self::build_from_program(gl, pending.program, mapping))
     }
 
-    fn build_from_program(gl: &LibGl, program: u32, mapping: &CxDrawShaderMapping) -> Self {
+    /// The driver's compile or link error for a program, after logging its info logs.
+    pub(crate) fn get_pending_program_error(
+        gl: &LibGl,
+        pending: &PendingGlShader,
+        vertex: &str,
+        pixel: &str,
+    ) -> Option<String> {
+        Self::opengl_log_shader_info(gl, true, pending.vertex_shader as usize, "vertex", vertex);
+        Self::opengl_has_shader_error(gl, true, pending.vertex_shader as usize, vertex)
+            .map(|error| format!("ERROR::SHADER::VERTEX::COMPILATION_FAILED\n{}", error))
+            .or_else(|| {
+                Self::opengl_log_shader_info(
+                    gl,
+                    true,
+                    pending.fragment_shader as usize,
+                    "fragment",
+                    pixel,
+                );
+                Self::opengl_has_shader_error(gl, true, pending.fragment_shader as usize, pixel)
+                    .map(|error| format!("ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n{}", error))
+            })
+            .or_else(|| {
+                Self::opengl_log_shader_info(gl, false, pending.program as usize, "program", "");
+                Self::opengl_has_shader_error(gl, false, pending.program as usize, "")
+                    .map(|error| format!("ERROR::SHADER::LINK::COMPILATION_FAILED\n{}", error))
+            })
+    }
+
+    pub(crate) fn build_from_program(gl: &LibGl, program: u32, mapping: &CxDrawShaderMapping) -> Self {
         unsafe {
             (gl.glUseProgram)(program);
 
@@ -2114,9 +2250,14 @@ impl GlShader {
             ));
         }
 
+        // This compile blocks our thread, so we ask Java to explain the wait.
+        // It only shows its compile screen if our first frame hasn't been drawn yet.
+        #[cfg(target_os = "android")]
+        unsafe {
+            crate::os::linux::android::android_jni::to_java_show_shader_compile_screen();
+        }
         let pending = Self::start_pending_program_compile(gl, vertex, pixel, os_type);
-        let program = Self::finish_pending_program_compile(gl, pending, vertex, pixel, os_type);
-        GlShaderState::Ready(Self::build_from_program(gl, program, mapping))
+        Self::finish_pending_program_compile(gl, pending, vertex, pixel, mapping, os_type)
     }
 
     pub fn set_uniform_array(gl: &LibGl, loc: &OpenglUniform, array: &[f32]) {
@@ -2458,23 +2599,21 @@ impl CxOsDrawShader {
             return;
         }
 
-        let program = GlShader::finish_pending_program_compile(
+        self.gl_shader[shader_variant] = Some(GlShader::finish_pending_program_compile(
             gl,
             pending,
             &self.vertex[shader_variant],
             &self.pixel[shader_variant],
+            mapping,
             os_type,
-        );
-        self.gl_shader[shader_variant] = Some(GlShaderState::Ready(GlShader::build_from_program(
-            gl, program, mapping,
-        )));
+        ));
     }
 
     pub fn is_window_gl_shader_ready(&self) -> bool {
-        self.gl_shader[SHADER_VARIANT_WINDOW]
-            .as_ref()
-            .and_then(GlShaderState::as_ready)
-            .is_some()
+        matches!(
+            self.gl_shader[SHADER_VARIANT_WINDOW],
+            Some(GlShaderState::Ready(_))
+        )
     }
 
     #[cfg(use_vulkan)]
@@ -2691,7 +2830,7 @@ impl CxOsDrawShader {
     }
 }
 
-fn get_gl_string(gl: &LibGl, key: gl_sys::GLenum) -> String {
+pub(crate) fn get_gl_string(gl: &LibGl, key: gl_sys::GLenum) -> String {
     unsafe {
         let string_ptr = (gl.glGetString)(key) as *const c_char;
         if string_ptr == ptr::null() {
@@ -2852,18 +2991,10 @@ pub struct CxOsTexture {
     /// True when Makepad owns the GL texture object and must delete it.
     pub gl_texture_owned: bool,
     pub gl_renderbuffer: Option<u32>,
-    /// Allocated GL storage `(width, height, internal_format)` of `gl_texture` for the append-only
-    /// SLUG glyph atlas (`VecRGBAf32`). The atlas is allocated with spare height capacity so that a
-    /// later height-growth append reuses the same texture via `glTexSubImage2D` instead of
-    /// recreating the (up to ~16 MB) texture with `glTexImage2D` on every change — the same win the
-    /// D3D11 backend gets from `UpdateSubresource`. `gl_cap_width == 0` means "not allocated".
-    gl_cap_width: usize,
-    gl_cap_height: usize,
-    gl_cap_internal_format: i32,
-    /// Number of rows already uploaded into `gl_texture`. In-place sub-rect reuse is only allowed
-    /// for pure appends (rows at/after this frontier), never overwriting rows an in-flight frame may
-    /// still be sampling — overwriting the SDF atlas mid-frame can tear the per-glyph curve data.
-    gl_uploaded_height: usize,
+    /// The GL copies of an append-only texture like the Slug glyph atlas (see
+    /// `APPEND_ATLAS_COPIES`), and `gl_texture` is the one at `gl_atlas_index`.
+    gl_atlas_copies: Vec<GlAtlasCopy>,
+    gl_atlas_index: usize,
     /// Latest SurfaceTexture `getTransformMatrix` for this OES texture (Android only).
     /// Written after each successful `updateTexImage` drain; Video applies it via
     /// `oes_st_c0..c3` before `sample_video`. Identity when not OES / not drained.
@@ -2879,14 +3010,26 @@ impl Default for CxOsTexture {
             rendered_top_left: false,
             gl_texture_owned: true,
             gl_renderbuffer: None,
-            gl_cap_width: 0,
-            gl_cap_height: 0,
-            gl_cap_internal_format: 0,
-            gl_uploaded_height: 0,
+            gl_atlas_copies: Vec::new(),
+            gl_atlas_index: 0,
             #[cfg(target_os = "android")]
             oes_st_matrix: OES_ST_IDENTITY,
         }
     }
+}
+
+/// Android keeps three copies of an append-only texture and writes a different one each time,
+/// so we never write a copy that a frame still in flight is drawing with, since the driver
+/// would then copy the whole texture first.
+const APPEND_ATLAS_COPIES: usize = if cfg!(target_os = "android") { 3 } else { 1 };
+
+#[derive(Clone)]
+struct GlAtlasCopy {
+    gl_texture: u32,
+    cap_width: usize,
+    cap_height: usize,
+    /// What this copy is still missing, since each upload only writes one copy.
+    pending: TextureUpdated,
 }
 
 impl CxTexture {
@@ -3027,6 +3170,41 @@ impl CxTexture {
             return;
         }
 
+        // Partial texture uploads are critical for append-only SLUG float atlases on
+        // Linux desktop. OHOS simulators/emulators still need the conservative full
+        // upload path.
+        const DO_PARTIAL_TEXTURE_UPDATES: bool = cfg!(not(ohos_sim));
+        // An append-only texture like the Slug glyph atlas keeps spare rows, so an append only
+        // uploads the new rows. OHOS still re-uploads the whole texture every time.
+        const ATLAS_INPLACE_UPDATES: bool = cfg!(not(target_env = "ohos"));
+        let is_append_atlas = self.is_append_only;
+        let allow_partial_texture_updates =
+            DO_PARTIAL_TEXTURE_UPDATES && (!is_append_atlas || ATLAS_INPLACE_UPDATES);
+        if is_append_atlas && allow_partial_texture_updates {
+            if self.os.gl_atlas_copies.len() < APPEND_ATLAS_COPIES {
+                let gl_texture = if self.os.gl_atlas_copies.is_empty() {
+                    self.os.gl_texture.unwrap()
+                } else {
+                    let mut gl_texture = std::mem::MaybeUninit::uninit();
+                    unsafe {
+                        (gl.glGenTextures)(1, gl_texture.as_mut_ptr());
+                        gl_texture.assume_init()
+                    }
+                };
+                self.os.gl_atlas_copies.push(GlAtlasCopy {
+                    gl_texture,
+                    cap_width: 0,
+                    cap_height: 0,
+                    pending: TextureUpdated::Full,
+                });
+                self.os.gl_atlas_index = self.os.gl_atlas_copies.len() - 1;
+            } else {
+                self.os.gl_atlas_index =
+                    (self.os.gl_atlas_index + 1) % self.os.gl_atlas_copies.len();
+            }
+            self.os.gl_texture = Some(self.os.gl_atlas_copies[self.os.gl_atlas_index].gl_texture);
+        }
+
         unsafe {
             (gl.glBindTexture)(gl_sys::TEXTURE_2D, self.os.gl_texture.unwrap());
             let wrap = match self.format.wrap() {
@@ -3162,109 +3340,72 @@ impl CxTexture {
                 _ => panic!("Unsupported texture format"),
             };
 
-            // Partial texture uploads are critical for append-only SLUG float atlases on
-            // Linux desktop. OHOS simulators/emulators still need the conservative full
-            // upload path.
-            const DO_PARTIAL_TEXTURE_UPDATES: bool = cfg!(not(ohos_sim));
-            // The append-only SLUG glyph atlas (`VecRGBAf32`). Unlike the bitmap atlases and images
-            // (sampled by normalized UV, so they must be exact-sized), this one is addressed by
-            // absolute texel index and only ever grows by appending rows, so on desktop Linux GL we
-            // keep spare height capacity and reuse the texture across growth — mirroring the D3D11
-            // `UpdateSubresource` path. `gl.glTexSubImage2D` updates the existing texture in place
-            // instead of recreating and re-uploading the whole (up to ~16 MB) atlas on every change,
-            // which was a per-change scroll hitch.
-            //
-            // This is gated to desktop Linux (X11/Wayland/direct): on Android/OHOS GLES the
-            // float-atlas `glTexSubImage2D` path is unreliable (see the note above about emoji
-            // rendering as black boxes), so those keep the conservative full `glTexImage2D` upload by
-            // excluding the atlas from partial updates entirely.
-            const ATLAS_INPLACE_UPDATES: bool =
-                cfg!(not(any(target_env = "ohos", target_os = "android")));
-            let is_append_atlas = matches!(self.format, TextureFormat::VecRGBAf32 { .. });
-            let allow_partial_texture_updates =
-                DO_PARTIAL_TEXTURE_UPDATES && (!is_append_atlas || ATLAS_INPLACE_UPDATES);
             let unpack_alignment = gl_unpack_alignment(bytes_per_pixel);
 
             match updated {
-                TextureUpdated::Partial(rect)
+                TextureUpdated::Partial(_) | TextureUpdated::Full
                     if allow_partial_texture_updates && is_append_atlas =>
                 {
-                    // ~3x height headroom with a floor, rounded up to a 128-row boundary, so a long
-                    // flick-scroll's worth of glyph-atlas growth reuses this storage instead of
-                    // recreating it (mirrors D3D11's `cap_height`). Rows `height..cap_height` stay
-                    // undefined — the glyph shader addresses by absolute texel index and never
-                    // samples them.
-                    let cap_height = {
-                        let want = (height * 3).max(512);
-                        ((want + 127) / 128) * 128
+                    let dirty_rect = match updated {
+                        TextureUpdated::Partial(rect) => Some(rect),
+                        _ => None,
                     };
-                    // Only a pure append (the dirty rect's top row is at/after the upload frontier)
-                    // is safe to write in place: overwriting rows an in-flight frame may still be
-                    // sampling can tear the per-glyph curve data and hang the GPU. `slug_atlas` only
-                    // ever reports growth as appended rows, so this holds; the check is defensive.
-                    let safe_append = rect.origin.y + 1 >= self.os.gl_uploaded_height;
-                    // (Re)allocate GL storage only when the texture is new, the width/format changed,
-                    // or the needed height exceeds capacity — NOT merely because the logical alloc
-                    // size grew (that fires on every height append).
-                    let need_storage = self.os.gl_cap_width != width
-                        || self.os.gl_cap_internal_format != internal_format as i32
-                        || self.os.gl_cap_height < height;
-                    if need_storage || !safe_append {
-                        // Allocate (orphaning any old storage) at `cap_height` and upload the full
-                        // logical region `0..height`; the dirty rect alone is insufficient after a
-                        // realloc since the rest of the texture is undefined. The full atlas data is
-                        // retained in `data`, so this is a complete, correct re-upload.
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);
-                        (gl.glTexImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32,
-                            cap_height as i32,
-                            0,
-                            format,
-                            data_type,
-                            0 as *const _,
-                        );
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
-                        (gl.glTexSubImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            0,
-                            0,
-                            width as i32,
-                            height as i32,
-                            format,
-                            data_type,
-                            data,
-                        );
-                        self.os.gl_cap_width = width;
-                        self.os.gl_cap_height = cap_height;
-                        self.os.gl_cap_internal_format = internal_format as i32;
-                        self.os.gl_uploaded_height = height;
-                    } else {
-                        // In-place sub-rect append into the existing (capacity-sufficient) storage —
-                        // the common case while scrolling brings new glyphs into the atlas.
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, rect.origin.x as i32);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, rect.origin.y as i32);
-                        (gl.glTexSubImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            rect.origin.x as i32,
-                            rect.origin.y as i32,
-                            rect.size.width as i32,
-                            rect.size.height as i32,
-                            format,
-                            data_type,
-                            data,
-                        );
-                        self.os.gl_uploaded_height =
-                            (rect.origin.y + rect.size.height).max(self.os.gl_uploaded_height);
+                    for copy in &mut self.os.gl_atlas_copies {
+                        copy.pending = copy.pending.update(dirty_rect);
+                    }
+                    let copy = &mut self.os.gl_atlas_copies[self.os.gl_atlas_index];
+                    match std::mem::replace(&mut copy.pending, TextureUpdated::Empty) {
+                        TextureUpdated::Partial(rect)
+                            if copy.cap_width == width && copy.cap_height >= height =>
+                        {
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, rect.origin.x as i32);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, rect.origin.y as i32);
+                            (gl.glTexSubImage2D)(
+                                gl_sys::TEXTURE_2D,
+                                0,
+                                rect.origin.x as i32,
+                                rect.origin.y as i32,
+                                rect.size.width as i32,
+                                rect.size.height as i32,
+                                format,
+                                data_type,
+                                data,
+                            );
+                        }
+                        _ => {
+                            // New storage holds nothing yet, so the whole atlas goes up.
+                            copy.cap_width = width;
+                            copy.cap_height = Self::get_append_only_capacity(height);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);
+                            (gl.glTexImage2D)(
+                                gl_sys::TEXTURE_2D,
+                                0,
+                                internal_format as i32,
+                                width as i32,
+                                copy.cap_height as i32,
+                                0,
+                                format,
+                                data_type,
+                                0 as *const _,
+                            );
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
+                            (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
+                            (gl.glTexSubImage2D)(
+                                gl_sys::TEXTURE_2D,
+                                0,
+                                0,
+                                0,
+                                width as i32,
+                                height as i32,
+                                format,
+                                data_type,
+                                data,
+                            );
+                        }
                     }
                 }
                 TextureUpdated::Partial(rect) if allow_partial_texture_updates => {
@@ -3310,62 +3451,21 @@ impl CxTexture {
                 // A `Full` update (and any `Partial` when partial updates are disabled, e.g.
                 // ohos_sim) recreates the texture at its exact logical size.
                 TextureUpdated::Partial(_) | TextureUpdated::Full => {
-                    if is_append_atlas && allow_partial_texture_updates {
-                        // Keep the append-only atlas allocated with height headroom (and its
-                        // capacity tracking in sync) even when the triggering update is `Full`
-                        // (first upload / width change / reset), so the following appends reuse it.
-                        let cap_height = {
-                            let want = (height * 3).max(512);
-                            ((want + 127) / 128) * 128
-                        };
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);
-                        (gl.glTexImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32,
-                            cap_height as i32,
-                            0,
-                            format,
-                            data_type,
-                            0 as *const _,
-                        );
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
-                        (gl.glTexSubImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            0,
-                            0,
-                            width as i32,
-                            height as i32,
-                            format,
-                            data_type,
-                            data,
-                        );
-                        self.os.gl_cap_width = width;
-                        self.os.gl_cap_height = cap_height;
-                        self.os.gl_cap_internal_format = internal_format as i32;
-                        self.os.gl_uploaded_height = height;
-                    } else {
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
-                        (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
-                        (gl.glTexImage2D)(
-                            gl_sys::TEXTURE_2D,
-                            0,
-                            internal_format as i32,
-                            width as i32,
-                            height as i32,
-                            0,
-                            format,
-                            data_type,
-                            data,
-                        );
-                    }
+                    (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, unpack_alignment);
+                    (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, width as _);
+                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_PIXELS, 0);
+                    (gl.glPixelStorei)(gl_sys::UNPACK_SKIP_ROWS, 0);
+                    (gl.glTexImage2D)(
+                        gl_sys::TEXTURE_2D,
+                        0,
+                        internal_format as i32,
+                        width as i32,
+                        height as i32,
+                        0,
+                        format,
+                        data_type,
+                        data,
+                    );
                 }
                 TextureUpdated::Empty => panic!("already asserted that updated is not empty"),
             };
@@ -4514,7 +4614,17 @@ impl CxOsTexture {
             >(get_integer);
             let mut total = 0u64;
             let mut allocated = false;
-            if let Some(texture) = self.gl_texture.filter(|_| self.gl_texture_owned) {
+            let other_atlas_copies = self
+                .gl_atlas_copies
+                .iter()
+                .map(|copy| copy.gl_texture)
+                .filter(|&texture| Some(texture) != self.gl_texture);
+            for texture in self
+                .gl_texture
+                .into_iter()
+                .chain(other_atlas_copies)
+                .filter(|_| self.gl_texture_owned)
+            {
                 let cube = self.allocation_target == gl_sys::TEXTURE_CUBE_MAP;
                 let mut previous = 0;
                 get_integer(if cube { 0x8514 } else { 0x8069 }, &mut previous);
@@ -4588,8 +4698,17 @@ impl CxOsTexture {
             allocated.then_some(total)
         }
     }
-    fn destroy_released(&mut self, gl: &LibGl) {
+    pub(crate) fn destroy_released(&mut self, gl: &LibGl) {
         if self.gl_texture_owned {
+            for copy in self
+                .gl_atlas_copies
+                .drain(..)
+                .filter(|copy| Some(copy.gl_texture) != self.gl_texture)
+            {
+                unsafe {
+                    (gl.glDeleteTextures)(1, &copy.gl_texture);
+                }
+            }
             if let Some(texture) = self.gl_texture.take() {
                 unsafe {
                     (gl.glDeleteTextures)(1, &texture);

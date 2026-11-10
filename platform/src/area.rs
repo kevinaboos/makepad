@@ -400,6 +400,15 @@ impl Area {
         self.draw_list_id().is_some_and(|id| attached.contains(&id))
     }
 
+    /// Returns whether this area is on screen right now, unlike one in a hidden dock tab
+    /// or one whose draw list has since been redrawn without it.
+    pub fn is_on_screen(&self, cx: &Cx) -> bool {
+        self.is_valid(cx) && self.draw_list_id()
+            .and_then(|draw_list_id| cx.draw_lists[draw_list_id].draw_pass_id)
+            .is_some_and(|pass_id| !cx.pass_attachment_is_stale(pass_id)
+                && self.is_attached(cx, &cx.attached_draw_lists(pass_id)))
+    }
+
     pub fn rect(&self, cx: &Cx) -> Rect {
         return match self {
             Area::Instance(inst) => {

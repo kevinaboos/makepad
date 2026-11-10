@@ -228,6 +228,15 @@ impl CxScrollLatch {
         self.owners[axis_slot(axis)]
     }
 
+    /// Whether `e` starts a new trackpad gesture, rather than being a wheel, momentum or more of a gesture.
+    pub(crate) fn starts_finger_gesture(&self, e: &ScrollEvent) -> bool {
+        match e.phase {
+            ScrollPhase::Began => true,
+            ScrollPhase::Changed => self.gesture != ScrollGesture::Fingers,
+            _ => false,
+        }
+    }
+
     /// Ends the gesture, so the next scroll event starts a new one.
     pub(crate) fn reset(&mut self) {
         self.gesture = ScrollGesture::Idle;
@@ -618,6 +627,10 @@ pub struct CxFingers {
     scroll_drag_locks: Vec<(DigitId, ScrollDirection)>,
     /// The presses something outside a drag scroller already held when it got them, which it never joins.
     presses_held_outside: Vec<(DigitId, Area)>,
+    /// The presses that leave the key focus where it is, see [`Self::mark_press_as_keeping_key_focus`].
+    presses_keeping_key_focus: Vec<DigitId>,
+    is_touching: bool,
+    is_mouse_drag_scrolling_disabled: bool,
 }
 
 impl CxFingers {
@@ -845,6 +858,17 @@ impl CxFingers {
         self.scroll_drag_holders.retain(|(id, _)| *id != digit_id);
         self.scroll_drag_locks.retain(|(id, _)| *id != digit_id);
         self.presses_held_outside.retain(|(id, _)| *id != digit_id);
+        self.presses_keeping_key_focus.retain(|id| *id != digit_id);
+    }
+
+    /// See [`Cx::set_mouse_drag_scrolling`].
+    pub(crate) fn set_mouse_drag_scrolling(&mut self, is_enabled: bool) {
+        self.is_mouse_drag_scrolling_disabled = !is_enabled;
+    }
+
+    /// Whether a mouse press can start a drag scroll, see [`Cx::set_mouse_drag_scrolling`].
+    pub fn can_mouse_drag_scroll(&self) -> bool {
+        !self.is_mouse_drag_scrolling_disabled
     }
 
     /// Whether `area` owns `digit_id`'s drag along `axis`, taking it unless another
@@ -916,6 +940,31 @@ impl CxFingers {
         }
     }
 
+    /// Marks `digit_id`'s press as leaving the key focus where it is, so a focused text input stays focused
+    /// (and keeps its soft keyboard up) even though the press ends outside of it. Call it before the press ends,
+    /// e.g., on `Hit::FingerDown`.
+    pub fn mark_press_as_keeping_key_focus(&mut self, digit_id: DigitId) {
+        if !self.presses_keeping_key_focus.contains(&digit_id) {
+            self.presses_keeping_key_focus.push(digit_id);
+        }
+    }
+
+    /// Undoes [`Self::mark_press_as_keeping_key_focus`], e.g., once a press that might have been a tap turns into a drag.
+    pub fn unmark_press_as_keeping_key_focus(&mut self, digit_id: DigitId) {
+        self.presses_keeping_key_focus.retain(|id| *id != digit_id);
+    }
+
+    /// Whether `digit_id`'s press leaves the key focus where it is, see [`Self::mark_press_as_keeping_key_focus`].
+    pub fn is_press_keeping_key_focus(&self, digit_id: DigitId) -> bool {
+        self.presses_keeping_key_focus.contains(&digit_id)
+    }
+
+    /// Whether a widget holds the press of a finger on the screen,
+    /// counting a finger being lifted until its touch update is done.
+    pub fn is_touch_press_held(&self) -> bool {
+        self.is_touching && !self.captures.is_empty()
+    }
+
     /// See [`Cx::lock_scroll_drag`].
     pub(crate) fn lock_scroll_drag(&mut self, digit_id: DigitId, travel: Vec2d) -> Option<ScrollDirection> {
         let owners = [Vec2Index::X, Vec2Index::Y].map(|axis| self.scroll_drag_owner(digit_id, axis));
@@ -941,8 +990,18 @@ impl CxFingers {
             for capture in self.captures.iter_mut().filter(|c| c.digit_id == digit_id && taken.contains(&c.area)) {
                 capture.is_taken_over = true;
             }
+            // It's a drag now, not a tap, so it only keeps the key focus if the scroller marks it again.
+            self.unmark_press_as_keeping_key_focus(digit_id);
         }
         Some(direction)
+    }
+
+    /// Removes `area`'s capture of `digit_id`'s press if a drag scroller took it over, see [`Self::take_over_press`].
+    fn remove_taken_over_capture(&mut self, digit_id: DigitId, area: Area) -> Option<CxDigitCapture> {
+        let index = self.captures.iter().position(|capture| {
+            capture.digit_id == digit_id && capture.area == area && capture.is_taken_over
+        })?;
+        Some(self.captures.remove(index))
     }
 
     /// The way `digit_id`'s drag goes, picked once it has traveled the tap distance and kept for the rest of its press.
@@ -1000,14 +1059,21 @@ impl CxFingers {
     }
 
     pub(crate) fn process_touch_update_start(&mut self, time: f64, touches: &[TouchPoint]) {
+        if !touches.is_empty() {
+            self.is_touching = true;
+        }
         for touch in touches {
             if let TouchState::Start = touch.state {
                 self.process_tap_count(touch.abs, time);
+                self.tap.digit_id = live_id_num!(touch, touch.uid).into();
             }
         }
     }
 
     pub(crate) fn process_touch_update_end(&mut self, touches: &[TouchPoint]) {
+        self.is_touching = touches
+            .iter()
+            .any(|touch| !matches!(touch.state, TouchState::Stop | TouchState::Cancel));
         for touch in touches {
             let digit_id = live_id_num!(touch, touch.uid).into();
             match touch.state {
@@ -1018,6 +1084,11 @@ impl CxFingers {
                 TouchState::Start | TouchState::Move | TouchState::Stable => {
                     self.cycle_hover_area(digit_id);
                 }
+            }
+            // A press that moved too far to be a tap doesn't count towards a double tap, like on Android and iOS,
+            // so swiping twice from the same spot doesn't make the second swipe a double tap.
+            if digit_id == self.tap.digit_id && touch.abs.distance(&self.tap.last_pos) >= TAP_COUNT_DISTANCE {
+                self.tap.last_time = f64::NEG_INFINITY;
             }
         }
         self.switch_captures();
@@ -1451,13 +1522,7 @@ impl Cx {
             return;
         }
         self.fingers.sweep_lock_validation_event = Some(event_id);
-        let attached = self.fingers.sweep_lock.is_some_and(|area| {
-            area.is_valid(self)
-                && area.draw_list_id()
-                    .and_then(|list| self.draw_lists[list].draw_pass_id)
-                    .is_some_and(|pass| !self.pass_attachment_is_stale(pass)
-                        && area.is_attached(self, &self.attached_draw_lists(pass)))
-        });
+        let attached = self.fingers.sweep_lock.is_some_and(|area| area.is_on_screen(self));
         if !attached {
             self.fingers.clear_sweep_lock();
         }
@@ -1660,11 +1725,7 @@ impl Event {
                     // A drag scroller took this press over from our widget, which gets one last FingerUp
                     // as a sweep (so it isn't taken for a tap or a click), then nothing more of the press.
                     if t.state != TouchState::Start {
-                        let taken_over = cx.fingers.captures.iter().position(|capture| {
-                            capture.digit_id == digit_id && capture.area == area && capture.is_taken_over
-                        });
-                        if let Some(index) = taken_over {
-                            let capture = cx.fingers.captures.remove(index);
+                        if let Some(capture) = cx.fingers.remove_taken_over_capture(digit_id, area) {
                             return Hit::FingerUp(FingerUpEvent {
                                 abs_start: capture.abs_start,
                                 rect: area.clipped_rect(cx),
@@ -1891,6 +1952,25 @@ impl Event {
 
                 if let Some((button, _window_id)) = cx.fingers.first_mouse_button {
                     let device = DigitDevice::Mouse { button };
+                    // Like a touch, a press that a drag scroller took over from our widget gets one last
+                    // FingerUp as a sweep, then nothing more.
+                    if let Some(capture) = cx.fingers.remove_taken_over_capture(digit_id, area) {
+                        return Hit::FingerUp(FingerUpEvent {
+                            abs_start: capture.abs_start,
+                            rect,
+                            window_id: e.window_id,
+                            abs: e.abs,
+                            digit_id,
+                            device,
+                            has_long_press_occurred: capture.has_long_press_occurred,
+                            tap_count,
+                            capture_time: capture.time,
+                            modifiers: e.modifiers,
+                            time: e.time,
+                            is_over: false,
+                            is_sweep: true,
+                        });
+                    }
                     //let handled_area = e.handled.get();
                     if !options.sweep_area.is_empty() {
                         if let Some(capture) = cx.fingers.find_digit_capture(digit_id) {
@@ -2098,6 +2178,25 @@ impl Event {
                 let tap_count = cx.fingers.tap_count();
                 let rect = area.clipped_rect(&cx);
 
+                // A press that a drag scroller took over on its last move ends as a sweep too.
+                if let Some(capture) = cx.fingers.remove_taken_over_capture(digit_id, area) {
+                    return Hit::FingerUp(FingerUpEvent {
+                        abs_start: capture.abs_start,
+                        rect,
+                        window_id: e.window_id,
+                        abs: e.abs,
+                        digit_id,
+                        device,
+                        has_long_press_occurred: capture.has_long_press_occurred,
+                        tap_count,
+                        capture_time: capture.time,
+                        modifiers: e.modifiers,
+                        time: e.time,
+                        is_over: false,
+                        is_sweep: true,
+                    });
+                }
+
                 if let Some(capture) = cx.fingers.find_area_capture(area) {
                     let is_over = hit_test(e.abs, &rect, &options.margin);
                     let event = Hit::FingerUp(FingerUpEvent {
@@ -2115,7 +2214,9 @@ impl Event {
                         is_over,
                         is_sweep: false,
                     });
-                    if is_over {
+                    // A `capture_overload` parent (e.g., PortalList) gets this release after the pressed item,
+                    // so only the first capture takes the hover, else the item never gets its hover-out.
+                    if is_over && cx.fingers.find_digit_capture(digit_id).is_some_and(|c| c.area == area) {
                         cx.fingers.new_hover_area(digit_id, area);
                     }
                     return event;

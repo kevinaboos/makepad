@@ -5,7 +5,7 @@ use {
         area::Area,
         cursor::MouseCursor,
         cx::{Cx, CxRef, GpuBackend, OsType, XrCapabilities},
-        display_context::SystemBarAppearance,
+        display_context::{NativeAppearance, SystemBarAppearance},
         draw_list::DrawListId,
         draw_pass::{CxDrawPassParent, CxDrawPassRect, DrawPassId},
         dvec2,
@@ -13,7 +13,8 @@ use {
         event::xr::XrAnchor,
         event::{
             video_playback::CameraPreviewMode, DigitId, DragItem, Event, NextFrame, QuitReason,
-            QuitRequestedEvent, ScrollDirection, ScrollEvent, Timer, Trigger, VideoSource,
+            QuitRequestedEvent, ScrollDirection, ScrollEvent, Timer, TouchPoint, Trigger,
+            VideoSource,
         },
         gpu_info::GpuInfo,
         ime::TextInputConfig,
@@ -325,6 +326,9 @@ pub enum CxOsOp {
     /// dark icons, `false` requests light icons. Honored on Android and iOS
     /// (iOS only has a status bar).
     SetSystemBarDarkIcons(bool),
+    /// Makes the OS-drawn parts of the app look light or dark.
+    /// See [`Cx::set_native_appearance`].
+    SetNativeAppearance(NativeAppearance),
     /// Asks the OS to defer its own edge gestures (the home-indicator swipe,
     /// the status-bar and control-centre pulls) on these screen edges, so
     /// the first swipe from such an edge reaches the app. Honored on iOS.
@@ -518,6 +522,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::PinMousePointer(..) => write!(f, "PinMousePointer"),
             Self::RepinMousePointer => write!(f, "RepinMousePointer"),
             Self::SetSystemBarDarkIcons(..) => write!(f, "SetSystemBarDarkIcons"),
+            Self::SetNativeAppearance(..) => write!(f, "SetNativeAppearance"),
             Self::DeferSystemGestures(..) => write!(f, "DeferSystemGestures"),
 
             Self::ShowTextIME(..) => write!(f, "ShowTextIME"),
@@ -1301,6 +1306,20 @@ impl Cx {
         self.display_context.system_bar_appearance = appearance;
     }
 
+    /// Makes the UI that the OS draws for the app light or dark, regardless of the OS's own setting.
+    ///
+    /// Honored on iOS and macOS, by Android's copy/paste toolbar and splash screen,
+    /// by KWin's and some other Linux title bars, and by the window menu on Windows.
+    pub fn set_native_appearance(&mut self, appearance: NativeAppearance) {
+        if self.display_context.native_appearance == Some(appearance) {
+            return;
+        }
+        self.display_context.native_appearance = Some(appearance);
+        self.platform_ops
+            .retain(|queued| !matches!(queued, CxOsOp::SetNativeAppearance(_)));
+        self.platform_ops.push_back(CxOsOp::SetNativeAppearance(appearance));
+    }
+
     /// Ask the OS to defer its own gestures on these screen edges, so the
     /// FIRST swipe from such an edge reaches the app (an app-owned home
     /// gesture, an edge-dragged drawer); the OS then shows its indicator and
@@ -1352,7 +1371,9 @@ impl Cx {
         config: TextInputConfig,
     ) {
         if !self.keyboard.text_ime_dismissed {
+            self.keyboard.is_text_ime_hide_deferred = false;
             self.ime_area = area;
+            self.ime_area_scope = self.ime_scope;
             let rect = area.rect(self);
             self.publish_hosted_ime(crate::ime::HostedImeState {
                 visible: !config.is_read_only
@@ -1383,14 +1404,46 @@ impl Cx {
         });
     }
 
+    /// Hides the soft keyboard, once no widget is being pressed by a finger.
+    ///
+    /// Hiding it moves everything above it, which would move a pressed widget out from under the finger.
     pub fn hide_text_ime(&mut self) {
-        self.publish_hosted_ime(crate::ime::HostedImeState::default());
+        // A text input that just took the focus already synced its text into iOS's text view, which a hide would wipe,
+        // and it shows the keyboard again anyway.
+        #[cfg(target_os = "ios")]
+        if self.keyboard.is_text_ime_hide_cancelled {
+            return;
+        }
         self.keyboard.reset_text_ime_dismissed();
-        self.platform_ops.push_back(CxOsOp::HideTextIME);
+        self.keyboard.is_text_ime_hide_deferred = true;
+        self.flush_text_ime_hide();
+    }
+
+    /// Cancels a hide of the soft keyboard that's still waiting for a press to end,
+    /// e.g., because a text input that shows it took the key focus again.
+    pub fn cancel_text_ime_hide(&mut self) {
+        self.keyboard.is_text_ime_hide_deferred = false;
+        self.keyboard.is_text_ime_hide_cancelled = true;
+    }
+
+    /// Sends out a hide of the soft keyboard that's been waiting, unless a widget is still being pressed.
+    fn flush_text_ime_hide(&mut self) {
+        if self.keyboard.is_text_ime_hide_deferred && !self.fingers.is_touch_press_held() {
+            self.keyboard.is_text_ime_hide_deferred = false;
+            self.publish_hosted_ime(crate::ime::HostedImeState::default());
+            self.platform_ops.push_back(CxOsOp::HideTextIME);
+        }
+    }
+
+    /// Ends a touch update after it was dispatched.
+    pub(crate) fn end_touch_update(&mut self, touches: &[TouchPoint]) {
+        self.fingers.process_touch_update_end(touches);
+        self.flush_text_ime_hide();
     }
 
     pub fn text_ime_was_dismissed(&mut self) {
         self.publish_hosted_ime(crate::ime::HostedImeState::default());
+        self.keyboard.is_text_ime_hide_deferred = false;
         self.keyboard.set_text_ime_dismissed();
         // A focused TextInput re-pushes ShowTextIME on every draw, so a show op
         // queued by a frame drawn just before this dismissal landed can still be
@@ -1632,6 +1685,7 @@ impl Cx {
     /// Call it once those widgets saw the touch get canceled.
     pub fn release_touch_captures(&mut self, uid: u64) {
         self.fingers.release_digit(live_id_num!(touch, uid).into());
+        self.flush_text_ime_hide();
     }
 
     pub fn sweep_unlock(&mut self, value: Area) {
@@ -1666,6 +1720,12 @@ impl Cx {
     /// [`Cx::block_scrolling_except_within()`].
     pub fn unblock_scrolling(&mut self) {
         self.fingers.block_scrolling_within_area(None);
+    }
+
+    /// Sets whether the mouse can drag-scroll, which it can by default.
+    /// A trackpad's click and drag counts as the mouse, while touches can always drag-scroll.
+    pub fn set_mouse_drag_scrolling(&mut self, is_enabled: bool) {
+        self.fingers.set_mouse_drag_scrolling(is_enabled);
     }
 
     /// Whether `area` owns this scroll along `axis`. Each gesture goes to the first caller (call it
@@ -2064,6 +2124,11 @@ impl Cx {
         self.ime_area.rect(self)
     }
 
+    /// The `ime_scope` that the focused text input last showed the IME from.
+    pub fn ime_area_scope(&self) -> u64 {
+        self.ime_area_scope
+    }
+
     pub fn update_area_refs(&mut self, old_area: Area, new_area: Area) -> Area {
         if old_area == Area::Empty {
             return new_area;
@@ -2111,6 +2176,21 @@ impl Cx {
     pub fn boost_frame_rate(&mut self) {
         #[cfg(target_os = "android")]
         self.os.boost_frame_rate();
+    }
+
+    /// Sets whether a frame repaints only the parts of the window that changed, which it does by default.
+    /// Only Android's OpenGL backend does that so far, and only when its EGL driver reports buffer ages.
+    pub fn set_partial_repainting(&mut self, is_enabled: bool) {
+        self.draw_damage.set_disabled(!is_enabled);
+    }
+
+    /// Whether this session builds the shaders its cache is missing on a background thread, so a screen created
+    /// early is ready by the time it opens. Only Android does that, and it reads false until the first frame shows.
+    pub fn is_building_shaders_in_background(&self) -> bool {
+        #[cfg(all(target_os = "android", not(use_vulkan)))]
+        return self.os.is_building_shaders_in_background();
+        #[cfg(not(all(target_os = "android", not(use_vulkan))))]
+        false
     }
 
     pub fn send_trigger(&mut self, area: Area, trigger: Trigger) {

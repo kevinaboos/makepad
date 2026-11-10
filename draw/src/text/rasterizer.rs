@@ -1,5 +1,5 @@
 use super::{
-    font::{Font, GlyphId},
+    font::{Font, FontId, GlyphId},
     font_atlas::{ColorAtlas, GlyphImageKey, GlyphImageKind, GrayscaleAtlas, MsdfAtlas},
     geom::{Point, Rect, Size},
     glyph_outline::{GlyphOutline, OutlineComplexity},
@@ -10,6 +10,7 @@ use super::{
     sdfer::Sdfer,
 };
 use fxhash::{FxHashMap, FxHashSet};
+use std::rc::Rc;
 //use std::{fs::File, io::BufWriter, path::Path, slice};
 
 #[derive(Debug)]
@@ -19,14 +20,26 @@ pub struct Rasterizer {
     msdf_resolution: MsdfResolutionSettings,
     msdf_complexity: MsdfComplexitySettings,
     outline_rasterization_mode: OutlineRasterizationMode,
+    pub(super) sdf_glyphs_rasterized: u64,
+    pub(super) msdf_jobs_queued: u64,
     atlas: ColorAtlas,
     allocator: MultiPlaneAllocator,
     cached_slots: FxHashMap<GlyphImageKey, AtlasSlot>,
     outline_msdf_ready: FxHashSet<GlyphImageKey>,
     outline_msdf_pending: FxHashSet<GlyphImageKey>,
     outline_msdf_failed: FxHashSet<GlyphImageKey>,
-    queued_msdf_jobs: Vec<QueuedMsdfJob>,
+    queued_msdf_jobs: Vec<QueuedOutlineJob>,
+    outline_sdf_pending: FxHashSet<GlyphImageKey>,
+    queued_sdf_jobs: Vec<QueuedOutlineJob>,
+    /// The fonts and sizes (as `f32` bits) whose printable ASCII we've already queued.
+    prewarm_sdf_sizes: FxHashSet<(FontId, u32)>,
+    /// The fonts and sizes whose printable ASCII we queue after this frame's own glyphs.
+    queued_sdf_prewarms: Vec<(Rc<Font>, f32)>,
     atlas_epoch: u64,
+    /// 0 means every glyph fit this frame.
+    pub(super) atlas_overflow_hash: u64,
+    /// Only `Fonts` raises this, so a worker's atlas never grows.
+    pub(super) max_atlas_height: usize,
 }
 
 impl Rasterizer {
@@ -71,7 +84,6 @@ impl Rasterizer {
             }
         }
         Some(RasterizedGlyph {
-            atlas_size: self.atlas.size(),
             atlas_image_bounds: slot.rect,
             atlas_plane: slot.plane.index(),
             ..published.glyph
@@ -86,6 +98,8 @@ impl Rasterizer {
             msdf_resolution: settings.msdf_resolution,
             msdf_complexity: settings.msdf_complexity,
             outline_rasterization_mode: settings.outline_rasterization_mode,
+            sdf_glyphs_rasterized: 0,
+            msdf_jobs_queued: 0,
             atlas: ColorAtlas::new(atlas_size),
             allocator: MultiPlaneAllocator::new(atlas_size),
             cached_slots: FxHashMap::default(),
@@ -93,7 +107,13 @@ impl Rasterizer {
             outline_msdf_pending: FxHashSet::default(),
             outline_msdf_failed: FxHashSet::default(),
             queued_msdf_jobs: Vec::new(),
+            outline_sdf_pending: FxHashSet::default(),
+            queued_sdf_jobs: Vec::new(),
+            prewarm_sdf_sizes: FxHashSet::default(),
+            queued_sdf_prewarms: Vec::new(),
             atlas_epoch: 0,
+            atlas_overflow_hash: 0,
+            max_atlas_height: atlas_size.height,
         }
     }
 
@@ -128,11 +148,46 @@ impl Rasterizer {
         self.outline_msdf_pending.clear();
         self.outline_msdf_failed.clear();
         self.queued_msdf_jobs.clear();
+        self.outline_sdf_pending.clear();
+        self.queued_sdf_jobs.clear();
+        self.prewarm_sdf_sizes.clear();
+        self.queued_sdf_prewarms.clear();
         self.atlas_epoch = self.atlas_epoch.wrapping_add(1);
     }
 
-    pub fn take_queued_msdf_jobs(&mut self) -> Vec<QueuedMsdfJob> {
+    pub fn take_queued_msdf_jobs(&mut self) -> Vec<QueuedOutlineJob> {
         std::mem::take(&mut self.queued_msdf_jobs)
+    }
+
+    /// Takes the SDF jobs queued since the last call, with the printable ASCII we prewarm last.
+    pub fn take_queued_sdf_jobs(&mut self) -> Vec<QueuedOutlineJob> {
+        for (font, dpxs_per_em) in std::mem::take(&mut self.queued_sdf_prewarms) {
+            let glyph_ids = font.with_ttf_parser_face(|face| {
+                (' '..='~')
+                    .filter_map(|ch| face.glyph_index(ch))
+                    .collect::<Vec<_>>()
+            });
+            for glyph_id in glyph_ids {
+                if let Some((key, outline, dpxs_per_em)) =
+                    self.get_glyph_outline_sdf_key(&font, glyph_id.0, dpxs_per_em)
+                {
+                    self.queue_glyph_outline_sdf(key, &outline, dpxs_per_em);
+                }
+            }
+        }
+        std::mem::take(&mut self.queued_sdf_jobs)
+    }
+
+    pub fn apply_completed_sdf_job(&mut self, job: CompletedSdfJob) {
+        if job.epoch != self.atlas_epoch || !self.outline_sdf_pending.remove(&job.key) {
+            return;
+        }
+        let Some((slot, allocated)) = self.allocate_sdf_slot(job.key) else {
+            return;
+        };
+        if allocated {
+            self.write_sdf_image(slot, &job.sdf_image);
+        }
     }
 
     pub fn apply_completed_msdf_job(&mut self, job: CompletedMsdfJob) {
@@ -193,14 +248,32 @@ impl Rasterizer {
         self.cached_slots.get(key).copied()
     }
 
+    fn allocate_or_grow<T>(
+        &mut self,
+        key: &GlyphImageKey,
+        allocate: impl Fn(&mut MultiPlaneAllocator, Size<usize>) -> Option<T>,
+    ) -> Option<T> {
+        if let Some(slot) = allocate(&mut self.allocator, key.size) {
+            return Some(slot);
+        }
+        // Straight to the full height, since every step re-uploads all of it.
+        let height = self.max_atlas_height;
+        if height > self.atlas.size().height {
+            self.atlas.grow(height);
+            self.allocator.size.height = height;
+            if let Some(slot) = allocate(&mut self.allocator, key.size) {
+                return Some(slot);
+            }
+        }
+        self.atlas_overflow_hash = self.atlas_overflow_hash.wrapping_add(fxhash::hash64(key));
+        None
+    }
+
     fn allocate_sdf_slot(&mut self, key: GlyphImageKey) -> Option<(AtlasSlot, bool)> {
         if let Some(slot) = self.get_cached_slot(&key) {
             return Some((slot, false));
         }
-        let Some(slot) = self.allocator.allocate_sdf_slot(key.size) else {
-            self.atlas.request_reset();
-            return None;
-        };
+        let slot = self.allocate_or_grow(&key, MultiPlaneAllocator::allocate_sdf_slot)?;
         self.cached_slots.insert(key, slot);
         Some((slot, true))
     }
@@ -209,10 +282,7 @@ impl Rasterizer {
         if let Some(slot) = self.get_cached_slot(&key) {
             return Some((slot, false));
         }
-        let Some(rect) = self.allocator.allocate_shared_slot(key.size) else {
-            self.atlas.request_reset();
-            return None;
-        };
+        let rect = self.allocate_or_grow(&key, MultiPlaneAllocator::allocate_shared_slot)?;
         let slot = AtlasSlot {
             rect,
             plane: AtlasPlane::R,
@@ -321,62 +391,106 @@ impl Rasterizer {
         &mut self,
         font: &Font,
         glyph_id: GlyphId,
-        mut dpxs_per_em: f32,
+        dpxs_per_em: f32,
     ) -> Option<RasterizedGlyph> {
+        let (key, outline, dpxs_per_em) =
+            self.get_glyph_outline_sdf_key(font, glyph_id, dpxs_per_em)?;
+        let (slot, allocated) = self.allocate_sdf_slot(key.clone())?;
+        if allocated {
+            self.sdf_glyphs_rasterized += 1;
+            let sdf_image = rasterize_outline_sdf(&mut self.sdfer, &outline, dpxs_per_em, key.size);
+            self.write_sdf_image(slot, &sdf_image);
+        }
+        Some(self.build_sdf_glyph(slot, &outline, dpxs_per_em))
+    }
+
+    /// Returns the glyph's SDF if the atlas has it, or else queues it for the worker.
+    ///
+    /// The first time a font misses at some size, we also queue that font's printable ASCII.
+    pub fn get_or_queue_glyph_outline_sdf(
+        &mut self,
+        font: &Rc<Font>,
+        glyph_id: GlyphId,
+        dpxs_per_em: f32,
+    ) -> Option<RasterizedGlyph> {
+        let (key, outline, dpxs_per_em) =
+            self.get_glyph_outline_sdf_key(font, glyph_id, dpxs_per_em)?;
+        if let Some(slot) = self.get_cached_slot(&key) {
+            return Some(self.build_sdf_glyph(slot, &outline, dpxs_per_em));
+        }
+        self.queue_glyph_outline_sdf(key, &outline, dpxs_per_em);
+        if self.prewarm_sdf_sizes.insert((font.id(), dpxs_per_em.to_bits())) {
+            self.queued_sdf_prewarms.push((font.clone(), dpxs_per_em));
+        }
+        None
+    }
+
+    /// Returns the atlas key of the glyph's SDF, along with its outline and the size we build it at.
+    fn get_glyph_outline_sdf_key(
+        &self,
+        font: &Font,
+        glyph_id: GlyphId,
+        dpxs_per_em: f32,
+    ) -> Option<(GlyphImageKey, Rc<GlyphOutline>, f32)> {
         debug_assert_eq!(
             self.sdfer.settings().padding,
             self.msdfer.settings().padding
         );
-        dpxs_per_em = dpxs_per_em.max(self.msdf_resolution.min_dpxs_per_em);
+        let dpxs_per_em = dpxs_per_em.max(self.msdf_resolution.min_dpxs_per_em);
         let mut outline = None;
         let bounds_in_ems = font.glyph_outline_bounds_in_ems(glyph_id, &mut outline)?;
         let outline = outline.unwrap_or_else(|| font.glyph_outline_rc(glyph_id).unwrap());
         let atlas_image_size = glyph_outline_image_size(bounds_in_ems.size, dpxs_per_em);
-        let atlas_image_padding = self.sdfer.settings().padding;
         let key = GlyphImageKey {
             font_id: font.id(),
             glyph_id,
-            size: atlas_image_size + Size::from(atlas_image_padding) * 2,
+            size: atlas_image_size + Size::from(self.sdfer.settings().padding) * 2,
             kind: GlyphImageKind::OutlineSdf,
         };
-        let (slot, allocated) = self.allocate_sdf_slot(key.clone())?;
-        let atlas_image_bounds = if !allocated {
-            slot.rect
-        } else {
-            let mut image = self.atlas.get_cached_glyph_image_mut(slot.rect);
-            {
-                let mut coverage = Image::new(atlas_image_size);
-                outline.rasterize(
-                    dpxs_per_em,
-                    &mut coverage.subimage_mut(atlas_image_size.into()),
-                );
-                let sdf_image_size = atlas_image_size + Size::from(atlas_image_padding) * 2;
-                let mut sdf_image = Image::<R>::new(sdf_image_size);
-                self.sdfer.coverage_to_sdf(
-                    &coverage.subimage(atlas_image_size.into()),
-                    &mut sdf_image.subimage_mut(Rect::from(sdf_image_size)),
-                );
-                for y in 0..sdf_image_size.height {
-                    for x in 0..sdf_image_size.width {
-                        let v = sdf_image[Point::new(x, y)].r();
-                        let point = Point::new(x, y);
-                        let old = image[point];
-                        image[point] = slot.plane.set(old, v);
-                    }
-                }
-            }
-            slot.rect
-        };
+        Some((key, outline, dpxs_per_em))
+    }
 
-        Some(RasterizedGlyph {
-            atlas_kind: AtlasKind::Grayscale,
-            atlas_size: self.atlas.size(),
-            atlas_image_bounds,
-            atlas_image_padding,
-            atlas_plane: slot.plane.index(),
-            origin_in_dpxs: bounds_in_ems.origin * dpxs_per_em,
+    fn queue_glyph_outline_sdf(
+        &mut self,
+        key: GlyphImageKey,
+        outline: &GlyphOutline,
+        dpxs_per_em: f32,
+    ) {
+        if self.cached_slots.contains_key(&key) || !self.outline_sdf_pending.insert(key.clone()) {
+            return;
+        }
+        self.queued_sdf_jobs.push(QueuedOutlineJob {
+            key,
+            outline: outline.clone(),
             dpxs_per_em,
-        })
+            epoch: self.atlas_epoch,
+        });
+    }
+
+    fn write_sdf_image(&mut self, slot: AtlasSlot, sdf_image: &Image<R>) {
+        let mut image = self.atlas.get_cached_glyph_image_mut(slot.rect);
+        for y in 0..slot.rect.size.height {
+            for x in 0..slot.rect.size.width {
+                let point = Point::new(x, y);
+                image[point] = slot.plane.set(image[point], sdf_image[point].r());
+            }
+        }
+    }
+
+    fn build_sdf_glyph(
+        &self,
+        slot: AtlasSlot,
+        outline: &GlyphOutline,
+        dpxs_per_em: f32,
+    ) -> RasterizedGlyph {
+        RasterizedGlyph {
+            atlas_kind: AtlasKind::Grayscale,
+            atlas_image_bounds: slot.rect,
+            atlas_image_padding: self.sdfer.settings().padding,
+            atlas_plane: slot.plane.index(),
+            origin_in_dpxs: outline.origin_in_ems() * dpxs_per_em,
+            dpxs_per_em,
+        }
     }
 
     fn rasterize_glyph_outline_msdf(
@@ -412,7 +526,6 @@ impl Rasterizer {
             if let Some(slot) = self.get_cached_slot(&key) {
                 return Some(RasterizedGlyph {
                     atlas_kind: AtlasKind::Msdf,
-                    atlas_size: self.atlas.size(),
                     atlas_image_bounds: slot.rect,
                     atlas_image_padding,
                     atlas_plane: AtlasPlane::R.index(),
@@ -435,10 +548,11 @@ impl Rasterizer {
             self.seed_msdf_slot_from_sdf(slot, sdf_glyph);
         }
         if self.outline_msdf_pending.insert(key.clone()) {
+            self.msdf_jobs_queued += 1;
             // The job crosses a thread boundary, so it needs an owned copy of the
             // outline. This deep clone happens at most once per glyph per atlas
             // epoch, guarded by the pending set above.
-            self.queued_msdf_jobs.push(QueuedMsdfJob {
+            self.queued_msdf_jobs.push(QueuedOutlineJob {
                 key,
                 outline: (*outline).clone(),
                 dpxs_per_em,
@@ -524,6 +638,18 @@ impl Rasterizer {
                 let mut image = self.atlas.get_cached_glyph_image_mut(slot.rect);
                 {
                     let size = image.size();
+                    // The decode only writes inside the padding, and an atlas reset leaves
+                    // old glyphs' pixels behind, so we clear the padding ourselves.
+                    for y in (0..PADDING).chain(size.height - PADDING..size.height) {
+                        for x in 0..size.width {
+                            image[Point::new(x, y)] = Bgra::default();
+                        }
+                    }
+                    for y in PADDING..size.height - PADDING {
+                        for x in (0..PADDING).chain(size.width - PADDING..size.width) {
+                            image[Point::new(x, y)] = Bgra::default();
+                        }
+                    }
                     image = image.subimage_mut(Rect::from(size).unpad(PADDING));
                     raster_image.decode_scaled(&mut image);
                 }
@@ -531,7 +657,6 @@ impl Rasterizer {
             };
             Some(RasterizedGlyph {
                 atlas_kind: AtlasKind::Color,
-                atlas_size: self.atlas.size(),
                 atlas_image_bounds,
                 atlas_image_padding: PADDING,
                 atlas_plane: AtlasPlane::R.index(),
@@ -594,54 +719,49 @@ impl AtlasPlane {
     }
 }
 
+/// Skyline packing, one skyline per plane. Each glyph goes as near the top as any plane allows,
+/// then as far left, so a frame's new glyphs land next to each other and its upload stays small.
 #[derive(Debug)]
 struct MultiPlaneAllocator {
-    planes: [RectPacker; 4],
-    plane_used_area: [usize; 4],
-    round_robin_cursor: usize,
+    size: Size<usize>,
+    skylines: [Skyline; 4],
 }
 
 impl MultiPlaneAllocator {
     fn new(size: Size<usize>) -> Self {
         Self {
-            planes: std::array::from_fn(|_| RectPacker::new(size)),
-            plane_used_area: [0; 4],
-            round_robin_cursor: 0,
+            size,
+            skylines: std::array::from_fn(|_| Skyline::new(size.width)),
         }
     }
 
     fn reset(&mut self, size: Size<usize>) {
-        self.planes = std::array::from_fn(|_| RectPacker::new(size));
-        self.plane_used_area = [0; 4];
-        self.round_robin_cursor = 0;
+        *self = Self::new(size);
     }
 
     fn allocate_sdf_slot(&mut self, size: Size<usize>) -> Option<AtlasSlot> {
-        let mut best_plane = None;
-        let mut best_rank = (usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX);
-        for offset in 0..4 {
-            let plane = (self.round_robin_cursor + offset) & 3;
-            let Some(score) = self.planes[plane].peek_best_fit(size) else {
-                continue;
-            };
-            // Keep single-channel occupancy balanced while still using best-fit packing.
-            let rank = (
-                self.plane_used_area[plane],
-                offset,
-                score.short,
-                score.long,
-                score.area,
-            );
-            if rank < best_rank {
-                best_rank = rank;
-                best_plane = Some(plane);
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let mut best: Option<(Point<usize>, usize)> = None;
+        for (plane, skyline) in self.skylines.iter().enumerate() {
+            for (index, segment) in skyline.segments.iter().enumerate() {
+                if segment.x + size.width > self.size.width {
+                    break;
+                }
+                let origin = Point::new(segment.x, skyline.top(index, segment.x + size.width));
+                if origin.y + size.height <= self.size.height
+                    && best.is_none_or(|(best_origin, _)| {
+                        (origin.y, origin.x) < (best_origin.y, best_origin.x)
+                    })
+                {
+                    best = Some((origin, plane));
+                }
             }
         }
-        let plane = best_plane?;
-        let rect = self.planes[plane].allocate(size)?;
-        let area = size.width.saturating_mul(size.height);
-        self.plane_used_area[plane] = self.plane_used_area[plane].saturating_add(area);
-        self.round_robin_cursor = (plane + 1) & 3;
+        let (origin, plane) = best?;
+        let rect = Rect::new(origin, size);
+        self.skylines[plane].raise(rect);
         Some(AtlasSlot {
             rect,
             plane: AtlasPlane::from_index(plane),
@@ -652,249 +772,100 @@ impl MultiPlaneAllocator {
         if size.width == 0 || size.height == 0 {
             return None;
         }
-        let mut candidates = self.planes[0].free_rects().to_vec();
-        for plane in 1..4 {
-            let mut next = Vec::new();
-            for a in candidates.iter().copied() {
-                for b in self.planes[plane].free_rects().iter().copied() {
-                    let Some(common) = rect_intersection(a, b) else {
-                        continue;
-                    };
-                    if common.size.width >= size.width && common.size.height >= size.height {
-                        next.push(common);
-                    }
-                }
-            }
-            prune_contained_rects(&mut next);
-            if next.is_empty() {
-                return None;
-            }
-            candidates = next;
-        }
-
-        let origin = choose_best_fit_origin(&candidates, size)?;
-        let placed = Rect::new(origin, size);
-        for plane in &mut self.planes {
-            if !plane.reserve(placed) {
-                return None;
-            }
-        }
-        let area = size.width.saturating_mul(size.height);
-        for used in &mut self.plane_used_area {
-            *used = used.saturating_add(area);
-        }
-        Some(placed)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PlacementScore {
-    origin: Point<usize>,
-    short: usize,
-    long: usize,
-    area: usize,
-}
-
-#[derive(Clone, Debug)]
-struct RectPacker {
-    size: Size<usize>,
-    free_rects: Vec<Rect<usize>>,
-}
-
-impl RectPacker {
-    fn new(size: Size<usize>) -> Self {
-        Self {
-            size,
-            free_rects: vec![Rect::from(size)],
-        }
-    }
-
-    fn free_rects(&self) -> &[Rect<usize>] {
-        &self.free_rects
-    }
-
-    fn peek_best_fit(&self, size: Size<usize>) -> Option<PlacementScore> {
-        let mut best: Option<PlacementScore> = None;
-        let mut best_rank = (usize::MAX, usize::MAX, usize::MAX);
-        for free in self.free_rects.iter().copied() {
-            if size.width > free.size.width || size.height > free.size.height {
-                continue;
-            }
-            let leftover_w = free.size.width - size.width;
-            let leftover_h = free.size.height - size.height;
-            let short = leftover_w.min(leftover_h);
-            let long = leftover_w.max(leftover_h);
-            let area = free.size.width * free.size.height - size.width * size.height;
-            let rank = (short, long, area);
-            if rank < best_rank {
-                best_rank = rank;
-                best = Some(PlacementScore {
-                    origin: free.origin,
-                    short,
-                    long,
-                    area,
-                });
-            }
-        }
-        best
-    }
-
-    fn allocate(&mut self, size: Size<usize>) -> Option<Rect<usize>> {
-        let score = self.peek_best_fit(size)?;
-        let rect = Rect::new(score.origin, size);
-        if self.reserve(rect) {
-            Some(rect)
-        } else {
-            None
-        }
-    }
-
-    fn reserve(&mut self, used: Rect<usize>) -> bool {
-        if used.size.width == 0 || used.size.height == 0 {
-            return false;
-        }
-        if !Rect::from(self.size).contains_rect(used) {
-            return false;
-        }
-        if !self
-            .free_rects
+        // A shared slot covers all four planes, so it has to sit below every plane's skyline.
+        let mut lefts: Vec<usize> = self
+            .skylines
             .iter()
-            .copied()
-            .any(|free| free.contains_rect(used))
-        {
-            return false;
-        }
-        let mut next_free_rects = Vec::with_capacity(self.free_rects.len().saturating_mul(2));
-        for free in self.free_rects.drain(..) {
-            if !rects_intersect(free, used) {
-                next_free_rects.push(free);
-                continue;
-            }
-            split_free_rect(free, used, &mut next_free_rects);
-        }
-        self.free_rects = next_free_rects;
-        prune_contained_rects(&mut self.free_rects);
-        true
-    }
-}
-
-fn choose_best_fit_origin(rects: &[Rect<usize>], size: Size<usize>) -> Option<Point<usize>> {
-    let mut best_origin = None;
-    let mut best_rank = (usize::MAX, usize::MAX, usize::MAX);
-    for rect in rects.iter().copied() {
-        if size.width > rect.size.width || size.height > rect.size.height {
-            continue;
-        }
-        let leftover_w = rect.size.width - size.width;
-        let leftover_h = rect.size.height - size.height;
-        let short = leftover_w.min(leftover_h);
-        let long = leftover_w.max(leftover_h);
-        let area = rect.size.width * rect.size.height - size.width * size.height;
-        let rank = (short, long, area);
-        if rank < best_rank {
-            best_rank = rank;
-            best_origin = Some(rect.origin);
-        }
-    }
-    best_origin
-}
-
-fn prune_contained_rects(rects: &mut Vec<Rect<usize>>) {
-    let mut i = 0;
-    while i < rects.len() {
-        let mut remove_i = false;
-        let mut j = i + 1;
-        while j < rects.len() {
-            if rects[i].contains_rect(rects[j]) {
-                rects.swap_remove(j);
-                continue;
-            }
-            if rects[j].contains_rect(rects[i]) {
-                remove_i = true;
+            .flat_map(|skyline| skyline.segments.iter().map(|segment| segment.x))
+            .collect();
+        lefts.sort_unstable();
+        lefts.dedup();
+        let mut best: Option<Point<usize>> = None;
+        for x in lefts {
+            if x + size.width > self.size.width {
                 break;
             }
-            j += 1;
+            let y = self
+                .skylines
+                .iter()
+                .map(|skyline| skyline.top(skyline.segment_at(x), x + size.width))
+                .fold(0, usize::max);
+            if y + size.height <= self.size.height && best.is_none_or(|best| y < best.y) {
+                best = Some(Point::new(x, y));
+            }
         }
-        if remove_i {
-            rects.swap_remove(i);
-        } else {
-            i += 1;
+        let rect = Rect::new(best?, size);
+        for skyline in &mut self.skylines {
+            skyline.raise(rect);
         }
+        Some(rect)
     }
 }
 
-fn rect_intersection(a: Rect<usize>, b: Rect<usize>) -> Option<Rect<usize>> {
-    let min_x = a.origin.x.max(b.origin.x);
-    let min_y = a.origin.y.max(b.origin.y);
-    let a_max = a.max();
-    let b_max = b.max();
-    let max_x = a_max.x.min(b_max.x);
-    let max_y = a_max.y.min(b_max.y);
-    if max_x <= min_x || max_y <= min_y {
-        return None;
-    }
-    Some(Rect::new(
-        Point::new(min_x, min_y),
-        Size::new(max_x - min_x, max_y - min_y),
-    ))
+#[derive(Debug)]
+struct Skyline {
+    segments: Vec<SkylineSegment>,
 }
 
-fn rects_intersect(a: Rect<usize>, b: Rect<usize>) -> bool {
-    let a_max = a.max();
-    let b_max = b.max();
-    a.origin.x < b_max.x && a_max.x > b.origin.x && a.origin.y < b_max.y && a_max.y > b.origin.y
+/// Columns `x..x + width` are used in rows `0..y`.
+#[derive(Clone, Copy, Debug)]
+struct SkylineSegment {
+    x: usize,
+    y: usize,
+    width: usize,
 }
 
-fn split_free_rect(free: Rect<usize>, used: Rect<usize>, out: &mut Vec<Rect<usize>>) {
-    let free_max = free.max();
-    let used_max = used.max();
-
-    if used.origin.x < free_max.x && used_max.x > free.origin.x {
-        if used.origin.y > free.origin.y {
-            push_non_empty_rect(
-                out,
-                Rect::new(
-                    free.origin,
-                    Size::new(free.size.width, used.origin.y - free.origin.y),
-                ),
-            );
-        }
-        if used_max.y < free_max.y {
-            push_non_empty_rect(
-                out,
-                Rect::new(
-                    Point::new(free.origin.x, used_max.y),
-                    Size::new(free.size.width, free_max.y - used_max.y),
-                ),
-            );
+impl Skyline {
+    fn new(width: usize) -> Self {
+        Self {
+            segments: vec![SkylineSegment { x: 0, y: 0, width }],
         }
     }
 
-    if used.origin.y < free_max.y && used_max.y > free.origin.y {
-        if used.origin.x > free.origin.x {
-            push_non_empty_rect(
-                out,
-                Rect::new(
-                    free.origin,
-                    Size::new(used.origin.x - free.origin.x, free.size.height),
-                ),
-            );
-        }
-        if used_max.x < free_max.x {
-            push_non_empty_rect(
-                out,
-                Rect::new(
-                    Point::new(used_max.x, free.origin.y),
-                    Size::new(free_max.x - used_max.x, free.size.height),
-                ),
-            );
-        }
+    fn segment_at(&self, x: usize) -> usize {
+        self.segments.partition_point(|segment| segment.x + segment.width <= x)
     }
-}
 
-fn push_non_empty_rect(out: &mut Vec<Rect<usize>>, rect: Rect<usize>) {
-    if rect.size.width != 0 && rect.size.height != 0 {
-        out.push(rect);
+    /// The first row free in all of columns `x..end`, where segment `first` holds column `x`.
+    fn top(&self, first: usize, end: usize) -> usize {
+        self.segments[first..]
+            .iter()
+            .take_while(|segment| segment.x < end)
+            .map(|segment| segment.y)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn raise(&mut self, used: Rect<usize>) {
+        let (x, end, y) = (used.origin.x, used.max().x, used.max().y);
+        let first = self.segment_at(x);
+        let last = first + self.segments[first..].partition_point(|segment| segment.x < end);
+        let head = self.segments[first];
+        let tail = self.segments[last - 1];
+        let left = (head.x < x).then(|| SkylineSegment {
+            width: x - head.x,
+            ..head
+        });
+        let right = (tail.x + tail.width > end).then(|| SkylineSegment {
+            x: end,
+            y: tail.y,
+            width: tail.x + tail.width - end,
+        });
+        let raised = SkylineSegment {
+            x,
+            y,
+            width: end - x,
+        };
+        self.segments
+            .splice(first..last, left.into_iter().chain([raised]).chain(right));
+        // Merge with neighbors at the same height so the segment list stays short.
+        let index = first + left.is_some() as usize;
+        if right.is_none() && self.segments.get(index + 1).is_some_and(|next| next.y == y) {
+            self.segments[index].width += self.segments.remove(index + 1).width;
+        }
+        if left.is_none() && index > 0 && self.segments[index - 1].y == y {
+            self.segments[index - 1].width += self.segments.remove(index).width;
+        }
     }
 }
 
@@ -908,8 +879,9 @@ pub struct Settings {
     pub atlas_size: Size<usize>,
 }
 
+/// A glyph outline for the worker to build an SDF or MSDF image of, depending on its key's kind.
 #[derive(Clone, Debug)]
-pub struct QueuedMsdfJob {
+pub struct QueuedOutlineJob {
     pub key: GlyphImageKey,
     pub outline: GlyphOutline,
     pub dpxs_per_em: f32,
@@ -920,6 +892,13 @@ pub struct QueuedMsdfJob {
 pub struct CompletedMsdfJob {
     pub key: GlyphImageKey,
     pub pixels: Vec<Bgra>,
+    pub epoch: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompletedSdfJob {
+    pub key: GlyphImageKey,
+    pub sdf_image: Image<R>,
     pub epoch: u64,
 }
 
@@ -943,7 +922,6 @@ pub struct MsdfComplexitySettings {
 #[derive(Clone, Copy, Debug)]
 pub struct RasterizedGlyph {
     pub atlas_kind: AtlasKind,
-    pub atlas_size: Size<usize>,
     pub atlas_image_bounds: Rect<usize>,
     pub atlas_image_padding: usize,
     pub atlas_plane: u8,
@@ -977,6 +955,24 @@ fn glyph_outline_image_size(size_in_ems: Size<f32>, dpxs_per_em: f32) -> Size<us
         size_in_dpxs.width.ceil() as usize,
         size_in_dpxs.height.ceil() as usize,
     )
+}
+
+/// Rasterizes an outline's coverage and turns it into an SDF image of `size`, padding included.
+pub fn rasterize_outline_sdf(
+    sdfer: &mut Sdfer,
+    outline: &GlyphOutline,
+    dpxs_per_em: f32,
+    size: Size<usize>,
+) -> Image<R> {
+    let coverage_size = size - Size::from(sdfer.settings().padding) * 2;
+    let mut coverage = Image::new(coverage_size);
+    outline.rasterize(dpxs_per_em, &mut coverage.subimage_mut(coverage_size.into()));
+    let mut sdf_image = Image::new(size);
+    sdfer.coverage_to_sdf(
+        &coverage.subimage(coverage_size.into()),
+        &mut sdf_image.subimage_mut(Rect::from(size)),
+    );
+    sdf_image
 }
 
 fn is_msdf_complexity_acceptable(

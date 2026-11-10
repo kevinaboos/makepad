@@ -33,9 +33,6 @@ script_mod! {
         aa_2x2: 0.0
         aa_4x4: 0.0
         aa_pad_px: uniform(float(1.0))
-        slug_matrix_0: uniform(vec4(1.0, 0.0, 0.0, 0.0))
-        slug_matrix_1: uniform(vec4(0.0, 1.0, 0.0, 0.0))
-        slug_matrix_3: uniform(vec4(0.0, 0.0, 0.0, 1.0))
         slug_viewport_px: uniform(vec2(1.0, 1.0))
         axis_relief: 0.0
         stem_darken: 0.0
@@ -51,17 +48,16 @@ script_mod! {
 
         slug_dilate: fn(pos: vec2, tex: vec2, jac: vec4, normal: vec2) -> vec4 {
             let n = normalize(normal)
-            let s = dot(self.slug_matrix_3.xy, pos) + self.slug_matrix_3.w
-            let t = dot(self.slug_matrix_3.xy, n)
+            // Pass cameras are only set at paint time, so we can't bake this into a uniform while drawing.
+            let world_pos = self.draw_list.view_transform * vec4(pos.x, pos.y, 0.0, 1.0)
+            let world_n = self.draw_list.view_transform * vec4(n.x, n.y, 0.0, 0.0)
+            let hp = self.draw_pass.camera_projection * (self.draw_pass.camera_view * world_pos)
+            let hn = self.draw_pass.camera_projection * (self.draw_pass.camera_view * world_n)
+            let s = hp.w
+            let t = hn.w
 
-            let u = (
-                s * dot(self.slug_matrix_0.xy, n)
-                    - t * (dot(self.slug_matrix_0.xy, pos) + self.slug_matrix_0.w)
-            ) * self.slug_viewport_px.x
-            let v = (
-                s * dot(self.slug_matrix_1.xy, n)
-                    - t * (dot(self.slug_matrix_1.xy, pos) + self.slug_matrix_1.w)
-            ) * self.slug_viewport_px.y
+            let u = (s * hn.x - t * hp.x) * self.slug_viewport_px.x
+            let v = (s * hn.y - t * hp.y) * self.slug_viewport_px.y
 
             let s2 = s * s
             let st = s * t
@@ -393,43 +389,24 @@ script_mod! {
             let sample = self.pos
             let px_x = max(abs(dFdx(sample.x)) + abs(dFdy(sample.x)), 0.00001)
             let px_y = max(abs(dFdx(sample.y)) + abs(dFdy(sample.y)), 0.00001)
-            let alpha_base = if self.aa_4x4 > 0.5 {
-                let x0 = px_x * 0.125
-                let x1 = px_x * 0.375
-                let y0 = px_y * 0.125
-                let y1 = px_y * 0.375
-                let a0 = self.alpha_at(sample + vec2(-x1, -y1), px_x, px_y)
-                let a1 = self.alpha_at(sample + vec2(-x0, -y1), px_x, px_y)
-                let a2 = self.alpha_at(sample + vec2( x0, -y1), px_x, px_y)
-                let a3 = self.alpha_at(sample + vec2( x1, -y1), px_x, px_y)
-                let a4 = self.alpha_at(sample + vec2(-x1, -y0), px_x, px_y)
-                let a5 = self.alpha_at(sample + vec2(-x0, -y0), px_x, px_y)
-                let a6 = self.alpha_at(sample + vec2( x0, -y0), px_x, px_y)
-                let a7 = self.alpha_at(sample + vec2( x1, -y0), px_x, px_y)
-                let a8 = self.alpha_at(sample + vec2(-x1,  y0), px_x, px_y)
-                let a9 = self.alpha_at(sample + vec2(-x0,  y0), px_x, px_y)
-                let a10 = self.alpha_at(sample + vec2( x0,  y0), px_x, px_y)
-                let a11 = self.alpha_at(sample + vec2( x1,  y0), px_x, px_y)
-                let a12 = self.alpha_at(sample + vec2(-x1,  y1), px_x, px_y)
-                let a13 = self.alpha_at(sample + vec2(-x0,  y1), px_x, px_y)
-                let a14 = self.alpha_at(sample + vec2( x0,  y1), px_x, px_y)
-                let a15 = self.alpha_at(sample + vec2( x1,  y1), px_x, px_y)
-                clamp(
-                    (a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15)
-                        * 0.0625,
-                    0.0,
-                    1.0
-                )
-            } else if self.aa_2x2 > 0.5 {
-                let offset = vec2(px_x * 0.25, px_y * 0.25)
-                let a0 = self.alpha_at(sample + vec2(-offset.x, -offset.y), px_x, px_y)
-                let a1 = self.alpha_at(sample + vec2(offset.x, -offset.y), px_x, px_y)
-                let a2 = self.alpha_at(sample + vec2(-offset.x, offset.y), px_x, px_y)
-                let a3 = self.alpha_at(sample + vec2(offset.x, offset.y), px_x, px_y)
-                clamp((a0 + a1 + a2 + a3) * 0.25, 0.0, 1.0)
-            } else {
-                self.alpha_at(sample, px_x, px_y)
+            // Some drivers (like Mali's) inline every call to alpha_at,
+            // so we keep it to a single call inside this loop.
+            let sample_step = if self.aa_4x4 > 0.5 { 0.25 } else if self.aa_2x2 > 0.5 { 0.5 } else { 1.0 }
+            let first_offset = sample_step * 0.5 - 0.5
+            var alpha_sum = 0.0
+            var row = 0.0
+            loop {
+                if row >= 1.0 { break }
+                var col = 0.0
+                loop {
+                    if col >= 1.0 { break }
+                    let offset = vec2(col + first_offset, row + first_offset) * vec2(px_x, px_y)
+                    alpha_sum = alpha_sum + self.alpha_at(sample + offset, px_x, px_y)
+                    col = col + sample_step
+                }
+                row = row + sample_step
             }
+            let alpha_base = clamp(alpha_sum * sample_step * sample_step, 0.0, 1.0)
             let darken = clamp(max(px_x, px_y) * self.stem_darken, 0.0, self.stem_darken_max)
             let edge_weight = clamp(1.0 - abs(alpha_base * 2.0 - 1.0), 0.0, 1.0)
             let alpha = clamp(alpha_base + darken * edge_weight, 0.0, 1.0)
@@ -1033,14 +1010,6 @@ impl DrawGlyph {
     fn update_draw_vars(&mut self, cx: &mut Cx2d) {
         self.ensure_initialized();
         self.upload_textures(cx.cx.cx);
-        let pass_id = cx.pass_stack.last().unwrap().pass_id;
-        let draw_list_id = *cx.draw_list_stack.last().unwrap();
-        let pass_uniforms = cx.passes[pass_id].pass_uniforms.clone();
-        let view_transform = cx.draw_lists[draw_list_id]
-            .draw_list_uniforms
-            .view_transform;
-        let model_view = Mat4f::mul(&pass_uniforms.camera_view, &view_transform);
-        let slug_matrix = Mat4f::mul(&pass_uniforms.camera_projection, &model_view);
         let viewport = cx.current_pass_size();
         let dpi_factor = cx.current_dpi_factor() as f32;
         let viewport_px = [
@@ -1048,12 +1017,6 @@ impl DrawGlyph {
             (viewport.y as f32 * dpi_factor).max(1.0),
         ];
 
-        self.draw_vars
-            .set_uniform(cx.cx, live_id!(slug_matrix_0), &mat4_row(&slug_matrix, 0));
-        self.draw_vars
-            .set_uniform(cx.cx, live_id!(slug_matrix_1), &mat4_row(&slug_matrix, 1));
-        self.draw_vars
-            .set_uniform(cx.cx, live_id!(slug_matrix_3), &mat4_row(&slug_matrix, 3));
         self.draw_vars
             .set_uniform(cx.cx, live_id!(slug_viewport_px), &viewport_px);
         self.draw_vars.texture_slots[0] = self.curve_texture.clone();
@@ -1143,10 +1106,6 @@ fn normalize_point(p: P2, bounds: BBox, inv_w: f32, inv_h: f32) -> P2 {
     }
 }
 
-fn mat4_row(mat: &Mat4f, row: usize) -> [f32; 4] {
-    [mat.v[row], mat.v[row + 4], mat.v[row + 8], mat.v[row + 12]]
-}
-
 fn path_to_quads(path: &VectorPath) -> (Vec<QuadCurve>, BBox) {
     let mut curves = Vec::new();
     let mut bounds = BBox::default();
@@ -1207,7 +1166,7 @@ fn push_quad(curves: &mut Vec<QuadCurve>, bounds: &mut BBox, curve: QuadCurve) {
     curves.push(curve);
 }
 
-fn band_range(
+pub(crate) fn band_range(
     min_value: f32,
     max_value: f32,
     bands_f: f32,

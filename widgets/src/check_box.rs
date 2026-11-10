@@ -535,6 +535,10 @@ impl Widget for CheckBox {
             self.animator_cut(cx, ids!(hover.off));
         }
 
+        if self.animator_in_state(cx, ids!(disabled.on)) {
+            return;
+        }
+
         match event.hits(cx, self.draw_bg.area()) {
             Hit::KeyFocus(_) => {
                 self.animator_play(cx, ids!(focus.on));

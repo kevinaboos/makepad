@@ -28,7 +28,7 @@ use {
                 macos::{
                     macos_app::{
                         activate_cocoa_window_on_pointer_down, init_macos_app_global,
-                        with_macos_app, MacosApp,
+                        set_native_appearance, with_macos_app, MacosApp,
                     },
                     macos_event::MacosEvent,
                     macos_window::MacosWindow,
@@ -75,6 +75,9 @@ const OCCLUSION_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 /// reduce a non-key/occluded view's display-link callbacks to roughly 12 Hz;
 /// a captured drag must retain the panel's full refresh cadence.
 const POINTER_CAPTURE_TIMER_ID: u64 = u64::MAX;
+
+/// A one-shot that runs the next `time_fps` frame's beat while the paint clock is stopped.
+const TIME_FPS_TIMER_ID: u64 = u64::MAX - 2;
 
 fn fastest_display_interval() -> f64 {
     unsafe {
@@ -673,6 +676,7 @@ impl Cx {
             }
         }));
 
+        cx.borrow_mut().os.refresh_interval = fastest_display_interval();
         cx.borrow_mut().call_event_handler(&Event::Startup);
         cx.borrow_mut().redraw_all();
         // Start timer if there's initial work after startup
@@ -703,7 +707,13 @@ impl Cx {
             }
         }
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        let time_now = self
+            .os
+            .link_flip_time
+            .unwrap_or_else(|| with_macos_app(|app| app.time_now()));
+        // Timer beats pass the refresh interval too, so a rate too fast to skip frames
+        // goes every frame from its first paint.
+        self.compute_pass_repaint_order(&mut passes_todo, time_now, self.os.refresh_interval);
         // A beat with nothing to paint still services the backend's
         // retirement debt (the maintenance a paint used to carry): it never
         // dirties a pass, and its receipt lets the app's wake stop.
@@ -730,10 +740,6 @@ impl Cx {
             return;
         }
         self.repaint_id += 1;
-        let time_now = self
-            .os
-            .link_flip_time
-            .unwrap_or_else(|| with_macos_app(|app| app.time_now()));
         let pass_time = self.pass_time(time_now);
         let scope = self.os.link_scope;
         for draw_pass_id in &passes_todo {
@@ -1123,7 +1129,10 @@ impl Cx {
                     self.sploded_recover_after_panic();
                     self.redraw_all();
                 }
-                if te.timer_id == 0 || te.timer_id == POINTER_CAPTURE_TIMER_ID {
+                if te.timer_id == TIME_FPS_TIMER_ID {
+                    self.os.time_fps_wake = None;
+                }
+                if te.timer_id == 0 || te.timer_id == POINTER_CAPTURE_TIMER_ID || te.timer_id == TIME_FPS_TIMER_ID {
                     // Catch paint-clock stalls in the
                     // act — was the gap a LATE FIRE (runloop starved / OS
                     // deferred the NSTimer) or a SLOW CALLBACK (our work)?
@@ -1134,7 +1143,8 @@ impl Cx {
                         }
                         let now = std::time::Instant::now();
                         LAST_FIRE.with(|last| {
-                            if let Some(prev) = last.replace(Some(now)) {
+                            let prev = last.replace(Some(now)).filter(|_| te.timer_id != TIME_FPS_TIMER_ID);
+                            if let Some(prev) = prev {
                                 let gap_ms = prev.elapsed().as_secs_f64() * 1000.0;
                                 if gap_ms > 20.0 {
                                     crate::trace!("timer", "fire-to-fire gap {:.1}ms", gap_ms);
@@ -1365,6 +1375,7 @@ impl Cx {
             MacosEvent::LinkFire {
                 window,
                 time,
+                period,
                 primary,
                 drawable: _,
                 target_presentation_time,
@@ -1372,6 +1383,9 @@ impl Cx {
                 self.os.link_scope = Some(window as usize);
                 self.os.link_flip_time = Some(time);
                 self.os.link_target_presentation_time = target_presentation_time;
+                if period > 0.0 {
+                    self.os.refresh_interval = period;
+                }
                 let flow = if primary {
                     // The primary link drives the WHOLE beat — identical to
                     // the timer-0 path (signals, actions, next-frames, then
@@ -1535,6 +1549,12 @@ impl Cx {
 
                 // ok here we send out to all our childprocesses
                 self.handle_repaint(metal_windows, metal_cx);
+                // A `time_fps` frame that got skipped is a dirty pass, not a due the timer wakes for,
+                // so we restart the paint clock rather than leave it to the 0.2 s heartbeat.
+                if !self.os.timer0_armed && self.any_passes_dirty() {
+                    self.os.timer0_idle_since = None;
+                    self.ensure_timer0_started();
+                }
             }
             MacosEvent::MouseDown(mut e) => {
                 if !self.windows.is_valid(e.window_id) || !self.windows[e.window_id].is_created {
@@ -1688,6 +1708,16 @@ impl Cx {
             }
         }
 
+        let time_fps_wake = self.time_repaint_at().filter(|_| !self.os.timer0_armed);
+        if self.os.time_fps_wake != time_fps_wake {
+            self.os.time_fps_wake = time_fps_wake;
+            with_macos_app(|app| {
+                app.stop_timer(TIME_FPS_TIMER_ID);
+                if let Some(wake) = time_fps_wake {
+                    app.start_timer(TIME_FPS_TIMER_ID, (wake - app.time_now()).max(0.0), false);
+                }
+            });
+        }
         // Determine the event flow based on whether we have work to do.
         if self.os.timer0_armed {
             // The paint clock is armed — display link, its timer fallback,
@@ -2204,6 +2234,9 @@ impl Cx {
                 CxOsOp::ShowInDock(show) => {
                     with_macos_app(|app| app.show_in_dock(show));
                 }
+                CxOsOp::SetNativeAppearance(appearance) => {
+                    set_native_appearance(appearance);
+                }
                 CxOsOp::CheckPermission {
                     permission,
                     request_id,
@@ -2639,6 +2672,10 @@ pub struct CxOs {
     remote_present_waiting: Option<(WindowId, Instant)>,
     /// Start time of the current idle stretch while timer0 is armed.
     pub(crate) timer0_idle_since: Option<f64>,
+    /// How far apart the display's flips are, from the fastest screen till the link measures them.
+    pub(crate) refresh_interval: f64,
+    /// When the `time_fps` one-shot will fire, if it's set.
+    pub(crate) time_fps_wake: Option<f64>,
     pub(crate) media: CxAppleMedia,
     pub(crate) bytes_written: usize,
     pub(crate) draw_calls_done: usize,

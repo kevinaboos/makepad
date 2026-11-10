@@ -545,6 +545,7 @@ pub struct CxVulkan {
     retained_prune_repaint: u64,
     retained_transfer_generation: u64,
     textures: HashMap<VulkanTextureKey, VulkanTextureResource>,
+    max_image_dimension_2d: u32,
     frame_resources: FrameResources,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
@@ -919,6 +920,7 @@ impl CxVulkan {
             retained_prune_repaint: u64::MAX,
             retained_transfer_generation: 0,
             textures: HashMap::new(),
+            max_image_dimension_2d: props.limits.max_image_dimension2_d,
             frame_resources: FrameResources::default(),
             command_pool,
             command_buffer,
@@ -1329,6 +1331,7 @@ impl CxVulkan {
             retained_prune_repaint: u64::MAX,
             retained_transfer_generation: 0,
             textures: HashMap::new(),
+            max_image_dimension_2d: props.limits.max_image_dimension2_d,
             frame_resources: FrameResources::default(),
             command_pool,
             command_buffer,
@@ -4153,6 +4156,7 @@ impl CxVulkan {
     ) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         self.release_retired_shared_frames();
+        cx.gpu_info.max_texture_size = self.max_image_dimension_2d as usize;
         let mut seen = HashSet::<VulkanTextureKey>::new();
         self.prepare_draw_list_textures_inner(cx, draw_list_id, &mut seen)
     }
@@ -6582,8 +6586,8 @@ impl CxVulkan {
                 };
 
                 if sh.mapping.uses_time {
-                    cx.demo_time_repaint = true;
-                    cx.passes[draw_pass_id].repaint_next = true;
+                    cx.demo_time_repaint |= cx.passes[draw_pass_id]
+                        .request_time_repaint(draw_call.options.time_fps, &mut cx.time_fps_clock);
                 }
 
                 draw_call.resolve_zbias(*zbias, sploded, uniforms_gen);

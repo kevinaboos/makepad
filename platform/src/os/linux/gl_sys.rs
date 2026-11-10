@@ -76,6 +76,7 @@ pub const BLEND: GLenum = 0x0BE2;
 pub const FRAMEBUFFER: GLenum = 0x8D40;
 pub const COLOR_BUFFER_BIT: GLenum = 0x00004000;
 pub const DEPTH_BUFFER_BIT: GLenum = 0x00000100;
+pub const STENCIL_BUFFER_BIT: GLenum = 0x00000400;
 pub const RENDERBUFFER: GLenum = 0x8D41;
 pub const DEPTH_COMPONENT16: GLenum = 0x81A5;
 pub const DEPTH_COMPONENT24: GLenum = 0x81A6;
@@ -123,6 +124,7 @@ pub const TEXTURE_WRAP_R: GLenum = 0x8072;
 pub const CLAMP_TO_EDGE: GLenum = 0x812F;
 pub const CLAMP_TO_BORDER: GLenum = 0x812D;
 pub const PROGRAM_BINARY_LENGTH: GLenum = 0x8741;
+pub const PROGRAM_BINARY_RETRIEVABLE_HINT: GLenum = 0x8257;
 pub const MAX_SHADER_COMPILER_THREADS_KHR: GLenum = 0x91B0;
 pub const COMPLETION_STATUS_KHR: GLenum = 0x91B1;
 pub const NO_ERROR: GLenum = 0x0;
@@ -137,6 +139,7 @@ pub const PACK_SKIP_ROWS: GLenum = 0x0D03;
 pub const DRAW_FRAMEBUFFER: GLenum = 0x8CA9;
 pub const TEXTURE_EXTERNAL_OES: GLenum = 0x8D65;
 pub const EXTENSIONS: GLenum = 0x1F03;
+pub const MAX_TEXTURE_SIZE: GLenum = 0x0D33;
 pub const VENDOR: GLenum = 0x1F00;
 pub const RENDERER: GLenum = 0x1F01;
 pub const VERSION: GLenum = 0x1F02;
@@ -305,6 +308,7 @@ pub type TglSamplerParameteri =
     unsafe extern "C" fn(sampler: GLuint, pname: GLenum, param: GLint) -> ();
 pub type TglFlush = unsafe extern "C" fn() -> ();
 pub type TglFinish = unsafe extern "C" fn() -> ();
+pub type TglGetIntegerv = unsafe extern "C" fn(pname: GLenum, data: *mut GLint) -> ();
 /// `glWaitSync` — wait on a share-group `GLsync` in the current context.
 pub type TglWaitSync =
     unsafe extern "C" fn(sync: *const raw::c_void, flags: GLbitfield, timeout: u64) -> ();
@@ -322,6 +326,8 @@ pub type TglProgramBinary = unsafe extern "C" fn(
     binary: *const raw::c_void,
     length: GLsizei,
 ) -> ();
+pub type TglProgramParameteri =
+    unsafe extern "C" fn(program: GLuint, pname: GLenum, value: GLint) -> ();
 pub type TglDeleteRenderbuffers =
     unsafe extern "C" fn(n: GLsizei, renderbuffers: *const GLuint) -> ();
 pub type TglDeleteBuffers = unsafe extern "C" fn(n: GLsizei, buffers: *const GLuint) -> ();
@@ -478,10 +484,12 @@ pub struct LibGl {
     pub glReadPixels: TglReadPixels,
     pub glFlush: TglFlush,
     pub glFinish: TglFinish,
+    pub glGetIntegerv: TglGetIntegerv,
     pub glWaitSync: Option<TglWaitSync>,
     pub glIsTexture: Option<TglIsTexture>,
     pub glGetProgramBinary: TglGetProgramBinary,
     pub glProgramBinary: TglProgramBinary,
+    pub glProgramParameteri: Option<TglProgramParameteri>,
     pub glDeleteTextures: TglDeleteTextures,
     pub glDeleteRenderbuffers: TglDeleteRenderbuffers,
     pub glDeleteBuffers: TglDeleteBuffers,
@@ -768,6 +776,7 @@ impl LibGl {
             glSamplerParameteri: load!(loadfn, TglSamplerParameteri, "glSamplerParameteri").ok(),
             glFlush: load!(loadfn, TglFlush, "glFlush")?,
             glFinish: load!(loadfn, TglFinish, "glFinish")?,
+            glGetIntegerv: load!(loadfn, TglGetIntegerv, "glGetIntegerv")?,
             glWaitSync: load!(loadfn, TglWaitSync, "glWaitSync").ok(),
             glIsTexture: load!(loadfn, TglIsTexture, "glIsTexture").ok(),
             glClearDepthf: load!(loadfn, TglClearDepthf, "glClearDepthf", "glClearDepthfOES")?,
@@ -783,6 +792,7 @@ impl LibGl {
                 "glProgramBinary",
                 "glProgramBinaryOES"
             )?,
+            glProgramParameteri: load!(loadfn, TglProgramParameteri, "glProgramParameteri").ok(),
             glDeleteRenderbuffers: load!(
                 loadfn,
                 TglDeleteRenderbuffers,

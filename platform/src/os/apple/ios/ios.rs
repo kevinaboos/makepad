@@ -2,7 +2,7 @@ use {
     crate::{
         cx::{Cx, IosParams, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace, ScreenEdges},
-        draw_pass::CxDrawPassParent,
+        draw_pass::{CxDrawPassParent, TickClock},
         event::{
             drag_drop::{DragEvent, DragItem, DragResponse, DropEvent},
             video_playback::{
@@ -556,7 +556,7 @@ impl Cx {
             return;
         }
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        self.compute_pass_repaint_order(&mut passes_todo, self.os.draw_ticks.last, self.os.draw_ticks.interval);
         self.queue_popup_parents(&mut passes_todo);
         self.repaint_id += 1;
         for draw_pass_id in &passes_todo {
@@ -736,6 +736,8 @@ impl Cx {
                 } else if te.timer_id == ios_app::IOS_TEXT_EVENT_DRAIN_TIMER_ID {
                     with_ios_app(|app| app.text_event_drain_timer_scheduled = false);
                     self.drain_ios_text_events();
+                } else if te.timer_id == ios_app::IOS_TIME_FPS_TIMER_ID {
+                    self.os.time_fps_wake = None;
                 }
             }
             _ => (),
@@ -771,6 +773,9 @@ impl Cx {
             }
             IosEvent::Background => {
                 self.call_event_handler(&Event::Background);
+                // No repaint comes now, so what the app just released can't wait for one.
+                self.poll_texture_lifetimes();
+                metal_cx.clear_staging_pool();
             }
             IosEvent::Pause => {
                 self.call_event_handler(&Event::Pause);
@@ -804,6 +809,7 @@ impl Cx {
                 self.redraw_all();
             }
             IosEvent::Paint => {
+                self.os.draw_ticks.tick(with_ios_app(|app| app.time_now()));
                 // Poll video players for new frames and preparation status
                 if !self.os.video_players.is_empty() {
                     let mut video_events = Vec::new();
@@ -1035,7 +1041,7 @@ impl Cx {
                     }
                 }
 
-                self.fingers.process_touch_update_end(&e.touches);
+                self.end_touch_update(&e.touches);
             }
             IosEvent::LongPress(mut e) => {
                 e.abs = self.windows[e.window_id].native_vec2d_to_layout(e.abs);
@@ -1095,7 +1101,10 @@ impl Cx {
             IosEvent::TextCopy(e) => self.call_event_handler(&Event::TextCopy(e)),
             IosEvent::TextCut(e) => self.call_event_handler(&Event::TextCut(e)),
             IosEvent::Timer(e) => {
-                if e.timer_id != 0 && e.timer_id != ios_app::IOS_TEXT_EVENT_DRAIN_TIMER_ID {
+                if e.timer_id != 0
+                    && e.timer_id != ios_app::IOS_TEXT_EVENT_DRAIN_TIMER_ID
+                    && e.timer_id != ios_app::IOS_TIME_FPS_TIMER_ID
+                {
                     self.handle_script_timer(&e);
                     self.call_event_handler(&Event::Timer(e))
                 }
@@ -1115,16 +1124,32 @@ impl Cx {
             self.run_live_edit_if_needed("ios");
         }
 
-        if self.any_passes_dirty()
+        let wake = self.time_repaint_tick_wake(self.os.draw_ticks.last, self.os.draw_ticks.interval);
+        let now = wake.map(|_| with_ios_app(|app| app.time_now()));
+        let is_poll = self.any_passes_dirty()
             || self.need_redrawing()
             || self.new_next_frames.len() != 0
             || paint_dirty
             || self.demo_time_repaint
             || !self.os.video_players.is_empty()
             || !self.os.camera_players.is_empty()
-        {
+            || wake.zip(now).is_some_and(|(wake, now)| wake <= now);
+        // While the view sleeps, a one-shot unpauses it in time for the draw the next `time_fps` frame
+        // lands on, since timer 0's 8 ms can miss a 120 Hz tick.
+        let time_fps_wake = wake.filter(|_| !is_poll);
+        if self.os.time_fps_wake != time_fps_wake {
+            self.os.time_fps_wake = time_fps_wake;
+            with_ios_app(|app| {
+                app.stop_timer(ios_app::IOS_TIME_FPS_TIMER_ID);
+                if let (Some(wake), Some(now)) = (time_fps_wake, now) {
+                    app.start_timer(ios_app::IOS_TIME_FPS_TIMER_ID, wake - now, false);
+                }
+            });
+        }
+        if is_poll {
             EventFlow::Poll
         } else {
+            self.os.draw_ticks.pause();
             EventFlow::Wait
         }
     }
@@ -1608,6 +1633,9 @@ impl Cx {
                 CxOsOp::SetSystemBarDarkIcons(dark_icons) => {
                     IosApp::set_status_bar_dark_icons(dark_icons);
                 }
+                CxOsOp::SetNativeAppearance(appearance) => {
+                    IosApp::set_native_appearance(appearance);
+                }
                 CxOsOp::DeferSystemGestures(edges) => {
                     IosApp::set_deferred_system_gesture_edges(ui_rect_edges(edges));
                 }
@@ -1920,6 +1948,10 @@ pub struct CxOs {
     pub(crate) native_camera_previews: HashMap<LiveId, IosNativeCameraPreview>,
     pub(crate) system_browsers: HashMap<LiveId, IosSystemBrowser>,
     pub(crate) internal_drag_items: Option<Arc<Vec<DragItem>>>,
+    /// The view's draws, which `time_fps` frames land on.
+    pub(crate) draw_ticks: TickClock,
+    /// When the `time_fps` one-shot will fire, if it's set.
+    pub(crate) time_fps_wake: Option<f64>,
 }
 
 pub struct PermissionResultChannel {

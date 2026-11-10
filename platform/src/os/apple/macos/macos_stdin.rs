@@ -92,7 +92,7 @@ impl Cx {
     ) {
         //self.demo_time_repaint = false;
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        self.compute_pass_repaint_order(&mut passes_todo, time, 0.0);
         self.repaint_id += 1;
         let pass_time = self.pass_time(time);
         for &draw_pass_id in &passes_todo {

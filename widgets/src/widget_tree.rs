@@ -149,14 +149,14 @@ struct WidgetTreeInner {
     subtree_end: Vec<u32>,
     skip_search: Vec<bool>,
     nodes: Vec<WidgetTreeNode>,
-    uid_map: HashMap<WidgetUid, u32>,
+    uid_map: FastHashMap<WidgetUid, u32>,
 
     root_uid: WidgetUid,
 
     // Persistent graph, lazily synced from WidgetNode::children()
-    graph: HashMap<WidgetUid, GraphNode>,
+    graph: FastHashMap<WidgetUid, GraphNode>,
     // Per-entrypoint path cache keyed by xor-combined path hash.
-    path_cache: HashMap<WidgetUid, HashMap<u64, Vec<PathCacheEntry>>>,
+    path_cache: FastHashMap<WidgetUid, FastHashMap<u64, Vec<PathCacheEntry>>>,
     /// Bumped by every invalidation that could turn a cached MISS into a
     /// hit (a node appearing, being renamed, re-parented, becoming
     /// searchable). A walk snapshots it and only writes its result back if
@@ -164,7 +164,7 @@ struct WidgetTreeInner {
     /// discoveries could persist a stale "not found" forever.
     path_cache_epoch: u64,
     stats: WidgetTreeStats,
-    dirty: HashSet<WidgetUid>,
+    dirty: FastHashSet<WidgetUid>,
     // Only set when tree topology changes (nodes added/removed, parent changes).
     // Property-only changes (name, widget ref, skip_search) are patched in-place.
     structure_dirty: bool,
@@ -180,7 +180,7 @@ struct WidgetTreeInner {
     ///
     /// They get removed once nothing in them is alive, or along with their parent. Most apps never
     /// have any, so these live apart from the graph's nodes and only get looked at if there are some.
-    detached: HashMap<WidgetUid, Vec<WidgetUid>>,
+    detached: FastHashMap<WidgetUid, Vec<WidgetUid>>,
 }
 
 struct WidgetTreeNode {
@@ -2998,8 +2998,8 @@ struct UiRoot {
     active_path: RefCell<Vec<WidgetWeakRef>>,
 }
 
-fn cancel_scope_resolver(cx: &Cx, candidate: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
-    cx.get_global_ref::<UiRoot>()?.widget.upgrade()?.resolve_cancel_scope(candidate)
+fn cancel_scope_resolver(cx: &Cx, swipe_window: Option<WindowId>, candidate: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
+    cx.get_global_ref::<UiRoot>()?.widget.upgrade()?.resolve_cancel_scope(swipe_window, candidate)
 }
 
 pub fn set_ui_root(cx: &mut Cx, ui: &WidgetRef) {

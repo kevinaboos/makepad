@@ -4,7 +4,7 @@ use {
         geom::{Point, Rect, Size},
         glyph_outline::{Command, GlyphOutline},
     },
-    crate::makepad_platform::*,
+    crate::{makepad_platform::*, shader::draw_glyph::band_range},
     fxhash::{FxHashMap, FxHashSet},
 };
 
@@ -13,6 +13,10 @@ const BAND_TEX_WIDTH: usize = 2048;
 const CUBIC_TO_QUAD_TOLERANCE: f32 = 0.05;
 const MAX_CUBIC_SPLIT_DEPTH: usize = 12;
 const RGBA_F32_TEXEL_FLOATS: usize = 4;
+/// Where the padding quad sits, far above and left of every glyph's unit box.
+const PAD_POINT: f32 = -65536.0;
+/// Slack around a curve's span when we sort it into bands, as a fraction of the glyph's box.
+const BAND_EPSILON: f32 = 1.0 / 1024.0;
 /// Soft cap on the append-only `curve_data` buffer (~4 MB of f32). Slug glyphs are only
 /// used for very large text, so a realistic on-screen working set is far below this; the
 /// generous headroom means a reset (rebuild of all currently-visible glyphs) only happens
@@ -58,6 +62,9 @@ pub enum SlugGlyphCacheResult {
 pub struct SlugAtlas {
     curve_data: Vec<f32>,
     band_data: Vec<f32>,
+    // We keep these between glyphs so building a glyph's bands doesn't allocate.
+    band_lists: [Vec<Vec<usize>>; 2],
+    curve_reaches: Vec<f32>,
     curve_texture: Texture,
     band_texture: Texture,
     curve_dirty: bool,
@@ -66,6 +73,8 @@ pub struct SlugAtlas {
     band_uploaded_floats: usize,
     cache_generation: u64,
     uploaded_generation: u64,
+    pub(super) glyphs_built: u64,
+    pub(super) upload_bytes: u64,
     cached_glyphs: FxHashMap<SlugGlyphKey, CachedSlugGlyphInfo>,
     missing_glyphs: FxHashSet<SlugGlyphKey>,
     empty_glyphs: FxHashSet<SlugGlyphKey>,
@@ -74,9 +83,11 @@ pub struct SlugAtlas {
 
 impl SlugAtlas {
     pub fn new(cx: &mut Cx) -> Self {
-        Self {
+        let atlas = Self {
             curve_data: Vec::new(),
             band_data: Vec::new(),
+            band_lists: [Vec::new(), Vec::new()],
+            curve_reaches: Vec::new(),
             curve_texture: Texture::new_with_format(
                 cx,
                 TextureFormat::VecRGBAf32 {
@@ -101,21 +112,28 @@ impl SlugAtlas {
             band_uploaded_floats: 0,
             cache_generation: 0,
             uploaded_generation: 0,
+            glyphs_built: 0,
+            upload_bytes: 0,
             cached_glyphs: FxHashMap::default(),
             missing_glyphs: FxHashSet::default(),
             empty_glyphs: FxHashSet::default(),
             needs_reset: false,
-        }
+        };
+        atlas.curve_texture.mark_as_append_only(cx);
+        atlas.band_texture.mark_as_append_only(cx);
+        atlas
     }
 
-    /// If a reset was requested (the curve buffer exceeded its cap), clear all cached glyph
-    /// data so it can be rebuilt from scratch, and report that a reset occurred. Mirrors the
-    /// raster atlas's `reset_if_needed`: the caller invokes this at a frame boundary (in
-    /// `Fonts::prepare_textures`, before any texture upload) and forces a full redraw, so no
-    /// stale `curve_offset` survives — all visible slug glyphs are re-built next frame.
-    pub fn reset_if_needed(&mut self) -> bool {
+    pub fn needs_reset(&self) -> bool {
+        self.needs_reset
+    }
+
+    /// Clears every cached glyph if the curve buffer passed its cap, so they rebuild from scratch.
+    ///
+    /// `Fonts::prepare_textures` calls this after a frame's upload, and the next frame redraws all.
+    pub fn reset_if_needed(&mut self) {
         if !self.needs_reset {
-            return false;
+            return;
         }
         self.needs_reset = false;
         self.curve_data.clear();
@@ -128,7 +146,6 @@ impl SlugAtlas {
         self.curve_dirty = true;
         self.band_dirty = true;
         self.cache_generation = self.cache_generation.wrapping_add(1);
-        true
     }
 
     pub fn curve_texture(&self) -> &Texture {
@@ -184,6 +201,7 @@ impl SlugAtlas {
             self.missing_glyphs.insert(key);
             return SlugGlyphCacheResult::Unavailable;
         };
+        self.glyphs_built += 1;
         let generation = self.cache_generation;
         self.cached_glyphs
             .insert(key, CachedSlugGlyphInfo { generation, info });
@@ -193,11 +211,14 @@ impl SlugAtlas {
         }
     }
 
-    pub fn prepare_textures(&mut self, cx: &mut Cx) -> bool {
-        let mut changed = false;
+    pub fn prepare_textures(&mut self, cx: &mut Cx) {
+        let new_floats = self.curve_data.len().saturating_sub(self.curve_uploaded_floats)
+            + self.band_data.len().saturating_sub(self.band_uploaded_floats);
+        self.upload_bytes += (new_floats * std::mem::size_of::<f32>()) as u64;
+        let is_dirty = self.curve_dirty || self.band_dirty;
 
         if self.curve_dirty {
-            changed |= Self::prepare_append_only_rgba_f32_texture(
+            Self::prepare_append_only_rgba_f32_texture(
                 cx,
                 &self.curve_texture,
                 CURVE_TEX_WIDTH,
@@ -208,7 +229,7 @@ impl SlugAtlas {
         }
 
         if self.band_dirty {
-            changed |= Self::prepare_append_only_rgba_f32_texture(
+            Self::prepare_append_only_rgba_f32_texture(
                 cx,
                 &self.band_texture,
                 BAND_TEX_WIDTH,
@@ -218,11 +239,9 @@ impl SlugAtlas {
             self.band_dirty = false;
         }
 
-        if changed {
+        if is_dirty {
             self.uploaded_generation = self.cache_generation;
         }
-
-        changed
     }
 
     fn prepare_append_only_rgba_f32_texture(
@@ -231,7 +250,7 @@ impl SlugAtlas {
         preferred_width: usize,
         source: &[f32],
         uploaded_floats: &mut usize,
-    ) -> bool {
+    ) {
         debug_assert_eq!(source.len() % RGBA_F32_TEXEL_FLOATS, 0);
 
         let new_width = if source.is_empty() {
@@ -256,10 +275,8 @@ impl SlugAtlas {
 
         // Only a WIDTH change requires re-laying-out the whole texture; the atlas is append-only,
         // so a height GROWTH leaves all existing rows in place and only the appended rows are
-        // dirty. Backends that must physically reallocate on a height change (GL `glTexImage2D`,
-        // Metal `replaceRegion`) re-upload everything regardless of the `Partial` flag; the D3D11
-        // backend keeps spare height capacity and honors `Partial`, uploading only the new rows
-        // via `UpdateSubresource` instead of recreating the (up to ~16 MB) texture every frame.
+        // dirty. Backends give this texture spare rows (see `CxTexture::is_append_only`), so they
+        // upload just those rows instead of the whole atlas.
         let width_changed = *width != new_width;
         let mut texture_data = data.take().unwrap_or_default();
         let had_texture_data = !texture_data.is_empty();
@@ -289,7 +306,6 @@ impl SlugAtlas {
             ))
         };
         *uploaded_floats = source.len();
-        true
     }
 
     fn appended_dirty_rect(
@@ -329,16 +345,80 @@ impl SlugAtlas {
             return None;
         }
 
+        // The text shader reads a glyph's curves from one texture row. We end them with a point
+        // quad that no ray ever crosses, which fills out the last group of each band list.
+        let texel_count = (curves.len() + 1) * 2;
+        // DrawTextSlug on Linux and Windows scans every curve, so it needs no bands or row limit.
+        let uses_bands = cfg!(not(any(target_os = "linux", target_os = "windows")));
+        if uses_bands && texel_count > CURVE_TEX_WIDTH {
+            return None;
+        }
+        start_new_row_if_needed(&mut self.curve_data, texel_count, CURVE_TEX_WIDTH);
         let curve_offset = self.curve_data.len() / 8;
         for curve in &curves {
             self.curve_data.extend_from_slice(&[
                 curve.p0.x, curve.p0.y, curve.p1.x, curve.p1.y, curve.p2.x, curve.p2.y, 0.0, 0.0,
             ]);
         }
+        self.curve_data.extend_from_slice(&[
+            PAD_POINT, PAD_POINT, PAD_POINT, PAD_POINT, PAD_POINT, PAD_POINT, 0.0, 0.0,
+        ]);
 
-        // Text rendering uses the full-curve scan path. The band-accelerated
-        // path has shown correctness issues on some GPU shader compilers.
-        let (band_offset, band_count) = (0, 0);
+        // The glyph's band block sits within one texture row. A band's texel holds where its
+        // H and V lists start and how many groups of 4 they have.
+        let (band_offset, band_count) = 'bands: {
+            if !uses_bands {
+                break 'bands (0, 0);
+            }
+            // List entries are curve texel offsets from the glyph's first curve.
+            let pad_entry = (curves.len() * 2) as f32;
+            // Fewer bands make a smaller block; one band always fits a glyph that fits in a curve row.
+            for band_count in [8, 4, 2, 1] {
+                let [h_lists, v_lists] = &mut self.band_lists;
+                let reaches = &mut self.curve_reaches;
+                build_band_lists(&curves, band_count, |p| p.y, |p| p.x, h_lists, reaches);
+                build_band_lists(&curves, band_count, |p| p.x, |p| p.y, v_lists, reaches);
+                let (h_lists, v_lists) = (&h_lists[..band_count], &v_lists[..band_count]);
+                let list_texels: usize = h_lists
+                    .iter()
+                    .chain(v_lists)
+                    .map(|list| list.len().div_ceil(4))
+                    .sum();
+                if band_count + list_texels > BAND_TEX_WIDTH {
+                    continue;
+                }
+
+                start_new_row_if_needed(
+                    &mut self.band_data,
+                    band_count + list_texels,
+                    BAND_TEX_WIDTH,
+                );
+                let band_offset = self.band_data.len() / RGBA_F32_TEXEL_FLOATS;
+                let meta_start = self.band_data.len();
+                self.band_data
+                    .resize(meta_start + band_count * RGBA_F32_TEXEL_FLOATS, 0.0);
+                let mut list_texel = band_count;
+                for (axis, lists) in [h_lists, v_lists].into_iter().enumerate() {
+                    for (band, list) in lists.iter().enumerate() {
+                        let groups = list.len().div_ceil(4);
+                        let meta = meta_start + band * RGBA_F32_TEXEL_FLOATS + axis * 2;
+                        self.band_data[meta] = list_texel as f32;
+                        self.band_data[meta + 1] = groups as f32;
+                        for chunk in list.chunks(4) {
+                            let mut texel = [pad_entry; 4];
+                            for (entry, index) in texel.iter_mut().zip(chunk) {
+                                *entry = (index * 2) as f32;
+                            }
+                            self.band_data.extend_from_slice(&texel);
+                        }
+                        list_texel += groups;
+                    }
+                }
+                self.band_dirty = true;
+                break 'bands (band_offset, band_count);
+            }
+            (0, 0)
+        };
         self.curve_dirty = true;
         self.cache_generation = self.cache_generation.wrapping_add(1);
 
@@ -358,6 +438,55 @@ impl SlugAtlas {
             band_count,
             fill_flags: 0,
         })
+    }
+}
+
+/// Pads `data` out to the next texture row when the next `texel_count` texels won't fit in this one.
+fn start_new_row_if_needed(data: &mut Vec<f32>, texel_count: usize, row_texels: usize) {
+    let row_texels_left = row_texels - (data.len() / RGBA_F32_TEXEL_FLOATS) % row_texels;
+    if texel_count > row_texels_left {
+        data.resize(data.len() + row_texels_left * RGBA_F32_TEXEL_FLOATS, 0.0);
+    }
+}
+
+/// Lists the curves a ray along `along` can cross in each band of `across`, furthest-reaching
+/// first, so the shader can stop once the rest of a list sits behind its sample.
+fn build_band_lists(
+    curves: &[QuadCurve],
+    band_count: usize,
+    across: impl Fn(P2) -> f32,
+    along: impl Fn(P2) -> f32,
+    lists: &mut Vec<Vec<usize>>,
+    reaches: &mut Vec<f32>,
+) {
+    if lists.len() < band_count {
+        lists.resize_with(band_count, Vec::new);
+    }
+    for list in &mut lists[..band_count] {
+        list.clear();
+    }
+    reaches.clear();
+    for (index, curve) in curves.iter().enumerate() {
+        reaches.push(along(curve.p0).max(along(curve.p1)).max(along(curve.p2)));
+        let [a, b, c] = [curve.p0, curve.p1, curve.p2].map(&across);
+        let (min, max) = (a.min(b).min(c), a.max(b).max(c));
+        // A ray only crosses a curve with points on both sides of it, so flat ones never count.
+        if min == max {
+            continue;
+        }
+        if let Some((lo, hi)) = band_range(
+            min - BAND_EPSILON,
+            max + BAND_EPSILON,
+            band_count as f32,
+            band_count,
+        ) {
+            for list in &mut lists[lo..=hi] {
+                list.push(index);
+            }
+        }
+    }
+    for list in &mut lists[..band_count] {
+        list.sort_by(|a, b| reaches[*b].total_cmp(&reaches[*a]));
     }
 }
 
@@ -768,31 +897,6 @@ mod tests {
                     panic!("unexpected unavailable result for {ch:?}");
                 }
             }
-        }
-    }
-
-    #[test]
-    fn text_slug_glyphs_use_full_curve_scan() {
-        let font = load_test_font();
-        let face = rustybuzz::ttf_parser::Face::parse(font.data().as_slice(), 0)
-            .expect("font face should parse");
-        let mut cx = Cx::new(Box::new(|_, _| {}));
-        let mut atlas = SlugAtlas::new(&mut cx);
-
-        for ch in ['A', 'g', 'W', 'S', 'L'] {
-            let glyph_id = face
-                .glyph_index(ch)
-                .unwrap_or_else(|| panic!("missing glyph for {ch:?}"))
-                .0;
-            let glyph = match atlas.get_or_cache_glyph(font.as_ref(), glyph_id, true) {
-                SlugGlyphCacheResult::NeedsUpload { glyph, .. }
-                | SlugGlyphCacheResult::Ready(glyph) => glyph,
-                other => panic!("unexpected glyph build result for {ch:?}: {other:?}"),
-            };
-            assert_eq!(
-                glyph.band_count, 0,
-                "text SLUG glyph {ch:?} should force the shader full-curve scan path"
-            );
         }
     }
 

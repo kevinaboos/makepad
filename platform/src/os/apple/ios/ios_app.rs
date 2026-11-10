@@ -1,6 +1,7 @@
 use {
     crate::{
         area::Area,
+        display_context::NativeAppearance,
         event::*,
         makepad_math::*,
         os::{
@@ -60,9 +61,21 @@ pub const UI_RETURN_KEY_DONE: i64 = 9;
 pub const UI_RETURN_KEY_EMERGENCY_CALL: i64 = 10;
 pub const UI_RETURN_KEY_CONTINUE: i64 = 11;
 
+// UIKeyboardAppearance
+pub const UI_KEYBOARD_APPEARANCE_DEFAULT: i64 = 0;
+pub const UI_KEYBOARD_APPEARANCE_DARK: i64 = 1;
+pub const UI_KEYBOARD_APPEARANCE_LIGHT: i64 = 2;
+
+// UIUserInterfaceStyle
+pub const UI_USER_INTERFACE_STYLE_UNSPECIFIED: i64 = 0;
+pub const UI_USER_INTERFACE_STYLE_LIGHT: i64 = 1;
+pub const UI_USER_INTERFACE_STYLE_DARK: i64 = 2;
+
 pub(crate) const IOS_TEXT_INPUT_CARET_HEIGHT: f64 = 20.0;
 pub(crate) const IOS_TEXT_INPUT_TARGET_HEIGHT: f64 = 32.0;
 pub const IOS_TEXT_EVENT_DRAIN_TIMER_ID: u64 = u64::MAX - 1;
+/// A one-shot that unpauses the view for the draw the next `time_fps` frame lands on.
+pub const IOS_TIME_FPS_TIMER_ID: u64 = u64::MAX - 2;
 
 // this value will be fetched from multiple threads (post signal uses it)
 pub static mut IOS_CLASSES: *const IosClasses = 0 as *const _;
@@ -191,6 +204,9 @@ pub struct IosApp {
     /// Last text the UITextView reported to makepad (via send_text_selection_changed),
     /// so set_ime_text can detect a newer in-flight user edit and not clobber it.
     pub last_forwarded_text: Option<String>,
+    /// The text and UTF-16 selection makepad last pushed, which the next show uses to fill
+    /// a recreated view. A hide wipes the view, so it drops this too.
+    pushed_ime_text: Option<(String, std::ops::Range<usize>)>,
     pub timer_delegate_instance: ObjcId,
     timers: Vec<IosTimer>,
     touches: Vec<TouchPoint>,
@@ -215,6 +231,8 @@ pub struct IosApp {
     last_keyboard_config: Option<crate::ime::TextInputConfig>,
     /// Root view controller for status bar / home indicator control
     pub view_controller: Option<ObjcId>,
+    window: Option<ObjcId>,
+    native_appearance: NativeAppearance,
     /// Native camera preview layers keyed by video_id.
     pub camera_preview_layers: HashMap<u64, ObjcId>,
     /// Selection handles overlayed over the MTK view (iOS 15+ custom implementation).
@@ -228,7 +246,10 @@ pub struct IosApp {
 /// text + caret), and attaches it to the MTKView. Used at startup and to
 /// re-create the view when leaving a secure field (iOS caches a sticky
 /// password/AutoFill tag on the text-input object).
-unsafe fn create_makepad_text_view(mtk_view_obj: ObjcId) -> ObjcId {
+unsafe fn create_makepad_text_view(
+    mtk_view_obj: ObjcId,
+    native_appearance: NativeAppearance,
+) -> ObjcId {
     let mtk_bounds: NSRect = msg_send![mtk_view_obj, bounds];
     let view: ObjcId = msg_send![get_ios_class_global().makepad_text_view, alloc];
     let view: ObjcId = msg_send![view, initWithFrame: mtk_bounds];
@@ -251,6 +272,7 @@ unsafe fn create_makepad_text_view(mtk_view_obj: ObjcId) -> ObjcId {
     let () = msg_send![view, setClipsToBounds: YES];
     // Drop the red misspelling underline; makepad renders the text itself.
     let () = msg_send![view, setSpellCheckingType: 1i64];
+    set_keyboard_appearance(view, native_appearance);
     let () = msg_send![view, setDelegate: view];
     let responds: BOOL = msg_send![view, respondsToSelector: sel!(setFocusEffect:)];
     if responds == YES {
@@ -268,6 +290,15 @@ unsafe fn create_makepad_text_view(mtk_view_obj: ObjcId) -> ObjcId {
     view
 }
 
+unsafe fn set_keyboard_appearance(text_view: ObjcId, appearance: NativeAppearance) {
+    let keyboard_appearance = match appearance {
+        NativeAppearance::System => UI_KEYBOARD_APPEARANCE_DEFAULT,
+        NativeAppearance::Light => UI_KEYBOARD_APPEARANCE_LIGHT,
+        NativeAppearance::Dark => UI_KEYBOARD_APPEARANCE_DARK,
+    };
+    let () = msg_send![text_view, setKeyboardAppearance: keyboard_appearance];
+}
+
 impl IosApp {
     pub fn new(
         metal_device: ObjcId,
@@ -283,6 +314,7 @@ impl IosApp {
                 queued_text_events: Vec::new(),
                 text_event_drain_timer_scheduled: false,
                 last_forwarded_text: None,
+                pushed_ime_text: None,
                 touches: Vec::new(),
                 last_window_geom: WindowGeom::default(),
                 metal_device,
@@ -302,6 +334,8 @@ impl IosApp {
                 physical_keyboard_connected,
                 last_keyboard_config: None,
                 view_controller: None,
+                window: None,
+                native_appearance: NativeAppearance::System,
                 camera_preview_layers: HashMap::new(),
                 selection_handle_start_view: None,
                 selection_handle_end_view: None,
@@ -445,7 +479,7 @@ impl IosApp {
 
             // Invisible real UITextView client: makepad renders text/caret, this owns
             // the system keyboard session. show_keyboard focuses it.
-            let makepad_text_view = create_makepad_text_view(mtk_view_obj);
+            let makepad_text_view = create_makepad_text_view(mtk_view_obj, self.native_appearance);
 
             // No UITextInteraction needed: arrow nav and auto-repeat come from
             // UIKeyCommand (see key_commands in ios_text_input.rs).
@@ -517,6 +551,7 @@ impl IosApp {
             let () = msg_send![window_obj, setRootViewController: view_ctrl_obj];
             self.view_controller = Some(view_ctrl_obj);
             let () = msg_send![window_obj, makeKeyAndVisible];
+            self.window = Some(window_obj);
 
             // Initialize UIEditMenuInteraction for clipboard actions (iOS 16+)
             let edit_menu_cls: ObjcId = makepad_objc_sys::runtime::objc_getClass(
@@ -852,6 +887,8 @@ impl IosApp {
             .try_with(|app| {
                 let mut app_ref = app.try_borrow_mut().ok()?;
                 let app = app_ref.as_mut()?;
+                // Every show takes it, since only the next one is sure to be for the field that pushed it.
+                let pushed_text = app.pushed_ime_text.take();
                 if app.last_keyboard_config.as_ref() == Some(config) {
                     return None;
                 }
@@ -864,18 +901,16 @@ impl IosApp {
                 app.last_keyboard_config = Some(*config);
                 if recreate {
                     // The fresh view starts empty at the origin: clear the cached
-                    // position (re-park next frame) and the freshness baseline so
-                    // makepad's re-push into the new view isn't dropped as stale.
+                    // position (re-park next frame).
                     app.makepad_text_view = None;
                     app.ime_position = None;
-                    app.last_forwarded_text = None;
                 }
-                Some((recreate, old_view, mtk))
+                Some((recreate, old_view, mtk, app.native_appearance, pushed_text))
             })
             .ok()
             .flatten();
 
-        let Some((recreate, old_view, mtk)) = plan else {
+        let Some((recreate, old_view, mtk, native_appearance, pushed_text)) = plan else {
             return;
         };
 
@@ -883,16 +918,37 @@ impl IosApp {
         let view = if recreate {
             if let (Some(old_view), Some(mtk)) = (old_view, mtk) {
                 let new_view = unsafe {
-                    // The old view was resigned in a prior drain and is now detached
-                    // with no strong refs; release balances its alloc+1.
+                    // This show may have cancelled the hide that would've resigned the old view, so we
+                    // resign it here, without sending makepad whatever it commits on the way out.
+                    let is_first_responder: BOOL = msg_send![old_view, isFirstResponder];
+                    if is_first_responder == YES {
+                        (*old_view).set_ivar::<BOOL>("programmatic_update", YES);
+                        let () = msg_send![old_view, resignFirstResponder];
+                    }
+                    // Once removed, the old view has no strong refs, so release balances its alloc+1.
                     let () = msg_send![old_view, removeFromSuperview];
                     let () = msg_send![old_view, release];
-                    create_makepad_text_view(mtk)
+                    let new_view = create_makepad_text_view(mtk, native_appearance);
+                    // Nothing re-pushes the field's text into the fresh view, so we fill it with makepad's
+                    // last push, or the first keystroke would leave the field holding just that character.
+                    if let Some((text, selection)) = &pushed_text {
+                        (*new_view).set_ivar::<BOOL>("programmatic_update", YES);
+                        let ns_text = str_to_nsstring(text);
+                        let () = msg_send![new_view, setText: ns_text];
+                        let range = NSRange {
+                            location: selection.start as u64,
+                            length: selection.len() as u64,
+                        };
+                        let () = msg_send![new_view, setSelectedRange: range];
+                        (*new_view).set_ivar::<BOOL>("programmatic_update", NO);
+                    }
+                    new_view
                 };
                 let _ = IOS_APP.try_with(|app| {
                     if let Ok(mut app_ref) = app.try_borrow_mut() {
                         if let Some(app) = app_ref.as_mut() {
                             app.makepad_text_view = Some(new_view);
+                            app.last_forwarded_text = pushed_text.map(|(text, _)| text);
                         }
                     }
                 });
@@ -1046,6 +1102,7 @@ impl IosApp {
                 if let Ok(mut app_ref) = app.try_borrow_mut() {
                     if let Some(app) = app_ref.as_mut() {
                         app.last_forwarded_text = None;
+                        app.pushed_ime_text = None;
                     }
                 }
             });
@@ -1124,8 +1181,9 @@ impl IosApp {
         // outside it (the writes' delegate callbacks can re-enter IOS_APP).
         let snapshot = IOS_APP
             .try_with(|app| {
-                app.try_borrow().ok().and_then(|app_ref| {
-                    let app = app_ref.as_ref()?;
+                app.try_borrow_mut().ok().and_then(|mut app_ref| {
+                    let app = app_ref.as_mut()?;
+                    app.pushed_ime_text = Some((text.clone(), selection_start_utf16..selection_end_utf16));
                     let view = app.makepad_text_view?;
                     Some((
                         view,
@@ -1471,6 +1529,39 @@ impl IosApp {
             unsafe {
                 (*vc).set_ivar::<i64>("_preferredStatusBarStyle", style);
                 let () = msg_send![vc, setNeedsStatusBarAppearanceUpdate];
+            }
+        }
+    }
+
+    pub fn set_native_appearance(appearance: NativeAppearance) {
+        let views = IOS_APP
+            .try_with(|app| {
+                let mut app_ref = app.try_borrow_mut().ok()?;
+                let app = app_ref.as_mut()?;
+                app.native_appearance = appearance;
+                Some((app.window, app.makepad_text_view))
+            })
+            .ok()
+            .flatten();
+        let Some((window, text_view)) = views else {
+            return;
+        };
+
+        let style = match appearance {
+            NativeAppearance::System => UI_USER_INTERFACE_STYLE_UNSPECIFIED,
+            NativeAppearance::Light => UI_USER_INTERFACE_STYLE_LIGHT,
+            NativeAppearance::Dark => UI_USER_INTERFACE_STYLE_DARK,
+        };
+        unsafe {
+            if let Some(window) = window {
+                let () = msg_send![window, setOverrideUserInterfaceStyle: style];
+            }
+            if let Some(text_view) = text_view {
+                set_keyboard_appearance(text_view, appearance);
+                let is_first_responder: BOOL = msg_send![text_view, isFirstResponder];
+                if is_first_responder == YES {
+                    let () = msg_send![text_view, reloadInputViews];
+                }
             }
         }
     }

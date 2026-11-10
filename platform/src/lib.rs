@@ -44,6 +44,7 @@ pub mod video_decode;
 pub mod video_encode;
 pub mod video_file;
 
+mod draw_damage;
 mod draw_list;
 pub mod retained_instances;
 pub mod recording_buffer;
@@ -161,7 +162,7 @@ pub use {
         cursor::MouseCursor,
         cx::{Cx, CxMemoryReport, CxRef, GpuBackend, LinuxWindowParams, OsType},
         cx_api::{AccessibilityUpdatePayload, CxOsApi, CxOsOp, CxThreadPriority, OpenUrlInPlace, ScreenEdges},
-        display_context::{DisplayContext, SystemBarAppearance},
+        display_context::{DisplayContext, NativeAppearance, SystemBarAppearance},
         font_policy::{
             extend_font_asset_manifest, font_asset_manifest_len, FontAsset, FontChain, FontPolicy,
             FontRole, FontSet, LazyFontAsset, LazyFontFamily, FONT_ASSET_MANIFEST_SECTION,
@@ -324,7 +325,7 @@ pub use {
     app_main::*,
     arc_string_mut::ArcStringMut,
     component_list::ComponentList,
-    component_map::ComponentMap,
+    component_map::{ComponentMap, FastHashMap, FastHashSet},
     //makepad_image_formats::image,
     log::*,
     makepad_math::makepad_micro_serde,

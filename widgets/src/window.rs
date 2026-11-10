@@ -310,8 +310,12 @@ pub struct Window {
     demo_next_frame: NextFrame,
     #[live]
     cursor_draw_list: DrawList2d,
+    /// Only `LinuxDirect` draws a cursor, so we build it from this template on its first draw
+    /// rather than compiling its shader on every platform.
     #[live]
-    draw_cursor: DrawQuad,
+    draw_cursor: ScriptObjectRef,
+    #[rust]
+    cursor_quad: Option<DrawQuad>,
     //#[live] debug_view: DebugView,
     //#[live] performance_view: PerformanceView,
     #[live]
@@ -433,6 +437,8 @@ impl ScriptHook for Window {
         _value: ScriptValue,
     ) {
         self.caption_has_content = None;
+        // The template may have changed (theme, live edit), so the cursor is rebuilt on its next draw.
+        self.cursor_quad = None;
         if !self.create_on_start && !self.initial_create_policy_applied {
             apply_initial_create_policy(vm.cx_mut(), &self.window.handle, false);
             self.initial_create_policy_applied = true;
@@ -672,15 +678,10 @@ impl SplodedStack {
         self.scene_pass.set_size(cx, size);
         cx.make_child_pass(&self.scene_pass);
         cx.begin_pass(&self.scene_pass, Some(dpi));
-        // The explode camera goes on THIS pass and nowhere else. Setting it
-        // here — before any content is emitted — also means the CPU-side slug
-        // text matrix, which bakes `camera_view` at draw time, is correct on
-        // the very first exploded frame instead of one frame late.
+        // The explode camera goes on THIS pass and nowhere else.
         let pass_id = self.scene_pass.draw_pass_id();
         let params = cx.sploded_params(size);
         cx.passes[pass_id].sploded = params;
-        let uniforms_gen = cx.next_uniform_gen();
-        cx.passes[pass_id].set_ortho_matrix(dvec2(0.0, 0.0), size, uniforms_gen);
         self.scene_draw_list.begin_always(cx);
         let pass_size = cx.current_pass_size();
         cx.begin_root_turtle(pass_size, Layout::flow_overlay());
@@ -1296,10 +1297,9 @@ impl Window {
                 pos: ev.abs - crate::cursor::hotspot(cx.mouse_cursor(), self.mouse_cursor_size),
                 size: self.mouse_cursor_size,
             };
-            if self.draw_cursor.draw_vars.area.is_valid(cx) {
-                self.draw_cursor.update_abs(cx, rect);
-            } else {
-                self.main_draw_list.redraw(cx);
+            match &mut self.cursor_quad {
+                Some(cursor_quad) if cursor_quad.draw_vars.area.is_valid(cx) => cursor_quad.update_abs(cx, rect),
+                _ => self.main_draw_list.redraw(cx),
             }
             trace!("input.cursor", "direct cursor position=({}, {}) shape={:?}", ev.abs.x, ev.abs.y, cx.mouse_cursor());
         }
@@ -1314,9 +1314,13 @@ impl Window {
         // Only the direct display owner draws a cursor, above every child.
         if let OsType::LinuxDirect = cx.os_type() {
             let shape = cx.mouse_cursor();
-            self.draw_cursor.draw_vars.set_dyn_instance(cx, id!(shape), &[crate::cursor::shape_value(shape)]);
+            let template: ScriptValue = self.draw_cursor.as_object().into();
+            let cursor_quad = self.cursor_quad.get_or_insert_with(|| {
+                cx.with_vm(|vm| DrawQuad::script_from_value(vm, template))
+            });
+            cursor_quad.draw_vars.set_dyn_instance(cx, id!(shape), &[crate::cursor::shape_value(shape)]);
             self.cursor_draw_list.begin_overlay_last(cx);
-            self.draw_cursor.draw_abs(cx, Rect {
+            cursor_quad.draw_abs(cx, Rect {
                 pos: self.last_mouse_pos - crate::cursor::hotspot(shape, self.mouse_cursor_size),
                 size: self.mouse_cursor_size,
             });
@@ -1700,9 +1704,15 @@ impl Widget for Window {
         (self.has_focus || !self.focus_known) && self.cancel_children_impl(visit)
     }
 
+    // A swipe belongs to the window it starts in, even one without focus, just like a scroll.
+    fn visit_cancel_for_swipe(&self, window_id: WindowId, visit: &mut dyn FnMut(LiveId, WidgetRef)) -> bool {
+        window_id == self.window.window_id() && self.cancel_children_impl(visit)
+    }
+
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.handle_direct_mouse_cursor(cx, event);
         crate::desktop_style::handle_event(cx, event);
+        crate::makepad_draw::text::fonts::handle_event(cx, event);
         if let Event::Custom(json) = event {
             if let Some(keyboard) = makepad_platform::ime::HostedKeyboard::parse(json) {
                 if keyboard.dismiss { cx.text_ime_was_dismissed(); }

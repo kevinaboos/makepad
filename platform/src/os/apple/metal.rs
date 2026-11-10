@@ -643,8 +643,8 @@ impl Cx {
                 }
 
                 if sh.mapping.uses_time {
-                    self.demo_time_repaint = true;
-                    self.passes[draw_pass_id].repaint_next = true;
+                    self.demo_time_repaint |= self.passes[draw_pass_id]
+                        .request_time_repaint(draw_call.options.time_fps, &mut self.time_fps_clock);
                 }
 
                 let encoder = encoders.group(draw_call.draw_shader_id.index, sh);
@@ -2973,6 +2973,15 @@ impl MetalCx {
         }
     }
 
+    pub(crate) fn clear_staging_pool(&self) {
+        let mut pool = self.staging_pool.borrow_mut();
+        pool.extend(self.staging_returned.try_iter());
+        let bytes = pool.iter().map(|staging| staging.len).sum();
+        self.staging_returner.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        self.staging_returner.count.fetch_sub(pool.len(), Ordering::AcqRel);
+        pool.clear();
+    }
+
     /// The smallest pooled staging buffer that fits `len`, or a fresh one.
     /// Fresh buffers round up to 64 KiB so sizes cluster and a returned
     /// buffer fits the next upload of the same texture.
@@ -3027,6 +3036,10 @@ impl Cx {
         command_buffer: ObjcId,
         pan_frame: Option<&mut PanFrame>,
     ) -> u64 {
+        if std::mem::take(&mut self.textures.1.has_stale_metal_staging) {
+            self.poll_texture_lifetimes();
+            metal_cx.clear_staging_pool();
+        }
         let mut enc = VecUploadEncoder::new(command_buffer, pan_frame);
         let mut stack: Vec<DrawListId> = vec![draw_list_id];
         while let Some(list_id) = stack.pop() {
@@ -5483,7 +5496,16 @@ impl CxTexture {
     /// touches the texture from the CPU: that is what raced the in-flight
     /// readers. Returns the bytes uploaded.
     fn update_vec_texture(&mut self, metal_cx: &MetalCx, enc: &mut VecUploadEncoder) -> u64 {
-        if self.alloc_vec() {
+        // An append-only texture keeps its storage while it still has room for the new size.
+        let needs_new_texture = self.alloc_vec()
+            && !(self.is_append_only
+                && self.os.texture.as_ref().is_some_and(|texture| {
+                    let alloc = self.alloc.as_ref().unwrap();
+                    let width: u64 = unsafe { msg_send![texture.as_id(), width] };
+                    let height: u64 = unsafe { msg_send![texture.as_id(), height] };
+                    width == alloc.width as u64 && height >= alloc.height as u64
+                }));
+        if needs_new_texture {
             let alloc = self.alloc.as_ref().unwrap();
 
             let descriptor = RcObjcId::from_owned(
@@ -5501,8 +5523,13 @@ impl CxTexture {
                 unsafe { msg_send![descriptor.as_id(), setStorageMode: MTLStorageMode::Private] };
             let _: () =
                 unsafe { msg_send![descriptor.as_id(), setUsage: MTLTextureUsage::ShaderRead] };
+            let height = if self.is_append_only {
+                Self::get_append_only_capacity(alloc.height)
+            } else {
+                alloc.height
+            };
             let _: () = unsafe { msg_send![descriptor.as_id(), setWidth: alloc.width as u64] };
-            let _: () = unsafe { msg_send![descriptor.as_id(), setHeight: alloc.height as u64] };
+            let _: () = unsafe { msg_send![descriptor.as_id(), setHeight: height as u64] };
             let mip_level_count = match &self.format {
                 TextureFormat::VecMipBGRAu8_32 { max_level, .. }
                 | TextureFormat::VecMipRGBAf32 { max_level, .. } => {
@@ -6945,7 +6972,9 @@ impl CxOsTexture {
 }
 
 impl Cx {
-    pub(crate) fn detach_released_texture(&mut self, _id: crate::texture::TextureId) {}
+    pub(crate) fn detach_released_texture(&mut self, _id: crate::texture::TextureId) {
+        self.textures.1.has_stale_metal_staging = true;
+    }
 
     pub(crate) fn poll_texture_lifetimes(&mut self) {
         let completed = self.textures.1.serials.completed.load(Ordering::Acquire);

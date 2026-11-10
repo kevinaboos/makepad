@@ -4,6 +4,7 @@ use crate::file_dialogs::{FileDialog, FileDialogAction};
 use {
     crate::{
         cursor::MouseCursor,
+        display_context::NativeAppearance,
         //macos_menu::{
         //    CxCommandSetting
         //},
@@ -156,6 +157,24 @@ pub fn activate_cocoa_window_on_pointer_down(window: ObjcId) -> bool {
             let () = msg_send![window, makeKeyAndOrderFront: nil];
         }
         !active || !key
+    }
+}
+
+/// `setAppearance:` re-lays out each window's titlebar right away, which can call back
+/// into `MacosApp`, so this can't run inside `with_macos_app`.
+pub fn set_native_appearance(appearance: NativeAppearance) {
+    unsafe {
+        let ns_appearance: ObjcId = match appearance {
+            NativeAppearance::System => nil,
+            NativeAppearance::Light => {
+                msg_send![class!(NSAppearance), appearanceNamed: NSAppearanceNameAqua]
+            }
+            NativeAppearance::Dark => {
+                msg_send![class!(NSAppearance), appearanceNamed: NSAppearanceNameDarkAqua]
+            }
+        };
+        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+        let () = msg_send![ns_app, setAppearance: ns_appearance];
     }
 }
 
@@ -1530,12 +1549,14 @@ impl MacosApp {
         .flatten() else {
             return;
         };
-        let (target, media_now): (f64, f64) =
-            unsafe { (msg_send![link, targetTimestamp], CACurrentMediaTime()) };
+        let (target, timestamp, media_now): (f64, f64, f64) = unsafe {
+            (msg_send![link, targetTimestamp], msg_send![link, timestamp], CACurrentMediaTime())
+        };
         let time = app_now + (target - media_now).clamp(0.0, 0.1);
         MacosApp::do_callback(MacosEvent::LinkFire {
             window,
             time,
+            period: target - timestamp,
             primary,
             drawable: None,
             target_presentation_time: target,

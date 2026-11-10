@@ -514,6 +514,23 @@ impl ViewRef {
         }
     }
 
+    /// See [`View::set_scroll_pos_no_clip()`].
+    pub fn set_scroll_pos_no_clip(&self, cx: &mut Cx, v: Vec2d) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_scroll_pos_no_clip(cx, v)
+        }
+    }
+
+    /// See [`View::scroll_pos()`].
+    pub fn scroll_pos(&self) -> Vec2d {
+        self.borrow().map_or(Vec2d::default(), |inner| inner.scroll_pos())
+    }
+
+    /// See [`View::max_scroll_pos()`].
+    pub fn max_scroll_pos(&self) -> Vec2d {
+        self.borrow().map_or(Vec2d::default(), |inner| inner.max_scroll_pos())
+    }
+
     pub fn area(&self) -> Area {
         if let Some(inner) = self.borrow_mut() {
             inner.area
@@ -845,7 +862,9 @@ impl WidgetNode for View {
             // redraw is a no-op and the visibility change only lands on
             // the next unrelated full repaint (the classic "appears after
             // hot reload" bug). Escalate to a full redraw in that case.
-            if visible && matches!(self.area, Area::Empty) {
+            // Not during the draw walk though, since a view shown then (like a list
+            // filling an item) gets drawn by that same walk.
+            if visible && matches!(self.area, Area::Empty) && !cx.is_in_draw_walk {
                 cx.redraw_all();
             } else {
                 self.redraw(cx);
@@ -1019,7 +1038,8 @@ impl Widget for View {
         if !fling_caught && (self.visible && self.cursor.is_some() || self.animator.is_defined) {
             match event.hits_with_capture_overload(cx, self.area(), self.capture_overload) {
                 Hit::FingerDown(e) => {
-                    if self.grab_key_focus {
+                    // A touch waits until it's a tap, so a drag that scrolls from here keeps the keyboard up.
+                    if self.grab_key_focus && !e.device.is_touch() {
                         cx.set_key_focus(self.area());
                     }
                     cx.widget_action(uid, ViewAction::FingerDown(e));
@@ -1030,6 +1050,12 @@ impl Widget for View {
                 Hit::FingerMove(e) => cx.widget_action(uid, ViewAction::FingerMove(e)),
                 Hit::FingerLongPress(e) => cx.widget_action(uid, ViewAction::FingerLongPress(e)),
                 Hit::FingerUp(e) => {
+                    // A child that keeps the key focus, like a text input it's about to take, wins over us.
+                    if self.grab_key_focus && e.device.is_touch() && e.is_over && e.was_tap()
+                        && !cx.fingers.is_press_keeping_key_focus(e.digit_id)
+                    {
+                        cx.set_key_focus(self.area());
+                    }
                     cx.widget_action(uid, ViewAction::FingerUp(e));
                     if self.animator.is_defined {
                         self.animator_play(cx, ids!(down.off));
@@ -1259,6 +1285,7 @@ impl Widget for View {
 
                 if let Some(scroll_bars) = &mut self.scroll_bars_obj {
                     scroll_bars.set_area(self.area);
+                    scroll_bars.draw_scroll_bars_outside_view(cx);
                     scroll_bars.end_nav_area(cx);
                 };
 
@@ -1362,6 +1389,30 @@ impl View {
         } else {
             self.layout.scroll = v;
         }
+    }
+
+    /// Like [`View::set_scroll_pos()`], but it doesn't clamp to the content of our last draw,
+    /// so we can scroll to content that we'll only draw next time. That draw clamps it instead.
+    pub fn set_scroll_pos_no_clip(&mut self, cx: &mut Cx, v: Vec2d) {
+        if let Some(scroll_bars) = &mut self.scroll_bars_obj {
+            scroll_bars.stop_motion();
+            scroll_bars.set_scroll_pos_no_clip(cx, v);
+        } else {
+            self.layout.scroll = v;
+        }
+    }
+
+    /// This view's scroll position, not counting any rubber-band stretch past either end of its content.
+    pub fn scroll_pos(&self) -> Vec2d {
+        match &self.scroll_bars_obj {
+            Some(scroll_bars) => scroll_bars.get_unstretched_scroll_pos(),
+            None => self.layout.scroll,
+        }
+    }
+
+    /// The furthest this view's scroll bars can scroll it, as of its last draw.
+    pub fn max_scroll_pos(&self) -> Vec2d {
+        self.scroll_bars_obj.as_ref().map_or(Vec2d::default(), |scroll_bars| scroll_bars.get_max_scroll_pos())
     }
 
     pub fn area(&self) -> Area {

@@ -56,9 +56,10 @@ impl Cx {
         time: &Win32Time,
     ) {
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        let time_now = time.time_now();
+        self.compute_pass_repaint_order(&mut passes_todo, time_now, 0.0);
         self.repaint_id += 1;
-        let pass_time = self.pass_time(time.time_now());
+        let pass_time = self.pass_time(time_now);
         for &draw_pass_id in &passes_todo {
             let uniforms_gen = self.next_uniform_gen();
             self.passes[draw_pass_id].set_time(pass_time, uniforms_gen);

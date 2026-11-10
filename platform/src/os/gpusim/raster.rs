@@ -891,7 +891,7 @@ impl Cx {
 
         let mut profile = RenderProfile::default();
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
+        self.compute_pass_repaint_order(&mut passes_todo, time, 0.0);
         let options = RenderOptions::from_env(self.gpusim_render_thread_count());
 
         let serial = (!passes_todo.is_empty()).then(|| self.textures.1.serials.submit());

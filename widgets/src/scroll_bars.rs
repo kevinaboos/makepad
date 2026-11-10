@@ -1,4 +1,4 @@
-use crate::{event::TouchState, makepad_draw::*, scroll_bar::*};
+use crate::{event::{TouchPoint, TouchState}, makepad_draw::*, scroll_bar::*};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -28,6 +28,10 @@ pub struct ScrollBars {
     show_scroll_y: bool,
     #[live(false)]
     ignore_scroll_input: bool,
+    /// Whether to draw the bars just outside of the view's right and bottom edges, instead of on top
+    /// of its content. They take up no layout space, so the view needs empty space around it for them.
+    #[live(false)]
+    bars_outside_view: bool,
     #[live]
     scroll_bar_x: ScrollBar,
     #[live]
@@ -38,6 +42,9 @@ pub struct ScrollBars {
     scroll: Vec2d,
     #[rust]
     area: Area,
+    /// The size of the content, for bars that are waiting for the view's turtle to end.
+    #[rust]
+    pending_outside_view_total: Option<Vec2d>,
 }
 
 pub enum ScrollBarsAction {
@@ -57,6 +64,21 @@ impl ScrollBars {
 
     pub fn get_scroll_pos(&self) -> Vec2d {
         self.scroll
+    }
+
+    /// The scroll position without any rubber-band stretch past either end, like `set_scroll_pos` takes.
+    pub fn get_unstretched_scroll_pos(&self) -> Vec2d {
+        dvec2(self.scroll_bar_x.get_scroll_pos(), self.scroll_bar_y.get_scroll_pos())
+    }
+
+    /// The furthest that `set_scroll_pos` can scroll the view, as of its last draw.
+    pub fn get_max_scroll_pos(&self) -> Vec2d {
+        let max = |is_shown: bool, bar: &ScrollBar| if is_shown {
+            (bar.get_scroll_view_total() - bar.get_scroll_view_visible()).max(0.0)
+        } else {
+            0.0
+        };
+        dvec2(max(self.show_scroll_x, &self.scroll_bar_x), max(self.show_scroll_y, &self.scroll_bar_y))
     }
 
     /// Whether a shown bar scrolls its view when a finger or the mouse drags the content.
@@ -221,26 +243,20 @@ impl ScrollBars {
     /// view dispatches the event to its children.
     pub fn catch_fling_on_press(&mut self, cx: &mut Cx, event: &Event) -> bool {
         let area_rect = self.area.rect(cx);
+        let is_press = |t: &TouchPoint| t.state == TouchState::Start && area_rect.contains(t.abs);
         // The press time also gates the coast check below, so a momentum stream that
         // silently stopped reaching this view can't leave it eating presses.
         let press_time = match event {
             Event::MouseDown(e) if area_rect.contains(e.abs) => e.time,
-            Event::TouchUpdate(e)
-                if e.touches
-                    .iter()
-                    .any(|t| matches!(t.state, TouchState::Start) && area_rect.contains(t.abs)) =>
-            {
-                e.time
-            }
+            Event::TouchUpdate(e) if e.touches.iter().any(is_press) => e.time,
             _ => return false,
         };
         // Use `|` so both bars' catch markers are consumed by this one press.
-        let press_catch = (self.show_scroll_x && self.scroll_bar_x.take_press_catch(press_time))
-            | (self.show_scroll_y && self.scroll_bar_y.take_press_catch(press_time));
-        let flinging = press_catch
-            || (self.show_scroll_x && self.scroll_bar_x.is_motion_live(press_time))
-            || (self.show_scroll_y && self.scroll_bar_y.is_motion_live(press_time));
-        if !flinging {
+        let is_x_caught = self.show_scroll_x
+            && (self.scroll_bar_x.take_press_catch(press_time) | self.scroll_bar_x.is_motion_live(press_time));
+        let is_y_caught = self.show_scroll_y
+            && (self.scroll_bar_y.take_press_catch(press_time) | self.scroll_bar_y.is_motion_live(press_time));
+        if !is_x_caught && !is_y_caught {
             return false;
         }
         // Stop both axes: a single press catches a 2D fling on both bars. The press
@@ -251,6 +267,20 @@ impl ScrollBars {
         }
         if self.show_scroll_y {
             self.scroll_bar_y.stop_fling(press_time);
+        }
+        // Stopping a scroll is part of scrolling, so it keeps the keyboard up like a drag of ours would.
+        if (is_x_caught && !self.scroll_bar_x.hide_keyboard_on_scroll)
+            || (is_y_caught && !self.scroll_bar_y.hide_keyboard_on_scroll)
+        {
+            match event {
+                Event::MouseDown(_) => cx.fingers.mark_press_as_keeping_key_focus(live_id!(mouse).into()),
+                Event::TouchUpdate(e) => {
+                    for touch in e.touches.iter().filter(|t| is_press(t)) {
+                        cx.fingers.mark_press_as_keeping_key_focus(live_id_num!(touch, touch.uid).into());
+                    }
+                }
+                _ => {}
+            }
         }
         true
     }
@@ -388,6 +418,7 @@ impl ScrollBars {
         self.draw_scroll_bars(cx);
         // this needs to be a rect_area
         cx.end_turtle_with_area(&mut self.area);
+        self.draw_scroll_bars_outside_view(cx);
         self.end_nav_area(cx);
     }
 
@@ -395,6 +426,7 @@ impl ScrollBars {
         self.draw_scroll_bars(cx);
         // this needs to be a rect_area
         cx.end_turtle_with_area(&mut self.area);
+        self.draw_scroll_bars_outside_view(cx);
         self.end_nav_area(cx);
     }
     // separate API
@@ -414,6 +446,10 @@ impl ScrollBars {
     pub fn draw_scroll_bars(&mut self, cx: &mut Cx2d) {
         // lets ask the turtle our actual bounds
         let view_total = cx.turtle().used();
+        if self.bars_outside_view {
+            self.pending_outside_view_total = Some(view_total);
+            return;
+        }
         let mut rect_now = cx.turtle().rect();
 
         // The turtle's rect might be `NaN` if either size dimension is `Fit`,
@@ -429,17 +465,39 @@ impl ScrollBars {
                 .map_or(view_total.x, |max| view_total.x.min(max));
         }
 
+        let track = Rect { pos: Vec2d::default(), size: rect_now.size };
+        self.draw_scroll_bars_along(cx, track, rect_now.size, view_total);
+    }
+
+    /// Draws the bars of a `bars_outside_view` view, once its turtle has ended and its area is set.
+    /// This has to wait until then, since the view's clip would cut off anything drawn outside of it.
+    pub fn draw_scroll_bars_outside_view(&mut self, cx: &mut Cx2d) {
+        let Some(view_total) = self.pending_outside_view_total.take() else { return };
+        let view_rect = self.area.rect(cx);
+        let track = Rect {
+            // A bar is positioned relative to the unscrolled origin of the turtle it's drawn in, now our parent.
+            pos: view_rect.pos - cx.turtle().origin() - cx.turtle().scroll(),
+            size: view_rect.size + dvec2(self.scroll_bar_y.bar_size, self.scroll_bar_x.bar_size),
+        };
+        self.draw_scroll_bars_along(cx, track, view_rect.size, view_total);
+    }
+
+    fn draw_scroll_bars_along(&mut self, cx: &mut Cx2d, track: Rect, view_visible: Vec2d, view_total: Vec2d) {
+        let laid_out_at = self.get_unstretched_scroll_pos();
         if self.show_scroll_x {
-            let scroll_pos =
-                self.scroll_bar_x
-                    .draw_scroll_bar(cx, ScrollAxis::Horizontal, rect_now, view_total);
+            let scroll_pos = self.scroll_bar_x
+                .draw_scroll_bar_along(cx, ScrollAxis::Horizontal, track, view_visible, view_total);
             self.set_scroll_x(cx, scroll_pos);
         }
         if self.show_scroll_y {
-            let scroll_pos =
-                self.scroll_bar_y
-                    .draw_scroll_bar(cx, ScrollAxis::Vertical, rect_now, view_total);
+            let scroll_pos = self.scroll_bar_y
+                .draw_scroll_bar_along(cx, ScrollAxis::Vertical, track, view_visible, view_total);
             self.set_scroll_y(cx, scroll_pos);
+        }
+        // Content that got shorter (or a view that got bigger) can leave us scrolled past the end. The bars just
+        // pulled us back, but only after the content was laid out at the old offset, so we lay it out once more.
+        if self.get_unstretched_scroll_pos() != laid_out_at {
+            cx.redraw_area_in_draw(self.area);
         }
     }
 

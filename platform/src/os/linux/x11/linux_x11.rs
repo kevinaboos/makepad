@@ -8,6 +8,7 @@ use {
         x11::x11_sys,
         x11::xlib_app::*,
         x11::xlib_event::*,
+        x11::xlib_window::XlibWindow,
     },
     self::super::opengl_x11::OpenglWindow,
     crate::{
@@ -350,7 +351,8 @@ impl X11Cx {
         }
 
         let cx = self.cx.borrow();
-        xlib_app.ui_wait_limit = cx.ui_wait_limit();
+        let time_fps_wait = cx.time_repaint_at().map(|at| at - xlib_app.time_now());
+        xlib_app.ui_wait_limit = cx.ui_wait_limit(time_fps_wait);
         if cx.any_passes_dirty()
             || cx.need_redrawing()
             || cx.new_next_frames.len() != 0
@@ -364,13 +366,14 @@ impl X11Cx {
     }
 
     pub(crate) fn handle_repaint(&mut self, opengl_windows: &mut Vec<OpenglWindow>) {
+        let frame_time = get_xlib_app_global().time_now();
         {
             // Paint follows every wake, so most have nothing to draw. If no pass is dirty,
             // skip the eglMakeCurrent + full pass-list scan below.
             // Time-animated passes don't turn dirty until compute_pass_repaint_order,
-            // so demo_time_repaint must keep us rendering.
+            // so demo_time_repaint, or a `time_fps` frame coming due, must keep us rendering.
             let mut cx = self.cx.borrow_mut();
-            if !cx.any_passes_dirty() && !cx.demo_time_repaint {
+            if !cx.any_passes_dirty() && !cx.demo_time_repaint && !cx.is_time_repaint_due(frame_time, 0.0) {
                 // This still binds our context while retirement work is pending.
                 cx.maintain_instance_retirements();
                 return;
@@ -380,7 +383,7 @@ impl X11Cx {
         {
             let mut cx = self.cx.borrow_mut();
             cx.os.opengl_cx.as_ref().unwrap().make_current();
-            cx.compute_pass_repaint_order(&mut passes_todo);
+            cx.compute_pass_repaint_order(&mut passes_todo, frame_time, 0.0);
             cx.repaint_id += 1;
         }
         for draw_pass_id in &passes_todo {
@@ -501,6 +504,7 @@ impl X11Cx {
                         &window.create_title,
                         &window.create_app_id,
                         window.is_fullscreen,
+                        cx.display_context.native_appearance.unwrap_or_default(),
                     );
                     let window = &mut cx.windows[window_id];
                     window.window_geom = opengl_window.window_geom.clone();
@@ -628,6 +632,18 @@ impl X11Cx {
                         opengl_windows.iter_mut().find(|w| w.window_id == window_id)
                     {
                         window.xlib_window.set_title(&title);
+                    }
+                }
+                CxOsOp::SetNativeAppearance(appearance) => {
+                    let xids = opengl_windows
+                        .iter()
+                        .filter(|w| !w.xlib_window.is_popup)
+                        .filter_map(|w| w.xlib_window.window);
+                    unsafe {
+                        for xid in xids {
+                            XlibWindow::set_x11_native_appearance(xlib_app.display, xid, appearance);
+                        }
+                        x11_sys::XFlush(xlib_app.display);
                     }
                 }
                 CxOsOp::SetWindowVisuals(_window_id, visuals) => {

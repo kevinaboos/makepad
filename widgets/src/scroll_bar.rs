@@ -1,5 +1,5 @@
 use crate::animator::*;
-use crate::event::{ScrollEvent, ScrollPhase, TouchState};
+use crate::event::{ScrollDirection, ScrollEvent, ScrollPhase, TouchState};
 use crate::makepad_derive_widget::*;
 use crate::makepad_draw::*;
 use crate::scroll_motion::{
@@ -242,6 +242,8 @@ enum ScrollState {
     Stopped,
     Drag {
         samples: Vec<ScrollSample>,
+        /// Whether the press has traveled the tap distance our way, so it's a scroll and not a tap.
+        has_traveled: bool,
     },
     /// The rubber-band bounce at a scroll limit (see `scroll_motion`).
     /// `x0`/`v0` are signed: negative stretches before the start, positive past the end.
@@ -313,6 +315,14 @@ pub struct ScrollBar {
     /// Whether to enable drag scrolling
     #[live(false)]
     drag_scrolling: bool,
+    /// Whether a mouse drag that starts on a widget inside us, like a button, drags us once it's
+    /// a drag our way, like a touch drag always does (e.g., for a sideways row of buttons).
+    #[live(false)]
+    mouse_drags_from_widgets: bool,
+    /// Whether a drag that scrolls us hides the soft keyboard when it ends (the focused text input loses its focus),
+    /// like a tap elsewhere does. It's off by default, since most apps keep the keyboard up while you scroll.
+    #[live(false)]
+    pub hide_keyboard_on_scroll: bool,
     /// Whether the bar fades out once scrolling stops and the pointer leaves it.
     #[live(true)]
     auto_hide: bool,
@@ -962,12 +972,19 @@ impl ScrollBar {
 
         let axis = self.axis.vec_index();
         // We can share a press that only nested drag scrollers hold, along an axis none of them took,
-        // and a touch that widgets inside us hold, which we take from them once it's a drag our way.
+        // and a touch (or with `mouse_drags_from_widgets`, a mouse press) that widgets inside us hold,
+        // which we take from them once it's a drag our way.
         let joins = self.scrollable()
             && match event {
                 Event::MouseDown(e) => {
+                    let digit_id = live_id!(mouse).into();
                     e.button.is_primary()
-                        && cx.fingers.can_join_scroll_drag(live_id!(mouse).into(), axis, scroll_area)
+                        && cx.fingers.can_mouse_drag_scroll()
+                        && if self.mouse_drags_from_widgets {
+                            cx.fingers.can_take_over_press(digit_id, axis, scroll_area)
+                        } else {
+                            cx.fingers.can_join_scroll_drag(digit_id, axis, scroll_area)
+                        }
                 }
                 Event::TouchUpdate(e) => {
                     let mut held = e
@@ -996,7 +1013,7 @@ impl ScrollBar {
             Hit::FingerDown(fe) if fe.is_primary_hit() && cx.fingers.is_drag_claimed(fe.digit_id) => {
                 self.stop_fling(fe.time);
             }
-            Hit::FingerDown(fe) if fe.is_primary_hit() => {
+            Hit::FingerDown(fe) if fe.is_primary_hit() && (!fe.device.is_mouse() || cx.fingers.can_mouse_drag_scroll()) => {
                 // So a scroller around us can share this drag along an axis we don't take.
                 cx.hold_scroll_drag(fe.digit_id, scroll_area);
                 // A drag moves only the innermost scrollable that can scroll its way.
@@ -1007,13 +1024,14 @@ impl ScrollBar {
                     };
                     self.scroll_state = ScrollState::Drag {
                         samples: vec![ScrollSample { abs, time: fe.time }],
+                        has_traveled: false,
                     };
                 }
             }
             Hit::FingerMove(e) => match &mut self.scroll_state {
                 // A widget that claimed the drag after we took it (its own hits run after ours) keeps it.
                 ScrollState::Drag { .. } if cx.fingers.is_drag_claimed(e.digit_id) => self.yield_drag(cx, dispatch_action),
-                ScrollState::Drag { samples } => {
+                ScrollState::Drag { samples, has_traveled } => {
                     let new_abs = match self.axis {
                         ScrollAxis::Horizontal => e.abs.x,
                         ScrollAxis::Vertical => e.abs.y,
@@ -1031,6 +1049,12 @@ impl ScrollBar {
                         None => return,
                         Some(direction) if !direction.allows(axis) => return self.yield_drag(cx, dispatch_action),
                         Some(_) => {}
+                    }
+                    // It's a scroll once it goes the tap distance our way, the rule `take_over_press` uses too.
+                    *has_traveled |= ScrollDirection::from_travel(travel)
+                        .is_some_and(|direction| direction.allows(axis));
+                    if *has_traveled && !self.hide_keyboard_on_scroll {
+                        cx.fingers.mark_press_as_keeping_key_focus(e.digit_id);
                     }
                     let old_sample = *samples.last().unwrap();
                     push_sample(samples, new_abs, e.time);
@@ -1092,7 +1116,7 @@ impl ScrollBar {
                 self.stop_drag(cx, dispatch_action);
             }
             Hit::FingerUp(fe) if fe.is_primary_hit() => match &mut self.scroll_state {
-                ScrollState::Drag { samples } => {
+                ScrollState::Drag { samples, .. } => {
                     // The press's release settles the fate of any fling it caught:
                     // only a qualifying same-direction flick below adds it back.
                     let caught_fling = self.caught_fling.take();
@@ -1190,6 +1214,10 @@ impl ScrollBar {
                 Hit::FingerDown(fe) if fe.is_primary_hit() => {
                     self.animator_play(cx, ids!(hover.drag));
                     cx.claim_finger_drag(fe.digit_id);
+                    // A press on the bar is for scrolling us, so it keeps the keyboard up like our drags do.
+                    if !self.hide_keyboard_on_scroll {
+                        cx.fingers.mark_press_as_keeping_key_focus(fe.digit_id);
+                    }
                     let rel = fe.abs - fe.rect.pos;
                     let rel = match self.axis {
                         ScrollAxis::Horizontal => rel.x,

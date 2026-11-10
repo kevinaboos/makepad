@@ -20,6 +20,7 @@ use {
             windows::{
                 d3d11::{D3d11Cx, D3d11Window},
                 win32_app::*,
+                win32_appearance::set_native_appearance,
                 win32_event::*,
                 win32_window::Win32Window,
                 windows_game_input::WindowsGameInput,
@@ -433,25 +434,13 @@ impl Cx {
 
                 // If a signal handler dirtied the UI (redraw / animation / dirty pass),
                 // or video is playing, resume the vsync-paced Poll loop so it paints
-                // promptly; otherwise go back to sleep in `GetMessageW`.
+                // promptly; otherwise go back to sleep, waking for a `time_fps` frame if one is coming.
                 // Video must keep Poll: Wait skips Paint on signal-poll ticks.
                 // A lost device makes every one of those conditions unsatisfiable: nothing can
                 // paint, so `Poll` would spin at the loop's full rate for the whole outage —
                 // which can be hours with a lid shut. Sleep instead and let the signal-poll
                 // heartbeat deliver the retries.
-                if d3d11_cx.device_lost.get() {
-                    return EventFlow::Wait;
-                }
-                if self.any_passes_dirty()
-                    || self.need_redrawing()
-                    || self.new_next_frames.len() != 0
-                    || self.demo_time_repaint
-                    || !self.screenshot_requests.is_empty()
-                    || self.os.video_players.values().any(|p| p.keep_polling())
-                {
-                    return EventFlow::Poll;
-                }
-                return EventFlow::Wait;
+                return self.next_event_flow(d3d11_cx, d3d11_windows);
             }
         }
 
@@ -460,17 +449,23 @@ impl Cx {
         // Pace painting like macOS/Linux: spin (Poll) only while there is visible work
         // pending — a pass is dirty, a redraw was requested, an animation NextFrame
         // is queued, or a video player is preparing/playing. Otherwise block (Wait) so
-        // the loop sleeps in `GetMessageW` at ~0% CPU until the next input / timer / signal.
+        // the loop sleeps at ~0% CPU until the next input / timer / signal or `time_fps` frame.
         // While Poll-ing, the vsync-blocking D3D11 `Present` (`handle_repaint` ->
         // `draw_pass_to_window` -> `Present(1,..)`) is what actually paces frames to
         // the display; this replaces the old hard-forced Poll that repainted
         // unconditionally at the 8 ms signal-timer rate (~125 Hz).
         // A lost device makes all of those unsatisfiable — nothing can paint until it is
         // rebuilt — so `Poll` would spin at the loop's full rate for the whole outage.
-        if d3d11_cx.device_lost.get() {
-            return EventFlow::Wait;
-        }
-        if self.any_passes_dirty()
+        self.next_event_flow(d3d11_cx, d3d11_windows)
+    }
+
+    /// Polls while something needs the very next frame, else Waits, and a `time_fps` frame still to
+    /// come ends that Wait at the beat that paints it.
+    fn next_event_flow(&self, d3d11_cx: &D3d11Cx, d3d11_windows: &[D3d11Window]) -> EventFlow {
+        let mut time_fps_wake = None;
+        let flow = if d3d11_cx.device_lost.get() {
+            EventFlow::Wait
+        } else if self.any_passes_dirty()
             || self.need_redrawing()
             || self.new_next_frames.len() != 0
             // A time-driven shader's pass only turns dirty in the next compute_pass_repaint_order.
@@ -482,8 +477,22 @@ impl Cx {
         {
             EventFlow::Poll
         } else {
+            if let Some(due) = self.time_repaint_at() {
+                let primary = with_win32_app(|app| app.beat_handles.first().map(|beat| beat.window_id))
+                    .and_then(|primary| d3d11_windows.iter().find(|window| window.window_id == primary));
+                // A beat paints for the next flip, so it comes a refresh ahead of the flip nearest the due.
+                time_fps_wake = match primary {
+                    Some(window) => match window.last_frame_stats {
+                        Some((_, sync_time)) => self.time_repaint_tick_wake(sync_time, window.refresh_period),
+                        None => Some(due - window.refresh_period),
+                    },
+                    None => Some(due),
+                };
+            }
             EventFlow::Wait
-        }
+        };
+        with_win32_app(|app| app.time_fps_wake = time_fps_wake);
+        flow
     }
 
     /// Ends the press and hover state left over from a drag over our windows: OLE
@@ -806,8 +815,6 @@ impl Cx {
     ) -> bool {
         let mut presented = false;
         let mut passes_todo = Vec::new();
-        self.compute_pass_repaint_order(&mut passes_todo);
-        self.repaint_id += 1;
         // ONE timestamp for the whole frame: the flip this beat is aimed at, or
         // wall-now for an unscoped tick. It used to be sampled per pass, so an
         // offscreen pass and the window pass that consumed it were stamped
@@ -815,7 +822,20 @@ impl Cx {
         let time_now = self
             .os
             .link_flip_time
-            .unwrap_or_else(|| with_win32_app(|app| app.time_now()));
+            .unwrap_or_else(|| with_win32_app(|app| app.time_now()))
+            // A paint between beats can come before the flip the last beat was stamped with.
+            .max(self.time_fps_clock.frame_time);
+        // A beat paints for flips a refresh apart, so a `time_fps` frame takes the one nearest its due.
+        let frame_interval = self
+            .os
+            .link_scope
+            .and_then(|scope| d3d11_windows.iter().find(|window| window.window_id == scope))
+            .map_or(0.0, |window| window.refresh_period);
+        self.compute_pass_repaint_order(&mut passes_todo, time_now, frame_interval);
+        if !self.textures.1.retired.is_empty() {
+            self.poll_texture_lifetimes();
+        }
+        self.repaint_id += 1;
         let pass_time = self.pass_time(time_now);
         let scope = self.os.link_scope;
         // Which windows have a beat of their own. Only those are held back during
@@ -964,6 +984,7 @@ impl Cx {
                         create_position,
                         &window.create_title,
                         window.is_fullscreen,
+                        self.display_context.native_appearance,
                     );
                     let visuals = window.window_visuals();
                     let mut d3d11_window = d3d11_window;
@@ -1012,8 +1033,13 @@ impl Cx {
                         position
                     };
 
-                    let d3d11_window =
-                        D3d11Window::new_popup(window_id, &d3d11_cx, size, screen_position);
+                    let d3d11_window = D3d11Window::new_popup(
+                        window_id,
+                        &d3d11_cx,
+                        size,
+                        screen_position,
+                        self.display_context.native_appearance,
+                    );
                     let mut d3d11_window = d3d11_window;
                     d3d11_window
                         .win32_window
@@ -1116,6 +1142,12 @@ impl Cx {
                     {
                         window.win32_window.set_title(&title);
                     }
+                }
+                CxOsOp::SetNativeAppearance(appearance) => {
+                    set_native_appearance(
+                        appearance,
+                        d3d11_windows.iter().map(|w| w.win32_window.hwnd),
+                    );
                 }
                 CxOsOp::SetWindowVisuals(window_id, visuals) => {
                     if let Some(window) =

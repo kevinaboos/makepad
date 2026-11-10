@@ -8,6 +8,8 @@ pub mod file_dialog;
 #[cfg(not(any(linux_direct, target_env = "ohos", target_os = "android")))]
 pub mod wayland;
 #[cfg(not(any(linux_direct, target_env = "ohos", target_os = "android")))]
+pub(crate) mod kde_color_scheme;
+#[cfg(not(any(linux_direct, target_env = "ohos", target_os = "android")))]
 pub mod windowing_backend;
 #[cfg(not(any(linux_direct, target_env = "ohos", target_os = "android")))]
 pub mod x11;
@@ -105,7 +107,7 @@ pub(crate) fn wake_ui_event_loop() {
 #[cfg(target_env = "ohos")]
 pub(crate) fn wake_ui_event_loop() {
     open_harmony::oh_callbacks::send_from_ohos_message(
-        open_harmony::oh_callbacks::FromOhosMessage::VSync,
+        open_harmony::oh_callbacks::FromOhosMessage::VSync(None),
     );
 }
 

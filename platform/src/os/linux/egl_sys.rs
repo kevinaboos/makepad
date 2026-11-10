@@ -23,6 +23,7 @@ pub const EGL_STENCIL_SIZE: u32 = 12326;
 pub const EGL_NATIVE_VISUAL_ID: u32 = 12334;
 pub const EGL_SURFACE_TYPE: u32 = 12339;
 pub const EGL_NONE: u32 = 0x3038;
+pub const EGL_EXTENSIONS: u32 = 0x3055;
 pub const EGL_RENDERABLE_TYPE: u32 = 12352;
 pub const EGL_HEIGHT: u32 = 12374;
 pub const EGL_WIDTH: u32 = 12375;
@@ -302,6 +303,17 @@ use std::ffi::CStr;
 use crate::module_loader::ModuleLoader;
 
 impl LibEgl {
+    /// The calling thread's last EGL error, or 0 if `eglGetError` isn't available.
+    pub fn last_error(&self) -> EGLint {
+        unsafe { self.eglGetError.map_or(0, |get_error| get_error()) }
+    }
+
+    /// Returns a null surface if the config doesn't allow a pbuffer.
+    pub(crate) unsafe fn create_1x1_pbuffer(&self, display: EGLDisplay, config: EGLConfig) -> EGLSurface {
+        let attributes = [EGL_WIDTH as i32, 1, EGL_HEIGHT as i32, 1, EGL_NONE as i32];
+        (self.eglCreatePbufferSurface.unwrap())(display, config, attributes.as_ptr())
+    }
+
     pub fn try_load() -> Option<LibEgl> {
         let module = ModuleLoader::load("libEGL.so")
             .or_else(|_| ModuleLoader::load("libEGL.so.1"))
