@@ -2120,6 +2120,12 @@ impl DrawText {
     }
 
     pub fn draw_walk(&mut self, cx: &mut Cx2d, walk: Walk, align: Align, text: &str) -> Rect {
+        let wrap = matches!(cx.turtle().layout().flow, Flow::Right { wrap: true, .. });
+        self.draw_walk_with_wrap(cx, walk, align, wrap, text)
+    }
+
+    /// Like [`Self::draw_walk`], but `wrap` decides whether the text wraps instead of the turtle's flow.
+    pub fn draw_walk_with_wrap(&mut self, cx: &mut Cx2d, walk: Walk, align: Align, wrap: bool, text: &str) -> Rect {
         let walk = cx.resolve_walk(walk, ResolveAt::BeforeBegin);
         let mut max_width_in_lpxs = self.max_layout_width_for_walk(cx, walk);
 
@@ -2137,8 +2143,6 @@ impl DrawText {
             max_width_in_lpxs =
                 self.fit_layout_width_for_walk(cx, walk, ellipsis_width_in_lpxs);
         }
-
-        let wrap = matches!(cx.turtle().layout().flow, Flow::Right { wrap: true, .. });
 
         let text = self.layout(cx, 0.0, 0.0, max_width_in_lpxs, wrap, align, text);
         self.draw_walk_laidout(cx, walk, &text)

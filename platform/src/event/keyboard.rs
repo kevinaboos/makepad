@@ -13,6 +13,10 @@ pub struct CxKeyboard {
     pub(crate) prev_key_focus: Area,
     pub(crate) next_key_focus: Area,
     pub(crate) key_focus: Area,
+    /// Whether the user gave `key_focus` its focus, e.g., with a press or Tab, rather than code.
+    pub(crate) is_key_focus_from_user: bool,
+    pub(crate) is_prev_key_focus_from_user: bool,
+    pub(crate) is_next_key_focus_from_user: bool,
     #[allow(dead_code)]
     pub(crate) keys_down: Vec<KeyEvent>,
     pub(crate) text_ime_dismissed: bool,
@@ -45,6 +49,13 @@ impl CxKeyboard {
     pub fn set_key_focus(&mut self, focus_area: Area) {
         self.text_ime_dismissed = false;
         self.next_key_focus = focus_area;
+        self.is_next_key_focus_from_user = false;
+    }
+
+    /// Like [`Self::set_key_focus`], for focus the user gave, e.g., by pressing on `focus_area` or tabbing to it.
+    pub fn set_key_focus_from_user(&mut self, focus_area: Area) {
+        self.set_key_focus(focus_area);
+        self.is_next_key_focus_from_user = true;
     }
 
     pub fn key_focus(&self) -> Area {
@@ -53,10 +64,16 @@ impl CxKeyboard {
 
     pub fn revert_key_focus(&mut self) {
         self.next_key_focus = self.prev_key_focus;
+        self.is_next_key_focus_from_user = self.is_prev_key_focus_from_user;
     }
 
     pub fn has_key_focus(&self, focus_area: Area) -> bool {
         self.key_focus == focus_area
+    }
+
+    /// Whether `focus_area` has key focus that the user gave it, rather than code.
+    pub fn has_key_focus_from_user(&self, focus_area: Area) -> bool {
+        self.key_focus == focus_area && self.is_key_focus_from_user
     }
 
     pub fn set_text_ime_dismissed(&mut self) {
@@ -82,7 +99,9 @@ impl CxKeyboard {
     pub(crate) fn cycle_key_focus_changed(&mut self) -> Option<(Area, Area)> {
         if self.next_key_focus != self.key_focus {
             self.prev_key_focus = self.key_focus;
+            self.is_prev_key_focus_from_user = self.is_key_focus_from_user;
             self.key_focus = self.next_key_focus;
+            self.is_key_focus_from_user = self.is_next_key_focus_from_user;
             return Some((self.prev_key_focus, self.key_focus));
         }
         None

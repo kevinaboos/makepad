@@ -351,6 +351,9 @@ pub struct Window {
     use_sploded: bool,
     #[rust]
     last_known_area: Area,
+    /// Whether the user gave `last_known_area` its key focus, so it gets that focus back the same way.
+    #[rust]
+    was_last_known_area_focused_by_user: bool,
     #[rust(GaussStack::new(vm.cx_mut()))]
     gauss_stack: GaussStack,
     #[rust(SsaaStack::new(vm.cx_mut()))]
@@ -1959,7 +1962,11 @@ impl Widget for Window {
                 if *window_id == self.window.window_id() {
                     self.has_focus = true;
                     self.focus_known = true;
-                    cx.set_key_focus(self.last_known_area);
+                    if self.was_last_known_area_focused_by_user {
+                        cx.set_key_focus_from_user(self.last_known_area);
+                    } else {
+                        cx.set_key_focus(self.last_known_area);
+                    }
                 }
 
                 *window_id != self.window.window_id()
@@ -1969,6 +1976,7 @@ impl Widget for Window {
                     self.has_focus = false;
                     self.focus_known = true;
                     self.last_known_area = cx.key_focus();
+                    self.was_last_known_area_focused_by_user = cx.has_key_focus_from_user(self.last_known_area);
                     cx.set_key_focus(Area::Empty);
                 }
 
